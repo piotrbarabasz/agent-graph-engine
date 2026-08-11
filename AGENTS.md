@@ -23,3 +23,8 @@
 - M003 Git operations are local-only: no remote/network or destructive operations. Inherited `GIT_*`
   context is removed, and explicit contained staging paths use `--literal-pathspecs` plus `--`.
 - Core and runtime remain Git-independent.
+- `agentgraph.work` is adapter-neutral; concrete adapters translate source-specific concepts into
+  immutable snapshots. Selection uses declaration order from one validated snapshot.
+- The M004 source adapter is strictly read-only and fails closed on invalid dependencies or unsafe
+  paths. Validation commands are declarative argv, and source revisions are content-based.
+- Work-source inspection never writes target files or creates adapter caches and metadata.

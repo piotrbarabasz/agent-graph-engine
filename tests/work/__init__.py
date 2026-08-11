@@ -1,0 +1,1 @@
+"""Neutral work contract tests."""
