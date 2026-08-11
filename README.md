@@ -1,12 +1,12 @@
 # Agent Graph Engine
 
 Agent Graph Engine is an early-stage Python project for deterministic orchestration of
-agent workflows. M001 implements only the in-memory Graph Core: immutable state,
-typed node results and patches, centrally enforced ownership, graph validation, and
-deterministic transition selection.
+agent workflows. M001 provides the in-memory deterministic Graph Core. M002 adds a
+local durable runtime foundation with atomic state, a checksummed journal, project
+locking, and fail-closed recovery assessment.
 
-The project requires Python 3.11 or newer. It currently has no CLI, persistence,
-LLM, Git, or remote-provider integration.
+The project requires Python 3.11 or newer. It has no CLI, Codex, Git, GitHub, Spec Kit,
+LLM provider, or real coding-task execution.
 
 ## Development
 
@@ -16,7 +16,9 @@ python -m pytest
 python -m ruff check .
 ```
 
-The package uses a `src` layout. `agentgraph.core` contains the domain models,
-patch executor, graph definition, canonical v1 graph, and synchronous in-memory
-engine. Runtime integrations will be introduced only in later milestones.
-
+The package uses a `src` layout. `agentgraph.core` remains entirely in memory.
+`agentgraph.runtime` stores local runtime artifacts outside the target repository,
+under `~/.agentgraph` by default. Library users and tests may override this with an
+explicit `RuntimePaths` root or the `AGENTGRAPH_HOME` environment variable.
+Each project permits one unfinished writer run; incomplete initialization remains in
+preserved staging until an explicit library recovery call retries it.

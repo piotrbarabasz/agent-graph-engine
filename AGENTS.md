@@ -9,4 +9,10 @@
 - Use `DELIVERY_REVIEW`; never introduce `EPIC_REVIEW`.
 - M001 has no Git, Codex, GitHub, subprocess, or persistence integration.
 - Every graph behavior change requires contract and transition tests.
-
+- Core remains independent of runtime; runtime artifacts always live outside the target repository.
+- State writes are atomic, journal writes are append-only, and every state update requires CAS.
+- Durable step order is fixed: started, result recorded, state CAS, transition committed.
+- Recovery never guesses. Interrupted write/external nodes block without a reconciler.
+- Locks use an OS advisory primitive; metadata is diagnostic and stale leases are never silently taken.
+- Every durable crash boundary requires a fault-injection regression test.
+- A project owns at most one unfinished writer run; initialization uses preserved staging evidence.
