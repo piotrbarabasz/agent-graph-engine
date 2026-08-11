@@ -16,3 +16,10 @@
 - Locks use an OS advisory primitive; metadata is diagnostic and stale leases are never silently taken.
 - Every durable crash boundary requires a fault-injection regression test.
 - A project owns at most one unfinished writer run; initialization uses preserved staging evidence.
+- Infrastructure commands are argv-only with `shell=False`; captured output is bounded and secrets
+  never enter receipts or diagnostic representations.
+- Timeout and cancellation must terminate and reap every started process. `GitAdapter` executes only
+  through `ProcessRunner`.
+- M003 Git operations are local-only: no remote/network or destructive operations. Explicit Git paths
+  use `--` and must remain contained in the repository.
+- Core and runtime remain Git-independent.

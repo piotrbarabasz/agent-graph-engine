@@ -3,10 +3,12 @@
 Agent Graph Engine is an early-stage Python project for deterministic orchestration of
 agent workflows. M001 provides the in-memory deterministic Graph Core. M002 adds a
 local durable runtime foundation with atomic state, a checksummed journal, project
-locking, and fail-closed recovery assessment.
+locking, and fail-closed recovery assessment. M003 adds neutral local process and Git
+infrastructure with bounded output, cancellation, redacted receipts, machine-readable
+repository snapshots, and explicit safe local Git mutations.
 
-The project requires Python 3.11 or newer. It has no CLI, Codex, Git, GitHub, Spec Kit,
-LLM provider, or real coding-task execution.
+The project requires Python 3.11 or newer. It has no CLI, Codex, GitHub, Spec Kit,
+LLM provider, automatic coding workflow, or real coding-task execution.
 
 ## Development
 
@@ -22,3 +24,13 @@ under `~/.agentgraph` by default. Library users and tests may override this with
 explicit `RuntimePaths` root or the `AGENTGRAPH_HOME` environment variable.
 Each project permits one unfinished writer run; incomplete initialization remains in
 preserved staging until an explicit library recovery call retries it.
+
+`agentgraph.infra.ProcessRunner` always executes structural argv with no shell, captures
+stdout and stderr through system temporary files, bounds returned bytes, and reaps the
+child after timeout or cancellation. POSIX termination targets the process group. The
+standard-library Windows implementation always reaps the main child but can only provide
+best-effort termination of descendants because it does not use Job Objects.
+
+`agentgraph.infra.GitAdapter` provides repository discovery and snapshots, diff inspection,
+branch creation/switching, explicit staging, and local commits. It has no remote operations
+and no reset, clean, merge, rebase, or other destructive workflow primitives.
