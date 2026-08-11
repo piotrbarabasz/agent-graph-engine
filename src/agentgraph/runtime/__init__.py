@@ -1,6 +1,7 @@
 """Small public API for the local durable runtime foundation."""
 
 from .coordinator import DurableGraphCoordinator, RunHandle, RuntimeSession
+from .ids import validate_project_id, validate_record_id, validate_run_id
 from .journal import Journal, JournalRecordType
 from .locking import ProjectLock
 from .paths import RuntimePaths
@@ -22,4 +23,7 @@ __all__ = [
     "RuntimePaths",
     "RuntimeSession",
     "StateStore",
+    "validate_project_id",
+    "validate_record_id",
+    "validate_run_id",
 ]

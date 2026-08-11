@@ -21,12 +21,14 @@ from .codec import (
     utc_now,
 )
 from .errors import (
+    InvalidRuntimeIdentifierError,
     ProjectLockedError,
     SerializationError,
     StaleLeaseError,
     StaleLeaseMismatchError,
     UnsupportedSchemaError,
 )
+from .ids import validate_project_id, validate_run_id
 
 
 class AdvisoryFileLock:
@@ -102,8 +104,8 @@ class LockMetadata:
     def __post_init__(self) -> None:
         if self.schema_version != 1:
             raise UnsupportedSchemaError("unsupported lock metadata schema")
-        if not self.project_id.startswith("prj_") or not self.run_id.startswith("run_"):
-            raise SerializationError("invalid lock metadata identity")
+        validate_project_id(self.project_id)
+        validate_run_id(self.run_id)
         parse_timestamp(self.acquired_at)
         parse_timestamp(self.heartbeat_at)
 
@@ -122,6 +124,8 @@ class ProjectLock:
         now: Callable[[], datetime] = utc_now,
         recovery_evidence_dir: Path | None = None,
     ) -> None:
+        validate_project_id(project_id)
+        validate_run_id(run_id)
         self.os_lock = AdvisoryFileLock(lock_path)
         self.metadata_path = metadata_path
         self.project_id = project_id
@@ -140,7 +144,7 @@ class ProjectLock:
                 raw_lease = self.metadata_path.read_bytes()
                 try:
                     stale = decode_value(parse_json_bytes(raw_lease), LockMetadata)
-                except (OSError, SerializationError) as exc:
+                except (OSError, SerializationError, InvalidRuntimeIdentifierError) as exc:
                     raise StaleLeaseMismatchError("stale lease metadata is invalid") from exc
                 if stale.project_id != self.project_id or stale.run_id != self.run_id:
                     raise StaleLeaseMismatchError(

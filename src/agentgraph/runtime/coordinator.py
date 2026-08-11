@@ -23,11 +23,12 @@ from .errors import (
     ActiveRunExistsError,
     AgentGraphRuntimeError,
     IncompleteRunInitializationError,
+    InvalidRuntimeIdentifierError,
     RunAlreadyExistsError,
     RunNotFoundError,
     SerializationError,
 )
-from .ids import generate_run_id
+from .ids import generate_run_id, validate_run_id
 from .journal import Journal, JournalRecordType
 from .lifecycle import ActiveRunRecord
 from .locking import ProjectLock
@@ -70,15 +71,18 @@ class DurableGraphCoordinator:
     def start_run(self, run_id: str | None = None) -> RunHandle:
         """Atomically initialize state version zero and RUN_STARTED under project lock."""
 
-        selected = run_id or self.run_id_factory()
+        selected = self.run_id_factory() if run_id is None else run_id
+        validate_run_id(selected)
         return self._start_run(selected, recover_incomplete=False)
 
     def recover_incomplete_run_initialization(self, run_id: str) -> RunHandle:
         """Preserve staging evidence and explicitly retry one incomplete initialization."""
 
+        validate_run_id(run_id)
         return self._start_run(run_id, recover_incomplete=True)
 
     def _start_run(self, selected: str, *, recover_incomplete: bool) -> RunHandle:
+        validate_run_id(selected)
         run_path = self.paths.run(self.project.project_id, selected)
         staging = self.paths.initializing_run(self.project.project_id, selected)
         with self._lock(selected):
@@ -121,6 +125,7 @@ class DurableGraphCoordinator:
     def open_session(self, run_id: str, *, recovery: bool = False) -> RuntimeSession:
         """Return a context manager holding the project lock for all operations."""
 
+        validate_run_id(run_id)
         run_path = self.paths.run(self.project.project_id, run_id)
         if not run_path.is_dir():
             if self.paths.initializing_run(self.project.project_id, run_id).exists():
@@ -213,7 +218,7 @@ class DurableGraphCoordinator:
             return None
         try:
             record = decode_value(parse_json_bytes(path.read_bytes()), ActiveRunRecord)
-        except (OSError, SerializationError) as exc:
+        except (OSError, SerializationError, InvalidRuntimeIdentifierError) as exc:
             raise ActiveRunExistsError("active-run ownership is corrupt") from exc
         if record.project_id != self.project.project_id:
             raise ActiveRunExistsError("active-run project identity mismatch")

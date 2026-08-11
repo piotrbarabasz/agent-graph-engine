@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 from .codec import parse_timestamp
 from .errors import SerializationError, UnsupportedSchemaError
+from .ids import validate_project_id, validate_run_id
 
 
 @dataclass(frozen=True, slots=True)
@@ -24,8 +25,8 @@ class FinalReceipt:
     def __post_init__(self) -> None:
         if self.schema_version != 1:
             raise UnsupportedSchemaError("unsupported final receipt schema")
-        if not self.project_id.startswith("prj_") or not self.run_id.startswith("run_"):
-            raise SerializationError("invalid final receipt identity")
+        validate_project_id(self.project_id)
+        validate_run_id(self.run_id)
         if self.final_state_version < 0 or self.last_journal_seq < 1:
             raise SerializationError("invalid final receipt versions")
         parse_timestamp(self.finished_at)

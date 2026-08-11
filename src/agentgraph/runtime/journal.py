@@ -23,12 +23,13 @@ from .codec import (
     utc_now,
 )
 from .errors import (
+    InvalidRuntimeIdentifierError,
     JournalCorruptionError,
     SerializationError,
     TruncatedJournalError,
     UnsupportedSchemaError,
 )
-from .ids import generate_record_id
+from .ids import generate_record_id, validate_record_id, validate_run_id
 
 
 class JournalRecordType(StrEnum):
@@ -59,6 +60,8 @@ class JournalRecord:
     def __post_init__(self) -> None:
         if self.schema_version != 1 or self.seq < 1:
             raise JournalCorruptionError("invalid journal record schema or sequence")
+        validate_record_id(self.record_id)
+        validate_run_id(self.run_id)
         parse_timestamp(self.timestamp)
         object.__setattr__(self, "payload", MappingProxyType(dict(self.payload)))
 
@@ -74,6 +77,7 @@ class Journal:
         record_id_factory: Callable[[], str] = generate_record_id,
         now: Callable[[], datetime] = utc_now,
     ) -> None:
+        validate_run_id(run_id)
         self.path = path
         self.run_id = run_id
         self.record_id_factory = record_id_factory
@@ -101,7 +105,7 @@ class Journal:
         content = {
             "schema_version": 1,
             "seq": len(records) + 1,
-            "record_id": self.record_id_factory(),
+            "record_id": validate_record_id(self.record_id_factory()),
             "record_type": record_type.value,
             "run_id": self.run_id,
             "timestamp": format_timestamp(self.now()),
@@ -138,7 +142,12 @@ class Journal:
                 data = parse_json_bytes(serialized)
                 record = decode_value(data, JournalRecord)
                 self._validate_record(record, data, records)
-            except (SerializationError, JournalCorruptionError, UnsupportedSchemaError) as exc:
+            except (
+                SerializationError,
+                InvalidRuntimeIdentifierError,
+                JournalCorruptionError,
+                UnsupportedSchemaError,
+            ) as exc:
                 raise JournalCorruptionError(f"corrupt journal record {index + 1}") from exc
             records.append(record)
             consumed += len(line)
@@ -170,7 +179,7 @@ class Journal:
         except TruncatedJournalError as error:
             recovery_dir.mkdir(parents=True, exist_ok=True)
             tail_digest = f"sha256:{hashlib.sha256(error.raw_tail).hexdigest()}"
-            evidence_id = self.record_id_factory()
+            evidence_id = validate_record_id(self.record_id_factory())
             atomic_write_bytes(recovery_dir / f"{evidence_id}.tail", error.raw_tail)
             metadata = {
                 "schema_version": 1,

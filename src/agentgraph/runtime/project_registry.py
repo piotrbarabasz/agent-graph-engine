@@ -18,8 +18,13 @@ from .codec import (
     parse_timestamp,
     utc_now,
 )
-from .errors import ProjectRegistryError, SerializationError, UnsupportedSchemaError
-from .ids import generate_project_id
+from .errors import (
+    InvalidRuntimeIdentifierError,
+    ProjectRegistryError,
+    SerializationError,
+    UnsupportedSchemaError,
+)
+from .ids import generate_project_id, validate_project_id
 from .locking import AdvisoryFileLock
 from .paths import RuntimePaths
 
@@ -35,8 +40,9 @@ class ProjectRecord:
     schema_version: int = 1
 
     def __post_init__(self) -> None:
-        if self.schema_version != 1 or not self.project_id.startswith("prj_"):
+        if self.schema_version != 1:
             raise ProjectRegistryError("invalid project record")
+        validate_project_id(self.project_id)
         parse_timestamp(self.created_at)
         parse_timestamp(self.updated_at)
 
@@ -63,6 +69,7 @@ class ProjectRegistry:
 
     def register(self, canonical_root: Path | str) -> ProjectRecord:
         root = canonicalize_root(canonical_root)
+        self.paths.require_external_to(root)
         self.paths.root.mkdir(parents=True, exist_ok=True)
         with AdvisoryFileLock(self.paths.registry_lock, blocking=True):
             records = self._load_unlocked()
@@ -84,6 +91,7 @@ class ProjectRegistry:
             return record
 
     def get(self, project_id: str) -> ProjectRecord:
+        validate_project_id(project_id)
         records = self._load_unlocked()
         try:
             record = next(item for item in records if item.project_id == project_id)
@@ -117,7 +125,7 @@ class ProjectRegistry:
             if len({item.canonical_root for item in records}) != len(records):
                 raise ProjectRegistryError("duplicate canonical root in registry")
             return records
-        except (OSError, SerializationError, TypeError) as exc:
+        except (OSError, SerializationError, InvalidRuntimeIdentifierError, TypeError) as exc:
             if isinstance(exc, ProjectRegistryError):
                 raise
             raise ProjectRegistryError("corrupted project registry") from exc

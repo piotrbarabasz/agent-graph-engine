@@ -9,6 +9,10 @@ class RuntimePathError(AgentGraphRuntimeError):
     """A runtime path is invalid or unsafe."""
 
 
+class InvalidRuntimeIdentifierError(RuntimePathError):
+    """A runtime identifier is malformed or unsafe for path construction."""
+
+
 class SerializationError(AgentGraphRuntimeError):
     """JSON data violates a strict serialization contract."""
 

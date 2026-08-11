@@ -5,7 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from .codec import parse_timestamp
-from .errors import SerializationError, UnsupportedSchemaError
+from .errors import UnsupportedSchemaError
+from .ids import validate_project_id, validate_run_id
 
 
 @dataclass(frozen=True, slots=True)
@@ -20,6 +21,6 @@ class ActiveRunRecord:
     def __post_init__(self) -> None:
         if self.schema_version != 1:
             raise UnsupportedSchemaError("unsupported active-run schema")
-        if not self.project_id.startswith("prj_") or not self.run_id.startswith("run_"):
-            raise SerializationError("invalid active-run identity")
+        validate_project_id(self.project_id)
+        validate_run_id(self.run_id)
         parse_timestamp(self.created_at)
