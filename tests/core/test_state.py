@@ -4,7 +4,7 @@ import pytest
 
 from agentgraph.core import GraphState, WorkItem
 from agentgraph.core.errors import ContractValidationError
-from agentgraph.core.state import WorkState
+from agentgraph.core.state import ReviewState, WorkState
 
 
 def test_initial_state_is_versioned_and_immutable() -> None:
@@ -32,3 +32,8 @@ def test_invalid_schema_or_state_versions_are_rejected(version: int) -> None:
     kwargs = {"schema_version": version} if version != -1 else {"state_version": version}
     with pytest.raises(ContractValidationError):
         GraphState(run=GraphState.initial("r").run, **kwargs)
+
+
+def test_delivery_review_safety_flag_is_strict_boolean() -> None:
+    with pytest.raises(ContractValidationError, match="safe_to_create_pr"):
+        ReviewState(safe_to_create_pr=1)  # type: ignore[arg-type]

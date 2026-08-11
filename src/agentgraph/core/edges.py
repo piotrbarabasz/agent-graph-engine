@@ -149,6 +149,32 @@ class WorkLimitCondition:
 
 
 @dataclass(frozen=True, slots=True)
+class CompletedWorkCondition:
+    """Match whether at least one work item has completed in this run."""
+
+    present: bool
+
+    def matches(self, state: GraphState, result: NodeResult, policy: PolicySnapshot) -> bool:
+        del result, policy
+        return bool(state.work.completed_items) is self.present
+
+
+@dataclass(frozen=True, slots=True)
+class DeliveryReviewCondition:
+    """Match the delivery verdict and explicit PR-safety gate."""
+
+    verdict: ReviewVerdict
+    safe_to_create_pr: bool | None = None
+
+    def matches(self, state: GraphState, result: NodeResult, policy: PolicySnapshot) -> bool:
+        del result, policy
+        return state.review.verdict is self.verdict and (
+            self.safe_to_create_pr is None
+            or state.review.safe_to_create_pr is self.safe_to_create_pr
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class CheckpointOutcomeCondition:
     """Match the synthetic M001 checkpoint decision."""
 

@@ -105,9 +105,10 @@ class PathRule:
 
 SET = frozenset({OperationType.SET, OperationType.CLEAR})
 SET_ONLY = frozenset({OperationType.SET})
-TUPLE_OPS = frozenset(
+TUPLE_IDENTIFIED_OPS = frozenset(
     {OperationType.SET, OperationType.APPEND_UNIQUE, OperationType.MERGE_BY_ID, OperationType.CLEAR}
 )
+TUPLE_SCALAR_OPS = frozenset({OperationType.SET, OperationType.APPEND_UNIQUE, OperationType.CLEAR})
 
 
 PATH_RULES: Mapping[str, PathRule] = MappingProxyType(
@@ -117,35 +118,36 @@ PATH_RULES: Mapping[str, PathRule] = MappingProxyType(
         "project.name": PathRule(SET, (str,), True),
         "project.metadata": PathRule(SET, (Mapping,)),
         "work.source": PathRule(SET, (str,), True),
-        "work.hierarchy": PathRule(TUPLE_OPS, (tuple,), item_types=(WorkHierarchyItem,)),
+        "work.hierarchy": PathRule(TUPLE_IDENTIFIED_OPS, (tuple,), item_types=(WorkHierarchyItem,)),
         "work.item": PathRule(SET, (WorkItem,), True),
-        "work.completed_items": PathRule(TUPLE_OPS, (tuple,), item_types=(WorkItem,)),
-        "work.dependencies": PathRule(TUPLE_OPS, (tuple,), item_types=(str,)),
+        "work.completed_items": PathRule(TUPLE_IDENTIFIED_OPS, (tuple,), item_types=(WorkItem,)),
+        "work.dependencies": PathRule(TUPLE_SCALAR_OPS, (tuple,), item_types=(str,)),
         "work.delivery_scope": PathRule(SET, (DeliveryScope,), True),
-        "work.available_items": PathRule(TUPLE_OPS, (tuple,), item_types=(WorkItem,)),
+        "work.available_items": PathRule(TUPLE_IDENTIFIED_OPS, (tuple,), item_types=(WorkItem,)),
         "task_package.ready": PathRule(SET_ONLY, (bool,)),
         "task_package.metadata": PathRule(SET, (Mapping,)),
-        "requirements.items": PathRule(TUPLE_OPS, (tuple,), item_types=(str,)),
-        "acceptance_criteria.items": PathRule(TUPLE_OPS, (tuple,), item_types=(str,)),
-        "architecture_invariants.items": PathRule(TUPLE_OPS, (tuple,), item_types=(str,)),
+        "requirements.items": PathRule(TUPLE_SCALAR_OPS, (tuple,), item_types=(str,)),
+        "acceptance_criteria.items": PathRule(TUPLE_SCALAR_OPS, (tuple,), item_types=(str,)),
+        "architecture_invariants.items": PathRule(TUPLE_SCALAR_OPS, (tuple,), item_types=(str,)),
         "baseline.revision": PathRule(SET, (str,), True),
         "baseline.metadata": PathRule(SET, (Mapping,)),
-        "scope.included": PathRule(TUPLE_OPS, (tuple,), item_types=(str,)),
-        "scope.excluded": PathRule(TUPLE_OPS, (tuple,), item_types=(str,)),
+        "scope.included": PathRule(TUPLE_SCALAR_OPS, (tuple,), item_types=(str,)),
+        "scope.excluded": PathRule(TUPLE_SCALAR_OPS, (tuple,), item_types=(str,)),
         "risk.level": PathRule(SET, (RiskLevel,), True),
-        "changes.agent_reported_files": PathRule(TUPLE_OPS, (tuple,), item_types=(str,)),
-        "changes.identifiers": PathRule(TUPLE_OPS, (tuple,), item_types=(str,)),
+        "changes.agent_reported_files": PathRule(TUPLE_SCALAR_OPS, (tuple,), item_types=(str,)),
+        "changes.identifiers": PathRule(TUPLE_SCALAR_OPS, (tuple,), item_types=(str,)),
         "changes.count": PathRule(
             frozenset({OperationType.SET, OperationType.INCREMENT}),
             (int,),
         ),
         "validation.verdict": PathRule(SET_ONLY, (ValidationVerdict,)),
-        "validation.checks": PathRule(TUPLE_OPS, (tuple,), item_types=(str,)),
+        "validation.checks": PathRule(TUPLE_SCALAR_OPS, (tuple,), item_types=(str,)),
         "review.verdict": PathRule(SET_ONLY, (ReviewVerdict,)),
         "review.safe_to_close": PathRule(SET_ONLY, (bool,)),
-        "review.findings": PathRule(TUPLE_OPS, (tuple,), item_types=(str,)),
+        "review.safe_to_create_pr": PathRule(SET_ONLY, (bool,)),
+        "review.findings": PathRule(TUPLE_SCALAR_OPS, (tuple,), item_types=(str,)),
         "repair.classification": PathRule(SET, (RepairClassification,), True),
-        "repair.history": PathRule(TUPLE_OPS, (tuple,), item_types=(RepairRecord,)),
+        "repair.history": PathRule(TUPLE_IDENTIFIED_OPS, (tuple,), item_types=(RepairRecord,)),
         "failure.category": PathRule(SET, (FailureCategory,), True),
         "failure.code": PathRule(SET, (str,), True),
         "cancellation.requested": PathRule(SET_ONLY, (bool,)),

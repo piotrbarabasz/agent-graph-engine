@@ -9,6 +9,7 @@ from agentgraph.core import (
     GraphEngine,
     NodeResult,
     NodeStatus,
+    NodeType,
     PatchOperation,
     PolicySnapshot,
     ProgrammerRoute,
@@ -16,10 +17,11 @@ from agentgraph.core import (
     RiskLevel,
     RunStatus,
     StatePatch,
+    UnauthorizedStatePatchError,
     ValidationVerdict,
     WorkItem,
 )
-from agentgraph.core.state import GraphProgress, WorkState
+from agentgraph.core.state import GraphProgress, ReviewState, WorkState
 from agentgraph.core.v1_graph import V1_NODE_IDS
 
 
@@ -56,6 +58,35 @@ def test_canonical_node_ids_and_delivery_review_name() -> None:
     assert tuple(node.id for node in CANONICAL_V1_GRAPH.nodes) == V1_NODE_IDS
     assert "DELIVERY_REVIEW" in V1_NODE_IDS
     assert "EPIC_REVIEW" not in V1_NODE_IDS
+
+
+@pytest.mark.parametrize(
+    ("node_id", "node_type"),
+    [
+        ("START", NodeType.DETERMINISTIC),
+        ("DISCOVER_PROJECT", NodeType.DETERMINISTIC),
+        ("PREFLIGHT", NodeType.DETERMINISTIC),
+        ("SELECT_WORK", NodeType.DETERMINISTIC),
+        ("EXPLORE", NodeType.LLM_READ_ONLY),
+        ("BUILD_TASK_PACKAGE", NodeType.LLM_READ_ONLY),
+        ("ASSESS_RISK", NodeType.LLM_READ_ONLY),
+        ("HUMAN_CHECKPOINT", NodeType.HUMAN_CHECKPOINT),
+        ("IMPLEMENT", NodeType.LLM_WRITE),
+        ("VALIDATE", NodeType.DETERMINISTIC),
+        ("REVIEW", NodeType.LLM_READ_ONLY),
+        ("CLASSIFY_FAILURE", NodeType.LLM_READ_ONLY),
+        ("PROGRAMMER_REPAIR", NodeType.LLM_WRITE),
+        ("DEBUGGER", NodeType.LLM_WRITE),
+        ("CLOSE_TASK", NodeType.EXTERNAL_OPERATION),
+        ("MORE_WORK", NodeType.DETERMINISTIC),
+        ("DELIVERY_REVIEW", NodeType.LLM_READ_ONLY),
+        ("CREATE_PR", NodeType.EXTERNAL_OPERATION),
+        ("FINALIZE", NodeType.DETERMINISTIC),
+        ("END", NodeType.DETERMINISTIC),
+    ],
+)
+def test_canonical_node_type_mapping(node_id: str, node_type: NodeType) -> None:
+    assert CANONICAL_V1_GRAPH.node(node_id).node_type is node_type
 
 
 @pytest.mark.parametrize(
@@ -201,3 +232,123 @@ def test_more_work_routes(work: WorkState, limit: int, target: str, status: RunS
     state, transition = engine.apply_result(state, success("MORE_WORK", state))
     assert transition.to_node == target
     assert state.run.status is status
+
+
+def test_completed_work_without_current_item_enters_delivery_review() -> None:
+    engine = GraphEngine(CANONICAL_V1_GRAPH, PolicySnapshot())
+    state = at(
+        engine,
+        "SELECT_WORK",
+        work=WorkState(completed_items=(WorkItem("ABC-123"),)),
+    )
+
+    state, transition = engine.apply_result(state, success("SELECT_WORK", state))
+
+    assert transition.to_node == "DELIVERY_REVIEW"
+    assert state.run.status is RunStatus.RUNNING
+
+
+@pytest.mark.parametrize(
+    ("verdict", "safe_to_create_pr", "target", "status"),
+    [
+        (ReviewVerdict.PASS, True, "HUMAN_CHECKPOINT", RunStatus.RUNNING),
+        (ReviewVerdict.PASS, False, "FINALIZE", RunStatus.FAILED),
+        (ReviewVerdict.FAIL, False, "FINALIZE", RunStatus.FAILED),
+    ],
+)
+def test_delivery_review_gate(
+    verdict: ReviewVerdict,
+    safe_to_create_pr: bool,
+    target: str,
+    status: RunStatus,
+) -> None:
+    engine = GraphEngine(CANONICAL_V1_GRAPH, PolicySnapshot())
+    state = at(engine, "DELIVERY_REVIEW")
+    state, transition = engine.apply_result(
+        state,
+        success(
+            "DELIVERY_REVIEW",
+            state,
+            PatchOperation.set("review.verdict", verdict),
+            PatchOperation.set("review.safe_to_create_pr", safe_to_create_pr),
+        ),
+    )
+
+    assert transition.to_node == target
+    assert state.run.status is status
+    if target == "HUMAN_CHECKPOINT":
+        assert state.graph.pending_resume_node == "CREATE_PR"
+
+
+def test_stale_task_review_does_not_authorize_delivery() -> None:
+    engine = GraphEngine(CANONICAL_V1_GRAPH, PolicySnapshot())
+    stale_review = ReviewState(verdict=ReviewVerdict.PASS, safe_to_close=True)
+    state = at(engine, "DELIVERY_REVIEW", review=stale_review)
+
+    state, transition = engine.apply_result(state, success("DELIVERY_REVIEW", state))
+
+    assert transition.to_node == "FINALIZE"
+    assert state.run.status is RunStatus.FAILED
+
+
+def test_task_review_cannot_patch_delivery_pr_gate() -> None:
+    engine = GraphEngine(CANONICAL_V1_GRAPH, PolicySnapshot())
+    state = at(engine, "REVIEW")
+    with pytest.raises(UnauthorizedStatePatchError):
+        engine.apply_result(
+            state,
+            success(
+                "REVIEW",
+                state,
+                PatchOperation.set("review.safe_to_create_pr", True),
+            ),
+        )
+
+
+def test_finalize_has_only_edges_to_end() -> None:
+    outgoing = CANONICAL_V1_GRAPH.outgoing("FINALIZE")
+    assert outgoing
+    assert all(edge.to_node == "END" and edge.terminal for edge in outgoing)
+
+
+@pytest.mark.parametrize(
+    ("category", "status"),
+    [
+        (FailureCategory.INFRASTRUCTURE, RunStatus.BLOCKED),
+        (FailureCategory.ENVIRONMENT, RunStatus.BLOCKED),
+        (FailureCategory.EXTERNAL_SERVICE, RunStatus.BLOCKED),
+        (FailureCategory.POLICY, RunStatus.FAILED),
+        (FailureCategory.CONTRACT, RunStatus.FAILED),
+        (FailureCategory.INTERNAL, RunStatus.FAILED),
+    ],
+)
+def test_create_pr_failure_semantics(category: FailureCategory, status: RunStatus) -> None:
+    engine = GraphEngine(CANONICAL_V1_GRAPH, PolicySnapshot())
+    state = at(engine, "CREATE_PR")
+    state, transition = engine.apply_result(state, failure("CREATE_PR", category))
+    assert transition.to_node == "FINALIZE"
+    assert state.run.status is status
+
+
+@pytest.mark.parametrize(
+    ("node_status", "run_status"),
+    [
+        (NodeStatus.TIMED_OUT, RunStatus.BLOCKED),
+        (NodeStatus.CANCELLED, RunStatus.CANCELLED),
+    ],
+)
+def test_create_pr_non_failure_terminal_statuses(
+    node_status: NodeStatus, run_status: RunStatus
+) -> None:
+    engine = GraphEngine(CANONICAL_V1_GRAPH, PolicySnapshot())
+    state = at(engine, "CREATE_PR")
+    state, transition = engine.apply_result(
+        state,
+        NodeResult("CREATE_PR", "a", node_status),
+    )
+    assert transition.to_node == "FINALIZE"
+    assert state.run.status is run_status
+
+
+def test_default_work_item_limit_matches_frozen_policy() -> None:
+    assert PolicySnapshot().max_work_items_per_run == 20

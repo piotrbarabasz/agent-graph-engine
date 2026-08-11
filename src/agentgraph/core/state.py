@@ -256,12 +256,15 @@ class ReviewState:
     verdict: ReviewVerdict = ReviewVerdict.UNKNOWN
     safe_to_close: bool = False
     findings: tuple[str, ...] = ()
+    safe_to_create_pr: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.verdict, ReviewVerdict):
             raise ContractValidationError("review verdict must be a ReviewVerdict")
         if type(self.safe_to_close) is not bool:
             raise ContractValidationError("safe_to_close must be boolean")
+        if type(self.safe_to_create_pr) is not bool:
+            raise ContractValidationError("safe_to_create_pr must be boolean")
 
 
 @dataclass(frozen=True, slots=True)

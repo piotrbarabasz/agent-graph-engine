@@ -118,3 +118,11 @@ def test_scope_is_frozen_after_implement_entry() -> None:
 def test_illegal_value_operation_or_path_is_rejected(operation: PatchOperation) -> None:
     with pytest.raises(InvalidStatePatchError):
         apply(GraphState.initial("run"), operation)
+
+
+def test_merge_by_id_is_not_a_legal_scalar_tuple_operation() -> None:
+    with pytest.raises(InvalidStatePatchError, match=r"not legal for requirements\.items"):
+        apply(
+            GraphState.initial("run"),
+            PatchOperation.merge_by_id("requirements.items", "REQ-1"),
+        )

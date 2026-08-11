@@ -5,6 +5,8 @@ from __future__ import annotations
 from .edges import (
     AllCondition,
     CheckpointOutcomeCondition,
+    CompletedWorkCondition,
+    DeliveryReviewCondition,
     Edge,
     FailureCategoryCondition,
     PendingResumeCondition,
@@ -132,19 +134,35 @@ def canonical_v1_graph() -> GraphDefinition:
         "ASSESS_RISK": ("risk.level",),
         "IMPLEMENT": ("changes.*",),
         "VALIDATE": ("validation.*", "failure.*"),
-        "REVIEW": ("review.*", "failure.*"),
+        "REVIEW": (
+            "review.verdict",
+            "review.safe_to_close",
+            "review.findings",
+            "failure.*",
+        ),
         "CLASSIFY_FAILURE": ("repair.classification", "repair.history"),
         "PROGRAMMER_REPAIR": ("changes.*",),
         "DEBUGGER": ("changes.*",),
         "CLOSE_TASK": ("work.item", "work.completed_items", "work.available_items"),
         "MORE_WORK": ("work.item", "work.available_items"),
-        "DELIVERY_REVIEW": ("review.*",),
+        "DELIVERY_REVIEW": (
+            "review.verdict",
+            "review.safe_to_create_pr",
+            "review.findings",
+        ),
     }
     special_types = {
+        "EXPLORE": NodeType.LLM_READ_ONLY,
+        "BUILD_TASK_PACKAGE": NodeType.LLM_READ_ONLY,
+        "ASSESS_RISK": NodeType.LLM_READ_ONLY,
         "HUMAN_CHECKPOINT": NodeType.HUMAN_CHECKPOINT,
         "IMPLEMENT": NodeType.LLM_WRITE,
+        "REVIEW": NodeType.LLM_READ_ONLY,
+        "CLASSIFY_FAILURE": NodeType.LLM_READ_ONLY,
         "PROGRAMMER_REPAIR": NodeType.LLM_WRITE,
         "DEBUGGER": NodeType.LLM_WRITE,
+        "CLOSE_TASK": NodeType.EXTERNAL_OPERATION,
+        "DELIVERY_REVIEW": NodeType.LLM_READ_ONLY,
         "CREATE_PR": NodeType.EXTERNAL_OPERATION,
     }
     nodes = tuple(
@@ -167,7 +185,6 @@ def canonical_v1_graph() -> GraphDefinition:
         ("PROGRAMMER_REPAIR", "VALIDATE"),
         ("DEBUGGER", "VALIDATE"),
         ("CLOSE_TASK", "MORE_WORK"),
-        ("CREATE_PR", "FINALIZE"),
     )
     for source, target in straight:
         edges.append(
@@ -189,14 +206,92 @@ def canonical_v1_graph() -> GraphDefinition:
                 _all(_status(NodeStatus.SUCCEEDED), WorkCondition("current", True)),
             ),
             _edge(
-                "select-work-empty",
+                "select-work-noop",
+                "SELECT_WORK",
+                "FINALIZE",
+                _all(
+                    _status(NodeStatus.SUCCEEDED),
+                    WorkCondition("current", False),
+                    CompletedWorkCondition(False),
+                ),
+                final_status=RunStatus.COMPLETED,
+            ),
+            _edge(
+                "select-work-delivery-complete",
                 "SELECT_WORK",
                 "DELIVERY_REVIEW",
-                _all(_status(NodeStatus.SUCCEEDED), WorkCondition("current", False)),
+                _all(
+                    _status(NodeStatus.SUCCEEDED),
+                    WorkCondition("current", False),
+                    CompletedWorkCondition(True),
+                ),
             ),
         ]
     )
     edges.extend(_common_failure_edges("SELECT_WORK"))
+
+    create_pr_operational_failures = frozenset(
+        {
+            FailureCategory.INFRASTRUCTURE,
+            FailureCategory.ENVIRONMENT,
+            FailureCategory.EXTERNAL_SERVICE,
+        }
+    )
+    create_pr_terminal_failures = frozenset(
+        {
+            FailureCategory.POLICY,
+            FailureCategory.CONTRACT,
+            FailureCategory.INTERNAL,
+            FailureCategory.IMPLEMENTATION,
+            FailureCategory.DESIGN,
+            FailureCategory.VALIDATION,
+        }
+    )
+    edges.extend(
+        [
+            _edge(
+                "create-pr-succeeded",
+                "CREATE_PR",
+                "FINALIZE",
+                _status(NodeStatus.SUCCEEDED),
+            ),
+            _edge(
+                "create-pr-operational-failure",
+                "CREATE_PR",
+                "FINALIZE",
+                FailureCategoryCondition(create_pr_operational_failures),
+                final_status=RunStatus.BLOCKED,
+            ),
+            _edge(
+                "create-pr-terminal-failure",
+                "CREATE_PR",
+                "FINALIZE",
+                FailureCategoryCondition(create_pr_terminal_failures),
+                final_status=RunStatus.FAILED,
+            ),
+            _edge(
+                "create-pr-timeout",
+                "CREATE_PR",
+                "FINALIZE",
+                _status(NodeStatus.TIMED_OUT),
+                final_status=RunStatus.BLOCKED,
+            ),
+            _edge(
+                "create-pr-cancelled",
+                "CREATE_PR",
+                "FINALIZE",
+                _status(NodeStatus.CANCELLED),
+                final_status=RunStatus.CANCELLED,
+            ),
+            _edge(
+                "create-pr-blocked",
+                "CREATE_PR",
+                "FINALIZE",
+                _status(NodeStatus.BLOCKED, NodeStatus.CHECKPOINT_REQUIRED),
+                final_status=RunStatus.BLOCKED,
+            ),
+        ]
+    )
 
     for levels, target, checkpoint, resume in (
         ((RiskLevel.LOW, RiskLevel.MEDIUM, RiskLevel.HIGH), "IMPLEMENT", False, None),
@@ -449,28 +544,78 @@ def canonical_v1_graph() -> GraphDefinition:
     )
     edges.extend(_common_failure_edges("MORE_WORK"))
 
-    edges.append(
-        _edge(
-            "delivery-review-checkpoint",
-            "DELIVERY_REVIEW",
-            "HUMAN_CHECKPOINT",
-            _status(NodeStatus.SUCCEEDED),
-            checkpoint=True,
-            resume_node="CREATE_PR",
-        )
+    edges.extend(
+        [
+            _edge(
+                "delivery-review-checkpoint",
+                "DELIVERY_REVIEW",
+                "HUMAN_CHECKPOINT",
+                _all(
+                    _status(NodeStatus.SUCCEEDED),
+                    DeliveryReviewCondition(ReviewVerdict.PASS, True),
+                ),
+                checkpoint=True,
+                resume_node="CREATE_PR",
+            ),
+            _edge(
+                "delivery-review-failed",
+                "DELIVERY_REVIEW",
+                "FINALIZE",
+                _all(
+                    _status(NodeStatus.SUCCEEDED),
+                    DeliveryReviewCondition(ReviewVerdict.FAIL),
+                ),
+                final_status=RunStatus.FAILED,
+            ),
+            _edge(
+                "delivery-review-unsafe",
+                "DELIVERY_REVIEW",
+                "FINALIZE",
+                _all(
+                    _status(NodeStatus.SUCCEEDED),
+                    DeliveryReviewCondition(ReviewVerdict.PASS, False),
+                ),
+                final_status=RunStatus.FAILED,
+            ),
+        ]
     )
     edges.extend(_common_failure_edges("DELIVERY_REVIEW"))
 
-    edges.append(
-        _edge(
-            "finalize-end",
-            "FINALIZE",
-            "END",
-            _status(NodeStatus.SUCCEEDED),
-            terminal=True,
-        )
+    edges.extend(
+        [
+            _edge(
+                "finalize-end",
+                "FINALIZE",
+                "END",
+                _status(NodeStatus.SUCCEEDED),
+                terminal=True,
+            ),
+            _edge(
+                "finalize-failed-end",
+                "FINALIZE",
+                "END",
+                _status(NodeStatus.FAILED, NodeStatus.TIMED_OUT),
+                final_status=RunStatus.FAILED,
+                terminal=True,
+            ),
+            _edge(
+                "finalize-cancelled-end",
+                "FINALIZE",
+                "END",
+                _status(NodeStatus.CANCELLED),
+                final_status=RunStatus.CANCELLED,
+                terminal=True,
+            ),
+            _edge(
+                "finalize-blocked-end",
+                "FINALIZE",
+                "END",
+                _status(NodeStatus.BLOCKED, NodeStatus.CHECKPOINT_REQUIRED),
+                final_status=RunStatus.BLOCKED,
+                terminal=True,
+            ),
+        ]
     )
-    edges.extend(_common_failure_edges("FINALIZE"))
     return GraphDefinition(nodes, tuple(edges))
 
 

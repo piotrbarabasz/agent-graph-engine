@@ -67,7 +67,12 @@ def base_scripts(
             ),
         ),
         "MORE_WORK": (template(),),
-        "DELIVERY_REVIEW": (template(),),
+        "DELIVERY_REVIEW": (
+            template(
+                PatchOperation.set("review.verdict", ReviewVerdict.PASS),
+                PatchOperation.set("review.safe_to_create_pr", True),
+            ),
+        ),
         "HUMAN_CHECKPOINT": (ResultTemplate(checkpoint_outcome=CheckpointOutcome.APPROVED),),
         "CREATE_PR": (template(),),
         "FINALIZE": (template(),),
@@ -227,9 +232,30 @@ def test_no_work_no_op_run() -> None:
     log: list[str] = []
     state, _ = execute(base_scripts(select_templates=(template(),), log=log))
     assert state.run.status is RunStatus.COMPLETED
-    assert "EXPLORE" not in log
-    assert "IMPLEMENT" not in log
-    assert "DELIVERY_REVIEW" in log
+    for skipped_node in (
+        "EXPLORE",
+        "IMPLEMENT",
+        "DELIVERY_REVIEW",
+        "HUMAN_CHECKPOINT",
+        "CREATE_PR",
+    ):
+        assert skipped_node not in log
+
+
+def test_failing_finalize_terminates_without_loop() -> None:
+    log: list[str] = []
+    scripts = base_scripts(select_templates=(template(),), log=log)
+    scripts["FINALIZE"] = ScriptedNode(
+        "FINALIZE",
+        failed(FailureCategory.INTERNAL),
+        call_log=log,
+    )
+
+    state, _ = execute(scripts)
+
+    assert state.graph.current_node == "END"
+    assert state.run.status is RunStatus.FAILED
+    assert log.count("FINALIZE") == 1
 
 
 def test_multi_work_item_loop_then_delivery_finalize() -> None:

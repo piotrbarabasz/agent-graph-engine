@@ -13,7 +13,7 @@ class PolicySnapshot:
     """Resolved policy that cannot change during a run."""
 
     max_repair_cycles: int = 2
-    max_work_items_per_run: int = 10
+    max_work_items_per_run: int = 20
     commit_mode: CommitMode = CommitMode.DISABLED
     push_mode: bool = False
     pull_request_mode: bool = False
