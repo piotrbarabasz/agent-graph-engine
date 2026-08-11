@@ -134,6 +134,19 @@ def test_full_happy_path() -> None:
     ]
 
 
+def test_context_and_invocation_refactor_preserves_step_identity() -> None:
+    node = ScriptedNode("START")
+    engine = GraphEngine(CANONICAL_V1_GRAPH, PolicySnapshot(), {"START": node})
+    state = engine.initial_state("context-regression")
+    context = engine.build_node_context(state)
+    result = engine.invoke_node(state, context)
+    next_state, transition = engine.apply_result(state, result)
+    assert context.node_attempt_id == "context-regression:START:1"
+    assert result.attempt_id == context.node_attempt_id
+    assert transition.to_node == "DISCOVER_PROJECT"
+    assert next_state.state_version == 1
+
+
 def test_critical_risk_checkpoint_path() -> None:
     log: list[str] = []
     checkpoints = (

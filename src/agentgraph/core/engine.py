@@ -122,16 +122,22 @@ class GraphEngine:
     ) -> tuple[GraphState, NodeResult, Transition]:
         """Run the injected node at the current cursor and apply its result."""
 
+        context = self.build_node_context(state, deadline=deadline)
+        result = self.invoke_node(state, context)
+        next_state, transition = self.apply_result(state, result)
+        return next_state, result, transition
+
+    def build_node_context(
+        self, state: GraphState, *, deadline: datetime | None = None
+    ) -> NodeContext:
+        """Build the canonical identity and policy context before node invocation."""
+
         node_id = state.graph.current_node
         if node_id == "END":
             raise GraphTransitionError("END is terminal and cannot be stepped")
-        try:
-            node = self.nodes[node_id]
-        except KeyError as exc:
-            raise ContractValidationError(f"no runtime node injected for {node_id}") from exc
-        attempt_id = f"{state.run.run_id}:{node_id}:{state.graph.transition_seq + 1}"
         definition = self.graph.node(node_id)
-        context = NodeContext(
+        attempt_id = f"{state.run.run_id}:{node_id}:{state.graph.transition_seq + 1}"
+        return NodeContext(
             run_id=state.run.run_id,
             node_attempt_id=attempt_id,
             idempotency_key=attempt_id,
@@ -139,11 +145,19 @@ class GraphEngine:
             policy_snapshot=self.policy,
             allowed_state_patch_paths=definition.allowed_patch_paths,
         )
+
+    def invoke_node(self, state: GraphState, context: NodeContext) -> NodeResult:
+        """Invoke one injected node and enforce its pre-recorded attempt identity."""
+
+        node_id = state.graph.current_node
+        try:
+            node = self.nodes[node_id]
+        except KeyError as exc:
+            raise ContractValidationError(f"no runtime node injected for {node_id}") from exc
         result = node.run(state, context)
-        if result.attempt_id != attempt_id:
+        if result.node_id != node_id or result.attempt_id != context.node_attempt_id:
             raise ContractValidationError("node result attempt_id does not match context")
-        next_state, transition = self.apply_result(state, result)
-        return next_state, result, transition
+        return result
 
     def run(self, state: GraphState, *, max_steps: int = 1_000) -> GraphState:
         """Execute injected in-memory nodes until END or a safety step bound."""
