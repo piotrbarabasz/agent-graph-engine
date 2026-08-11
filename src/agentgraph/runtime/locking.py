@@ -12,8 +12,21 @@ from pathlib import Path
 from typing import BinaryIO
 
 from .atomic import atomic_write_bytes
-from .codec import canonical_json_bytes, format_timestamp, parse_json_bytes, utc_now
-from .errors import ProjectLockedError, StaleLeaseError
+from .codec import (
+    canonical_json_bytes,
+    decode_value,
+    format_timestamp,
+    parse_json_bytes,
+    parse_timestamp,
+    utc_now,
+)
+from .errors import (
+    ProjectLockedError,
+    SerializationError,
+    StaleLeaseError,
+    StaleLeaseMismatchError,
+    UnsupportedSchemaError,
+)
 
 
 class AdvisoryFileLock:
@@ -86,6 +99,14 @@ class LockMetadata:
     engine_version: str = "0.1.0"
     schema_version: int = 1
 
+    def __post_init__(self) -> None:
+        if self.schema_version != 1:
+            raise UnsupportedSchemaError("unsupported lock metadata schema")
+        if not self.project_id.startswith("prj_") or not self.run_id.startswith("run_"):
+            raise SerializationError("invalid lock metadata identity")
+        parse_timestamp(self.acquired_at)
+        parse_timestamp(self.heartbeat_at)
+
 
 class ProjectLock:
     """Project-wide writer lock; lock.json is evidence, never the primitive."""
@@ -117,6 +138,14 @@ class ProjectLock:
                 if not self.recovery:
                     raise StaleLeaseError("stale lock metadata requires explicit recovery mode")
                 raw_lease = self.metadata_path.read_bytes()
+                try:
+                    stale = decode_value(parse_json_bytes(raw_lease), LockMetadata)
+                except (OSError, SerializationError) as exc:
+                    raise StaleLeaseMismatchError("stale lease metadata is invalid") from exc
+                if stale.project_id != self.project_id or stale.run_id != self.run_id:
+                    raise StaleLeaseMismatchError(
+                        "stale lease identity does not match requested recovery run"
+                    )
                 evidence_dir = self.recovery_evidence_dir or self.metadata_path.parent / "recovery"
                 evidence_dir.mkdir(parents=True, exist_ok=True)
                 digest = hashlib.sha256(raw_lease).hexdigest()
@@ -151,10 +180,15 @@ class ProjectLock:
         atomic_write_bytes(self.metadata_path, canonical_json_bytes(self.metadata))
 
     def release(self) -> None:
-        if self.metadata is not None:
-            self.metadata_path.unlink(missing_ok=True)
+        try:
+            if self.metadata is not None:
+                self._remove_metadata()
+        finally:
             self.metadata = None
-        self.os_lock.release()
+            self.os_lock.release()
+
+    def _remove_metadata(self) -> None:
+        self.metadata_path.unlink(missing_ok=True)
 
     def read_metadata(self) -> dict[str, object]:
         return parse_json_bytes(self.metadata_path.read_bytes())

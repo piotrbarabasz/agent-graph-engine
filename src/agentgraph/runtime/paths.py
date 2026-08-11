@@ -44,5 +44,14 @@ class RuntimePaths:
     def lease(self, project_id: str) -> Path:
         return self.project(project_id) / "lock.json"
 
+    def active_run(self, project_id: str) -> Path:
+        return self.project(project_id) / "active-run.json"
+
     def run(self, project_id: str, run_id: str) -> Path:
         return self.project(project_id) / "runs" / run_id
+
+    def initializing_run(self, project_id: str, run_id: str) -> Path:
+        return self.project(project_id) / "runs" / f".initializing-{run_id}"
+
+    def initialization_recovery(self, project_id: str) -> Path:
+        return self.project(project_id) / "initialization-recovery"

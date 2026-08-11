@@ -15,3 +15,4 @@
 - Recovery never guesses. Interrupted write/external nodes block without a reconciler.
 - Locks use an OS advisory primitive; metadata is diagnostic and stale leases are never silently taken.
 - Every durable crash boundary requires a fault-injection regression test.
+- A project owns at most one unfinished writer run; initialization uses preserved staging evidence.

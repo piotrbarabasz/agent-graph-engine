@@ -20,3 +20,5 @@ The package uses a `src` layout. `agentgraph.core` remains entirely in memory.
 `agentgraph.runtime` stores local runtime artifacts outside the target repository,
 under `~/.agentgraph` by default. Library users and tests may override this with an
 explicit `RuntimePaths` root or the `AGENTGRAPH_HOME` environment variable.
+Each project permits one unfinished writer run; incomplete initialization remains in
+preserved staging until an explicit library recovery call retries it.

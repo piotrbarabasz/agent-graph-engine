@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
@@ -18,9 +19,17 @@ from .codec import (
     parse_json_bytes,
     utc_now,
 )
-from .errors import RunAlreadyExistsError, RunNotFoundError
+from .errors import (
+    ActiveRunExistsError,
+    AgentGraphRuntimeError,
+    IncompleteRunInitializationError,
+    RunAlreadyExistsError,
+    RunNotFoundError,
+    SerializationError,
+)
 from .ids import generate_run_id
 from .journal import Journal, JournalRecordType
+from .lifecycle import ActiveRunRecord
 from .locking import ProjectLock
 from .paths import RuntimePaths
 from .project_registry import ProjectRecord
@@ -62,17 +71,36 @@ class DurableGraphCoordinator:
         """Atomically initialize state version zero and RUN_STARTED under project lock."""
 
         selected = run_id or self.run_id_factory()
+        return self._start_run(selected, recover_incomplete=False)
+
+    def recover_incomplete_run_initialization(self, run_id: str) -> RunHandle:
+        """Preserve staging evidence and explicitly retry one incomplete initialization."""
+
+        return self._start_run(run_id, recover_incomplete=True)
+
+    def _start_run(self, selected: str, *, recover_incomplete: bool) -> RunHandle:
         run_path = self.paths.run(self.project.project_id, selected)
+        staging = self.paths.initializing_run(self.project.project_id, selected)
         with self._lock(selected):
             if run_path.exists():
                 raise RunAlreadyExistsError(f"run already exists: {selected}")
-            run_path.mkdir(parents=True)
-            (run_path / "recovery").mkdir()
-            (run_path / "temp").mkdir()
+            self._enforce_active_run_lifecycle()
+            if staging.exists():
+                if not recover_incomplete:
+                    raise IncompleteRunInitializationError(
+                        f"incomplete staging run requires explicit recovery: {selected}"
+                    )
+                self._preserve_incomplete_staging(staging, selected)
+            staging.mkdir(parents=True)
+            self.fault("after_run_staging_creation")
+            (staging / "recovery").mkdir()
+            (staging / "temp").mkdir()
             state = self.engine.initial_state(selected)
-            persisted = StateStore(run_path / "state.json").initialize(state)
-            journal = Journal(run_path / "journal.jsonl", selected, now=self.now)
+            persisted = StateStore(staging / "state.json").initialize(state)
+            self.fault("after_state_initialization")
+            journal = Journal(staging / "journal.jsonl", selected, now=self.now)
             journal.initialize()
+            self.fault("after_journal_creation")
             journal.append(
                 JournalRecordType.RUN_STARTED,
                 {
@@ -80,6 +108,14 @@ class DurableGraphCoordinator:
                     "initial_state_digest": persisted.digest,
                 },
             )
+            self.fault("after_run_started")
+            self.fault("before_run_promotion")
+            os.replace(staging, run_path)
+            self._fsync_runs_directory()
+            self.fault("after_run_promotion")
+            self.fault("before_run_activation")
+            self._write_active_run(selected)
+            self.fault("after_run_activation")
         return RunHandle(self.project.project_id, selected, run_path)
 
     def open_session(self, run_id: str, *, recovery: bool = False) -> RuntimeSession:
@@ -87,8 +123,156 @@ class DurableGraphCoordinator:
 
         run_path = self.paths.run(self.project.project_id, run_id)
         if not run_path.is_dir():
+            if self.paths.initializing_run(self.project.project_id, run_id).exists():
+                raise IncompleteRunInitializationError(
+                    f"run initialization is incomplete: {run_id}"
+                )
             raise RunNotFoundError(f"run not found: {run_id}")
+        self._validate_initialized_run(run_id)
         return RuntimeSession(self, RunHandle(self.project.project_id, run_id, run_path), recovery)
+
+    def _enforce_active_run_lifecycle(self) -> None:
+        active = self._read_active_run()
+        if active is not None:
+            if self._has_terminal_evidence(active.run_id):
+                self._clear_active_run(active.run_id)
+            else:
+                raise ActiveRunExistsError(f"unfinished active run exists: {active.run_id}")
+        unfinished = self._find_unfinished_runs()
+        if unfinished:
+            self._write_active_run(unfinished[0])
+            raise ActiveRunExistsError(f"unfinished active run exists: {unfinished[0]}")
+
+    def _find_unfinished_runs(self) -> tuple[str, ...]:
+        runs_dir = self.paths.project(self.project.project_id) / "runs"
+        unfinished = []
+        for path in runs_dir.iterdir():
+            if not path.is_dir() or path.name.startswith("."):
+                continue
+            self._validate_initialized_run(path.name)
+            if not self._has_terminal_evidence(path.name):
+                unfinished.append(path.name)
+        return tuple(sorted(unfinished))
+
+    def _validate_initialized_run(self, run_id: str) -> None:
+        run_path = self.paths.run(self.project.project_id, run_id)
+        try:
+            persisted = StateStore(run_path / "state.json").load_persisted()
+            records = Journal(run_path / "journal.jsonl", run_id, now=self.now).load()
+            first = records[0]
+            if (
+                first.record_type is not JournalRecordType.RUN_STARTED
+                or first.payload.get("initial_state_version") != 0
+                or persisted.state.run.run_id != run_id
+                or (
+                    persisted.state.state_version == 0
+                    and first.payload.get("initial_state_digest") != persisted.digest
+                )
+            ):
+                raise IncompleteRunInitializationError("RUN_STARTED evidence mismatch")
+        except (IndexError, OSError, AgentGraphRuntimeError) as exc:
+            if isinstance(exc, IncompleteRunInitializationError):
+                raise
+            raise IncompleteRunInitializationError(
+                f"canonical run initialization is incomplete: {run_id}"
+            ) from exc
+
+    def _has_terminal_evidence(self, run_id: str) -> bool:
+        run_path = self.paths.run(self.project.project_id, run_id)
+        try:
+            persisted = StateStore(run_path / "state.json").load_persisted()
+            if persisted.state.graph.current_node != "END":
+                return False
+            records = Journal(run_path / "journal.jsonl", run_id, now=self.now).load()
+            finalized = next(
+                (
+                    record
+                    for record in reversed(records)
+                    if record.record_type is not JournalRecordType.RECOVERY_NOTE
+                ),
+                None,
+            )
+            receipt = decode_value(
+                parse_json_bytes((run_path / "final.json").read_bytes()), FinalReceipt
+            )
+            return (
+                finalized is not None
+                and finalized.record_type is JournalRecordType.RUN_FINALIZED
+                and receipt.project_id == self.project.project_id
+                and receipt.run_id == run_id
+                and receipt.final_status == persisted.state.run.status.value
+                and receipt.final_state_version == persisted.state.state_version
+                and receipt.final_state_digest == persisted.digest
+            )
+        except (IndexError, OSError, AgentGraphRuntimeError):
+            return False
+
+    def _read_active_run(self) -> ActiveRunRecord | None:
+        path = self.paths.active_run(self.project.project_id)
+        if not path.exists():
+            return None
+        try:
+            record = decode_value(parse_json_bytes(path.read_bytes()), ActiveRunRecord)
+        except (OSError, SerializationError) as exc:
+            raise ActiveRunExistsError("active-run ownership is corrupt") from exc
+        if record.project_id != self.project.project_id:
+            raise ActiveRunExistsError("active-run project identity mismatch")
+        return record
+
+    def _write_active_run(self, run_id: str) -> None:
+        record = ActiveRunRecord(
+            self.project.project_id,
+            run_id,
+            format_timestamp(self.now()),
+        )
+        atomic_write_bytes(
+            self.paths.active_run(self.project.project_id), canonical_json_bytes(record)
+        )
+
+    def _clear_active_run(self, run_id: str) -> None:
+        active = self._read_active_run()
+        if active is not None and active.run_id == run_id:
+            self.paths.active_run(self.project.project_id).unlink()
+            self._fsync_project_directory()
+
+    def _assert_session_ownership(self, run_id: str) -> None:
+        state = StateStore(self.paths.run(self.project.project_id, run_id) / "state.json").load()
+        if state.graph.current_node == "END":
+            return
+        active = self._read_active_run()
+        if active is None:
+            self._write_active_run(run_id)
+            return
+        if active.run_id != run_id:
+            raise ActiveRunExistsError(f"another unfinished run owns the project: {active.run_id}")
+
+    def _preserve_incomplete_staging(self, staging: Path, run_id: str) -> None:
+        recovery_root = self.paths.initialization_recovery(self.project.project_id)
+        recovery_root.mkdir(parents=True, exist_ok=True)
+        index = 1
+        while (destination := recovery_root / f"{run_id}-{index}").exists():
+            index += 1
+        os.replace(staging, destination)
+
+    def _fsync_runs_directory(self) -> None:
+        if os.name == "nt":
+            return
+        runs = self.paths.project(self.project.project_id) / "runs"
+        descriptor = os.open(runs, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+    def _fsync_project_directory(self) -> None:
+        if os.name == "nt":
+            return
+        project = self.paths.project(self.project.project_id)
+        descriptor = os.open(project, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
 
     def _lock(self, run_id: str, *, recovery: bool = False) -> ProjectLock:
         return ProjectLock(
@@ -119,8 +303,13 @@ class RuntimeSession:
 
     def __enter__(self) -> RuntimeSession:
         self.lock.acquire()
-        self._entered = True
-        return self
+        try:
+            self.coordinator._assert_session_ownership(self.handle.run_id)
+            self._entered = True
+            return self
+        except BaseException:
+            self.lock.release()
+            raise
 
     def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
         self._entered = False
@@ -239,10 +428,12 @@ class RuntimeSession:
             )
             if comparable != expected:
                 raise RunAlreadyExistsError("terminal receipt conflicts with persisted state")
+            self.coordinator._clear_active_run(self.handle.run_id)
             return
         self.coordinator.fault("before_final_receipt")
         atomic_write_bytes(path, canonical_json_bytes(receipt))
         self.coordinator.fault("after_final_receipt")
+        self.coordinator._clear_active_run(self.handle.run_id)
 
     def _require_lock(self) -> None:
         if not self._entered:

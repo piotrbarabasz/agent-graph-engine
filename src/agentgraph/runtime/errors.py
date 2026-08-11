@@ -29,12 +29,24 @@ class StaleLeaseError(ProjectLockedError):
     """Diagnostic lease metadata remains and explicit recovery is required."""
 
 
+class StaleLeaseMismatchError(StaleLeaseError):
+    """Stale lease identity does not match the requested recovery run."""
+
+
+class ActiveRunExistsError(AgentGraphRuntimeError):
+    """A project already owns an unfinished writer run."""
+
+
 class RunAlreadyExistsError(AgentGraphRuntimeError):
     """A run directory already exists."""
 
 
 class RunNotFoundError(AgentGraphRuntimeError):
     """A requested run does not exist."""
+
+
+class IncompleteRunInitializationError(AgentGraphRuntimeError):
+    """Staging or canonical run initialization is incomplete."""
 
 
 class StateStoreError(AgentGraphRuntimeError):
