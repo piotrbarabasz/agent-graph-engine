@@ -188,8 +188,21 @@ class GitAdapter:
     def diff_check(self, repository: GitRepository) -> DiffCheckResult:
         """Check whitespace errors independently in unstaged and staged diffs."""
 
-        working = self._run(repository, ("--no-pager", "diff", "--check"))
-        staged = self._run(repository, ("--no-pager", "diff", "--cached", "--check"))
+        working = self._run(
+            repository,
+            ("--no-pager", "diff", "--no-ext-diff", "--no-textconv", "--check"),
+        )
+        staged = self._run(
+            repository,
+            (
+                "--no-pager",
+                "diff",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--cached",
+                "--check",
+            ),
+        )
         for result in (working, staged):
             if result.receipt.status in {ProcessStatus.TIMED_OUT, ProcessStatus.CANCELLED}:
                 self._require_success(result, "Git diff check did not complete")
@@ -226,7 +239,12 @@ class GitAdapter:
             raise GitPathError("stage_paths requires at least one explicit path")
         result = self._run(
             repository,
-            ("add", "--", *(path.as_posix() for path in relative_paths)),
+            (
+                "--literal-pathspecs",
+                "add",
+                "--",
+                *(path.as_posix() for path in relative_paths),
+            ),
         )
         self._require_success(result, "Git staging failed")
         return result.receipt
@@ -313,7 +331,7 @@ class GitAdapter:
         return _sorted_paths(normalized)
 
     def _diff_paths(self, repository: GitRepository, *, cached: bool) -> tuple[Path, ...]:
-        arguments = ["--no-pager", "diff"]
+        arguments = ["--no-pager", "diff", "--no-ext-diff", "--no-textconv"]
         if cached:
             arguments.append("--cached")
         arguments.extend(("--name-only", "-z"))
@@ -342,6 +360,12 @@ class GitAdapter:
             cwd=cwd,
             timeout_seconds=timeout_seconds or self.timeout_seconds,
             env={"GIT_TERMINAL_PROMPT": "0", "LC_ALL": "C", "LANG": "C"},
+            unset_env=tuple(
+                sorted(
+                    (key for key in os.environ if key.upper().startswith("GIT_")),
+                    key=lambda key: (key.upper(), key),
+                )
+            ),
         )
         try:
             return self.runner.run(spec)

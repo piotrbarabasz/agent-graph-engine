@@ -20,6 +20,6 @@
   never enter receipts or diagnostic representations.
 - Timeout and cancellation must terminate and reap every started process. `GitAdapter` executes only
   through `ProcessRunner`.
-- M003 Git operations are local-only: no remote/network or destructive operations. Explicit Git paths
-  use `--` and must remain contained in the repository.
+- M003 Git operations are local-only: no remote/network or destructive operations. Inherited `GIT_*`
+  context is removed, and explicit contained staging paths use `--literal-pathspecs` plus `--`.
 - Core and runtime remain Git-independent.

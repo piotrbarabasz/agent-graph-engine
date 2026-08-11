@@ -38,6 +38,7 @@ class CommandSpec:
     cwd: Path = field(repr=False)
     timeout_seconds: float | None = None
     env: Mapping[str, str] | None = field(default=None, repr=False)
+    unset_env: tuple[str, ...] = ()
     stdin: bytes | None = field(default=None, repr=False)
     max_stdout_bytes: int = DEFAULT_MAX_OUTPUT_BYTES
     max_stderr_bytes: int = DEFAULT_MAX_OUTPUT_BYTES
@@ -66,6 +67,13 @@ class CommandSpec:
                 raise InvalidCommandSpecError("output limits must be positive integers")
         if self.stdin is not None and type(self.stdin) is not bytes:
             raise InvalidCommandSpecError("stdin must be bytes or None")
+        if type(self.unset_env) is not tuple or not all(
+            type(key) is str and key and "=" not in key and "\x00" not in key
+            for key in self.unset_env
+        ):
+            raise InvalidCommandSpecError("unset_env must be a tuple of valid environment keys")
+        if len(set(self.unset_env)) != len(self.unset_env):
+            raise InvalidCommandSpecError("unset_env must not contain duplicate keys")
         if type(self.secret_values) is not tuple or not all(
             type(value) is str for value in self.secret_values
         ):
@@ -134,6 +142,8 @@ class ProcessRunner:
         started_at = self.now()
         started_tick = self.monotonic()
         environment = os.environ.copy()
+        for key in spec.unset_env:
+            environment.pop(key, None)
         if spec.env:
             environment.update(spec.env)
         redactor = self._redactor_for(spec, environment)

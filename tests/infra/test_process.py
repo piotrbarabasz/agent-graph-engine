@@ -49,6 +49,10 @@ def test_missing_executable_is_typed_start_error(tmp_path) -> None:
         lambda root: CommandSpec((sys.executable,), root, max_stdout_bytes=0),
         lambda root: CommandSpec((sys.executable,), root, stdin="text"),
         lambda root: CommandSpec((sys.executable,), root, env={"OK": 1}),
+        lambda root: CommandSpec((sys.executable,), root, unset_env=["VALUE"]),
+        lambda root: CommandSpec((sys.executable,), root, unset_env=("",)),
+        lambda root: CommandSpec((sys.executable,), root, unset_env=("BAD=KEY",)),
+        lambda root: CommandSpec((sys.executable,), root, unset_env=("VALUE", "VALUE")),
     ],
 )
 def test_invalid_command_specs_fail_closed(tmp_path, factory) -> None:
@@ -68,6 +72,22 @@ def test_stdin_cwd_and_environment_override_without_global_mutation(tmp_path, mo
 
     assert result.stdout == b"input|" + os.fsencode(tmp_path.resolve()) + b"|override"
     assert key not in os.environ
+
+
+def test_unset_env_removes_child_value_without_mutating_parent_and_override_wins(
+    tmp_path, monkeypatch
+) -> None:
+    key = "AGENTGRAPH_REMOVE_ME"
+    monkeypatch.setenv(key, "poison")
+    code = f"import os; print(os.environ.get('{key}', 'missing'))"
+    removed = ProcessRunner().run(python_spec(tmp_path, code, unset_env=(key,)))
+    overridden = ProcessRunner().run(
+        python_spec(tmp_path, code, unset_env=(key,), env={key: "safe"})
+    )
+
+    assert removed.stdout.strip() == b"missing"
+    assert overridden.stdout.strip() == b"safe"
+    assert os.environ[key] == "poison"
 
 
 def test_stdout_and_stderr_are_drained_without_pipe_deadlock(tmp_path) -> None:

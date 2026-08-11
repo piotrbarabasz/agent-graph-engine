@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -37,6 +38,22 @@ def test_stage_paths_handles_option_shaped_name_and_blocks_escape(git_repo, tmp_
             adapter.stage_paths(repository, (unsafe,))
     with pytest.raises(GitPathError):
         adapter.stage_paths(repository, "--evil.txt")
+
+
+def test_stage_paths_uses_literal_pathspec_even_with_poisoned_parent_environment(
+    git_repo, monkeypatch
+) -> None:
+    root, adapter, repository = git_repo
+    literal = root / "file[1].txt"
+    glob_match = root / "file1.txt"
+    literal.write_text("literal", encoding="utf-8")
+    glob_match.write_text("glob match", encoding="utf-8")
+    monkeypatch.setenv("GIT_GLOB_PATHSPECS", "1")
+
+    adapter.stage_paths(repository, (literal,))
+
+    assert adapter.staged_diff_paths(repository) == (Path("file[1].txt"),)
+    assert os.environ["GIT_GLOB_PATHSPECS"] == "1"
 
 
 def test_stage_path_symlink_escaping_repository_fails_closed(

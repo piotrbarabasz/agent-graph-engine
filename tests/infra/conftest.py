@@ -38,15 +38,19 @@ def git_command(
     )
 
 
+def initialize_repository(executable: str, root: Path, *, content: str = "initial\n") -> None:
+    root.mkdir()
+    git_command(executable, root, "init", "--quiet")
+    git_command(executable, root, "config", "user.name", "Fixture User")
+    git_command(executable, root, "config", "user.email", "fixture@example.test")
+    (root / "tracked.txt").write_text(content, encoding="utf-8")
+    git_command(executable, root, "add", "--", "tracked.txt")
+    git_command(executable, root, "commit", "--quiet", "-m", "initial")
+
+
 @pytest.fixture
 def git_repo(tmp_path, git_executable):
     root = tmp_path / "repo"
-    root.mkdir()
-    git_command(git_executable, root, "init", "--quiet")
-    git_command(git_executable, root, "config", "user.name", "Fixture User")
-    git_command(git_executable, root, "config", "user.email", "fixture@example.test")
-    (root / "tracked.txt").write_text("initial\n", encoding="utf-8")
-    git_command(git_executable, root, "add", "--", "tracked.txt")
-    git_command(git_executable, root, "commit", "--quiet", "-m", "initial")
+    initialize_repository(git_executable, root)
     adapter = GitAdapter(executable=git_executable)
     return root, adapter, adapter.discover_repository(root)
