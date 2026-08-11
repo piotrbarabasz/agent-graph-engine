@@ -306,7 +306,7 @@ def test_multi_work_item_loop_then_delivery_finalize() -> None:
     scripts["EXPLORE"] = ScriptedNode(
         "EXPLORE",
         scripts["EXPLORE"].templates[0],
-        template(),
+        scripts["EXPLORE"].templates[0],
         call_log=log,
     )
     for node_id in ("BUILD_TASK_PACKAGE", "ASSESS_RISK", "IMPLEMENT", "MORE_WORK"):
@@ -316,5 +316,6 @@ def test_multi_work_item_loop_then_delivery_finalize() -> None:
     assert state.run.status is RunStatus.COMPLETED
     assert state.work.completed_items == (first, second)
     assert log.count("SELECT_WORK") == 2
+    assert log.count("EXPLORE") == 2
     assert log.count("MORE_WORK") == 2
     assert log.count("DELIVERY_REVIEW") == 1

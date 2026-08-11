@@ -19,7 +19,19 @@ from .node import Node, NodeContext
 from .patches import StatePatchApplier
 from .policy import PolicySnapshot
 from .result import NodeResult
-from .state import GraphProgress, GraphState
+from .state import (
+    ChangesState,
+    FailureState,
+    GraphProgress,
+    GraphState,
+    RepairState,
+    ReviewState,
+    RiskState,
+    ScopeState,
+    TaskPackageState,
+    TextCollectionState,
+    ValidationState,
+)
 
 
 class GraphEngine:
@@ -146,6 +158,11 @@ class GraphEngine:
         raise GraphTransitionError(f"run exceeded max_steps={max_steps}")
 
     def _execute_transition(self, state: GraphState, transition: Transition) -> GraphState:
+        if transition.from_node == "MORE_WORK" and transition.to_node == "SELECT_WORK":
+            state = self._reset_item_state(state)
+        if transition.to_node == "DELIVERY_REVIEW":
+            state = replace(state, review=ReviewState())
+
         repair = state.repair
         risk = state.risk
         scope = state.scope
@@ -188,6 +205,23 @@ class GraphEngine:
             risk=risk,
             scope=scope,
             run=replace(run, status=status),
+        )
+
+    def _reset_item_state(self, state: GraphState) -> GraphState:
+        """Start a fresh item scope while preserving run- and delivery-level state."""
+
+        return replace(
+            state,
+            task_package=TaskPackageState(),
+            requirements=TextCollectionState(),
+            acceptance_criteria=TextCollectionState(),
+            scope=ScopeState(),
+            risk=RiskState(),
+            changes=ChangesState(),
+            validation=ValidationState(),
+            review=ReviewState(),
+            failure=FailureState(),
+            repair=RepairState(max_cycles=self.policy.max_repair_cycles),
         )
 
     def _validate_result_identity(self, state: GraphState, result: NodeResult) -> None:
