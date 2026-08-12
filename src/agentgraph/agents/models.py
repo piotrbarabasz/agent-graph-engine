@@ -83,6 +83,7 @@ class AgentContext:
     runtime_directory: Path
     baseline_head: str
     source_revision: str
+    provider_invocation_id: str | None = None
 
     def __post_init__(self) -> None:
         if not all(
@@ -90,6 +91,12 @@ class AgentContext:
             for value in (self.project_id, self.run_id, self.node_id, self.node_attempt_id)
         ):
             raise AgentContextError("agent context identity is invalid")
+        if self.provider_invocation_id is not None and (
+            not isinstance(self.provider_invocation_id, str)
+            or not self.provider_invocation_id
+            or "\x00" in self.provider_invocation_id
+        ):
+            raise AgentContextError("agent provider invocation identity is invalid")
         if _DIGEST.fullmatch(self.source_revision) is None:
             raise AgentContextError("agent source revision must be a SHA-256 fingerprint")
         if not re.fullmatch(r"[0-9a-f]{40,64}", self.baseline_head):

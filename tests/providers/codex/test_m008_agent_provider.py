@@ -5,6 +5,8 @@ import shutil
 import sys
 from pathlib import Path
 
+import pytest
+
 from agentgraph.adapters.speckit import SpecKitAdapter, SpecKitLayout
 from agentgraph.agents import EXPLORE_ANALYSIS_SCHEMA, AgentContext, AgentRequest
 from agentgraph.infra import GitAdapter
@@ -26,6 +28,40 @@ def _config() -> CodexProviderConfig:
         executable_arguments=(str(Path(__file__).with_name("_fake_codex.py")),),
         timeout_seconds=5,
     )
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected_outcome", "expected_code"),
+    (
+        ("hang", WriteSliceOutcome.FAILED, "codex_timeout"),
+        ("malformed", WriteSliceOutcome.FAILED, "codex_response_invalid"),
+        ("unsupported", WriteSliceOutcome.BLOCKED, "codex_cli_unsupported"),
+    ),
+)
+def test_codex_agent_preserves_typed_diagnostic_codes(
+    tmp_path, monkeypatch, mode, expected_outcome, expected_code
+) -> None:
+    target = _target(tmp_path)
+    if mode == "unsupported":
+        monkeypatch.setenv("FAKE_CODEX_PROFILE_UNSUPPORTED", "1")
+        config = _config()
+    else:
+        monkeypatch.setenv("FAKE_CODEX_MODE", mode)
+        config = CodexProviderConfig(
+            executable=sys.executable,
+            executable_arguments=(str(Path(__file__).with_name("_fake_codex.py")),),
+            timeout_seconds=0.1 if mode == "hang" else 5,
+        )
+
+    report = runner(
+        target,
+        tmp_path / "runtime",
+        CodexAgentProvider(config=config),
+    ).run(WriteSliceRequest(scope_id="E001"))
+
+    assert report.outcome is expected_outcome
+    assert report.issues[0].code == expected_code
+    assert "BUILD_TASK_PACKAGE" not in report.executed_nodes
 
 
 def _explore_result() -> dict[str, object]:

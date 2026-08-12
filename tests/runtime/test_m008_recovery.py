@@ -6,6 +6,7 @@ import pytest
 
 from agentgraph.runtime import RecoveryAction
 from agentgraph.write import WriteSliceOutcome, WriteSliceRequest
+from agentgraph.write.evidence import read_evidence
 from tests.integration.test_m006_vertical_slice import _target
 from tests.integration.test_m008_analysis import (
     CapturingChangeProvider,
@@ -57,6 +58,10 @@ def test_completed_analysis_nodes_are_not_reinvoked_after_restart(
         "assess_risk",
     ][:calls_at_restart]
     assert len(change.requests) == 1
+    if resume_node == "IMPLEMENT":
+        request = change.requests[0]
+        assert "Preserve the tracked baseline." in request.effective_requirements
+        assert "The new module remains deterministic." in request.effective_acceptance_criteria
 
 
 @pytest.mark.parametrize(
@@ -101,6 +106,16 @@ def test_interrupted_read_only_node_reruns_with_new_attempt_evidence(
     attempts = tuple(path for path in evidence_root.iterdir() if path.is_dir())
     assert len(attempts) == 2
     assert all((path / "analysis.json").is_file() for path in attempts)
+    documents = tuple(read_evidence(path / "analysis.json") for path in attempts)
+    canonical_ids = {document["node_attempt_id"] for document in documents}
+    invocation_ids = {document["provider_invocation_id"] for document in documents}
+    assert len(canonical_ids) == 1
+    assert canonical_ids == {
+        context.node_attempt_id
+        for request, context in agent.requests
+        if request.operation_id == expected_operation
+    }
+    assert len(invocation_ids) == 2
 
 
 def test_recorded_explore_result_replay_does_not_call_provider_again(tmp_path) -> None:

@@ -13,6 +13,7 @@ from agentgraph.agents import (
     AGENT_TASK_PACKAGE_SCHEMA,
     EXPLORE_ANALYSIS_SCHEMA,
     AgentAnalysisDriftError,
+    AgentAnalysisStatus,
     AgentContext,
     AgentContextError,
     AgentEvidenceError,
@@ -30,8 +31,9 @@ from agentgraph.agents import (
     parse_task_package_payload,
     reconcile_explore,
     reconcile_task_package,
+    stable_union,
 )
-from agentgraph.core import RiskLevel
+from agentgraph.core import GraphState, RiskLevel
 from agentgraph.infra import GitAdapter, GitRepository
 from agentgraph.integration import verify_work_source_revision
 from agentgraph.runtime.codec import encode_value, sha256_digest
@@ -60,6 +62,8 @@ class AgentExecution:
     explore_analysis: ExploreAnalysis | None = field(default=None, init=False)
     task_package: AgentTaskPackage | None = field(default=None, init=False)
     risk_assessment: AgentRiskAssessment | None = field(default=None, init=False)
+    effective_requirements: tuple[str, ...] | None = field(default=None, init=False)
+    effective_acceptance_criteria: tuple[str, ...] | None = field(default=None, init=False)
     issue_code: str | None = field(default=None, init=False)
 
     def explore(self, node_attempt_id: str, prompt: str) -> AnalysisResult:
@@ -91,7 +95,9 @@ class AgentExecution:
         self.task_package = result.value
         return result
 
-    def assess_risk(self, node_attempt_id: str, prompt: str) -> tuple[AnalysisResult, RiskLevel]:
+    def assess_risk(
+        self, node_attempt_id: str, prompt: str
+    ) -> tuple[AnalysisResult, RiskLevel | None]:
         request = AgentRequest.create(
             "assess_risk",
             prompt,
@@ -107,7 +113,36 @@ class AgentExecution:
         )
         assert isinstance(result.value, AgentRiskAssessment)
         self.risk_assessment = result.value
+        if result.value.status is AgentAnalysisStatus.BLOCKED:
+            return result, None
         return result, effective_risk(self.inputs.package.risk, result.value)
+
+    def prepare_implementation(self, state: GraphState) -> None:
+        """Bind IMPLEMENT context to the exact durable GraphState and Explore evidence."""
+
+        explore = self.restore_explore(state.baseline.metadata)
+        self.restore_task_package(state.task_package.metadata)
+        package = self.inputs.package
+        requirements = stable_union(
+            tuple(value for value in (package.goal, *package.test_requirements) if value),
+            explore.derived_requirements,
+        )
+        acceptance = stable_union(
+            package.acceptance_criteria,
+            explore.derived_acceptance_criteria,
+        )
+        if (
+            state.requirements.items != requirements
+            or state.acceptance_criteria.items != acceptance
+        ):
+            raise AgentEvidenceError("agent_analysis_evidence_mismatch")
+        self.effective_requirements = requirements
+        self.effective_acceptance_criteria = acceptance
+
+    def implementation_requirements(self) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        if self.effective_requirements is None or self.effective_acceptance_criteria is None:
+            raise AgentEvidenceError("agent_analysis_evidence_mismatch")
+        return self.effective_requirements, self.effective_acceptance_criteria
 
     def restore_explore(self, metadata: Any) -> ExploreAnalysis:
         reference = metadata.get("agent_explore_evidence")
@@ -137,16 +172,17 @@ class AgentExecution:
         reconciler: Callable[[Path, Any], Any],
     ) -> AnalysisResult:
         before = self._pinned_snapshot()
-        attempt_id, attempt_dir = self._attempt_directory(node_id, node_attempt_id)
+        provider_invocation_id, attempt_dir = self._attempt_directory(node_id, node_attempt_id)
         context = AgentContext(
             self.inputs.project_id,
             self.run_id,
             node_id,
-            attempt_id,
+            node_attempt_id,
             self.target.root,
             attempt_dir,
             self.inputs.baseline_head,
             self.inputs.source_revision,
+            provider_invocation_id,
         )
         provider_error: BaseException | None = None
         response: AgentResponse | None = None
@@ -171,14 +207,21 @@ class AgentExecution:
             raise AgentResponseContractError("agent response input digest mismatch")
         value = reconciler(self.target.root, parser(dict(response.payload)))
         reference = self._persist_host_evidence(
-            node_id, attempt_id, attempt_dir, request, response, value
+            node_id,
+            node_attempt_id,
+            provider_invocation_id,
+            attempt_dir,
+            request,
+            response,
+            value,
         )
         return AnalysisResult(response, value, reference)
 
     def _persist_host_evidence(
         self,
         node_id: str,
-        attempt_id: str,
+        node_attempt_id: str,
+        provider_invocation_id: str,
         attempt_dir: Path,
         request: AgentRequest,
         response: AgentResponse,
@@ -192,7 +235,8 @@ class AgentExecution:
                 "project_id": self.inputs.project_id,
                 "run_id": self.run_id,
                 "node_id": node_id,
-                "node_attempt_id": attempt_id,
+                "node_attempt_id": node_attempt_id,
+                "provider_invocation_id": provider_invocation_id,
                 "provider": response.provider_name,
                 "provider_version": response.provider_version,
                 "model": response.model,
@@ -265,8 +309,7 @@ class AgentExecution:
         while (root / selected).exists() or (root / selected).is_symlink():
             index += 1
             selected = f"{safe}-rerun-{index}"
-        evidence_attempt = attempt_id if index == 1 else f"{attempt_id}-rerun-{index}"
-        return evidence_attempt, root / selected
+        return selected, root / selected
 
     def _pinned_snapshot(self):
         snapshot = self.git.snapshot(self.target)

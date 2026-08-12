@@ -150,6 +150,10 @@ def test_full_agent_path_is_advisory_and_enriches_implement(tmp_path) -> None:
     assert request.implementation_plan == ("Create src/t001.py with deterministic content.",)
     assert request.derived_constraints == ("Do not modify source declarations.",)
     assert request.validation_focus == ("Run the declared checks only in VALIDATE.",)
+    assert request.effective_requirements == report.graph_state.requirements.items
+    assert "Preserve the tracked baseline." in request.effective_requirements
+    assert request.effective_acceptance_criteria == report.graph_state.acceptance_criteria.items
+    assert "The new module remains deterministic." in request.effective_acceptance_criteria
     assert "Preserve the tracked baseline." in report.graph_state.requirements.items
     assert "The new module remains deterministic." in report.graph_state.acceptance_criteria.items
     assert semantic_git_state(target) == before_git
@@ -302,6 +306,36 @@ def test_explicit_blocked_explore_uses_canonical_blocked_path_without_retry(tmp_
     assert report.outcome is WriteSliceOutcome.BLOCKED
     assert report.issues[0].code == "insufficient_repository_context"
     assert len(agent.requests) == 1
+    assert change.requests == []
+
+
+def test_explicit_blocked_risk_does_not_compute_effective_risk_or_implement(tmp_path) -> None:
+    target = _target(tmp_path)
+
+    def blocked(operation, payload):
+        if operation == "assess_risk":
+            return {
+                **payload,
+                "status": "blocked",
+                "risk_level": None,
+                "reason_code": "insufficient_risk_context",
+                "message": "Risk cannot be assessed from the available context.",
+            }
+        return payload
+
+    agent = RecordingAgentProvider(transform=blocked)
+    change = CapturingChangeProvider()
+    report = runner(target, tmp_path / "runtime", agent, change).run(
+        WriteSliceRequest(scope_id="E001")
+    )
+
+    assert report.outcome is WriteSliceOutcome.BLOCKED
+    assert report.issues[0].code == "insufficient_risk_context"
+    assert [request.operation_id for request, _ in agent.requests] == [
+        "explore",
+        "build_task_package",
+        "assess_risk",
+    ]
     assert change.requests == []
 
 

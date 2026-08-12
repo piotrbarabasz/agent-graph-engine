@@ -16,6 +16,7 @@ from agentgraph.runtime.codec import encode_value, parse_json_bytes, sha256_dige
 from agentgraph.write.evidence import write_evidence
 
 from .config import CodexProviderConfig
+from .errors import CodexResponseError
 from .runtime import CodexInvocationRuntime
 
 
@@ -47,6 +48,7 @@ class CodexAgentProvider(AgentProvider):
             "run_id": context.run_id,
             "node_id": context.node_id,
             "node_attempt_id": context.node_attempt_id,
+            "provider_invocation_id": context.provider_invocation_id,
             "provider": "codex",
             "model": self.runtime.config.model,
             "input_digest": request.input_digest,
@@ -61,7 +63,10 @@ class CodexAgentProvider(AgentProvider):
             evidence_context=evidence_context,
             receipt_name="receipt.json",
         )
-        document = parse_json_bytes(result.raw)
+        try:
+            document = parse_json_bytes(result.raw)
+        except Exception as exc:
+            raise CodexResponseError("Codex agent response is not strict JSON") from exc
         parser = {
             "agentgraph.explore.v1": parse_explore_payload,
             "agentgraph.task-package.v1": parse_task_package_payload,
@@ -69,7 +74,10 @@ class CodexAgentProvider(AgentProvider):
         }.get(request.output_schema_id)
         if parser is None:
             raise ValueError("unsupported Codex agent schema ID")
-        parsed = parser(document)
+        try:
+            parsed = parser(document)
+        except Exception as exc:
+            raise CodexResponseError("Codex agent response violates its schema") from exc
         payload = encode_value(parsed)
         output_digest = sha256_digest(payload)
         write_evidence(

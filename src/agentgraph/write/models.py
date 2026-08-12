@@ -75,6 +75,8 @@ class ChangeRequest:
     validation_focus: tuple[str, ...] = ()
     derived_constraints: tuple[str, ...] = ()
     relevant_files: tuple[str, ...] = ()
+    effective_requirements: tuple[str, ...] = ()
+    effective_acceptance_criteria: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

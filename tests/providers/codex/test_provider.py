@@ -35,6 +35,8 @@ def test_implementation_prompt_contains_bounded_analysis_but_preserves_authority
         validation_focus=("Exercise the public behavior.",),
         derived_constraints=("Preserve the interface.",),
         relevant_files=("src/interface.py",),
+        effective_requirements=("Source requirement.", "Derived requirement."),
+        effective_acceptance_criteria=("Acceptance one", "Derived criterion."),
     )
 
     prompt = build_codex_change_prompt(request).decode("utf-8")
@@ -47,7 +49,13 @@ def test_implementation_prompt_contains_bounded_analysis_but_preserves_authority
         "src/interface.py",
         "src/existing.py",
         request.baseline_head,
+        request.source_revision,
         "Acceptance one",
+        "EFFECTIVE REQUIREMENTS",
+        "EFFECTIVE ACCEPTANCE CRITERIA",
+        "Source requirement.",
+        "Derived requirement.",
+        "Derived criterion.",
     ):
         assert expected in prompt
 

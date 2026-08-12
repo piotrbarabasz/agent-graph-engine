@@ -528,6 +528,7 @@ class WriteExecution:
         package = self.inputs.package
         explore = self.analysis.explore_analysis
         task_package = self.analysis.task_package
+        effective_requirements, effective_acceptance = self.analysis.implementation_requirements()
         relevant_files = (
             ()
             if explore is None
@@ -563,15 +564,14 @@ class WriteExecution:
             () if task_package is None else task_package.validation_focus,
             () if explore is None else explore.derived_constraints,
             relevant_files,
+            effective_requirements,
+            effective_acceptance,
         )
 
     def prepare_implementation_analysis(self, state: GraphState) -> None:
         """Reconstruct advisory context from GraphState-bound immutable evidence."""
 
-        if self.analysis.explore_analysis is None:
-            self.analysis.restore_explore(state.baseline.metadata)
-        if self.analysis.task_package is None:
-            self.analysis.restore_task_package(state.task_package.metadata)
+        self.analysis.prepare_implementation(state)
 
     def evidence_context(self) -> dict[str, object]:
         return {

@@ -86,6 +86,11 @@ def _failed(
 def _agent_failure(
     node_id: str, context: NodeContext, exc: Exception, execution: AgentExecution
 ) -> NodeResult:
+    reason_code = getattr(exc, "reason_code", None)
+    message = getattr(exc, "message", None)
+    if isinstance(reason_code, str) and isinstance(message, str):
+        execution.issue_code = reason_code
+        return _blocked(node_id, context, reason_code, message)
     code = getattr(exc, "code", None) or "agent_invocation_failed"
     execution.issue_code = code
     if isinstance(exc, AgentAnalysisDriftError):
@@ -114,8 +119,8 @@ def _agent_failure(
     return _failed(
         node_id,
         context,
-        "agent_invocation_failed",
-        "read-only agent provider failed",
+        code,
+        str(exc) or "read-only agent provider failed",
         FailureCategory.INFRASTRUCTURE,
     )
 
@@ -293,6 +298,7 @@ class AssessRiskNode:
                     value.message,
                     (Evidence("agent_risk", result.evidence_reference),),
                 )
+            assert level is not None
             if level is RiskLevel.CRITICAL or value.requests_human_checkpoint:
                 self.analysis.issue_code = "human_checkpoint_required_not_supported_in_m008"
                 return _blocked(
