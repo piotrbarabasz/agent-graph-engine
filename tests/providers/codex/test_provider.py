@@ -18,10 +18,46 @@ from agentgraph.providers.codex import (
     CodexProviderContextError,
     CodexResponseError,
     CodexTimeoutError,
+    build_codex_change_prompt,
     restricted_permission_config_overrides,
 )
 from agentgraph.write.evidence import read_evidence
 from tests.providers.codex.conftest import proposal
+
+
+def test_implementation_prompt_contains_bounded_analysis_but_preserves_authority(
+    codex_fixture,
+) -> None:
+    request = replace(
+        codex_fixture["request"],
+        analysis_summary=("Existing service boundary is stable.",),
+        implementation_plan=("Change only the declared service module.",),
+        validation_focus=("Exercise the public behavior.",),
+        derived_constraints=("Preserve the interface.",),
+        relevant_files=("src/interface.py",),
+        effective_requirements=("Source requirement.", "Derived requirement."),
+        effective_acceptance_criteria=("Acceptance one", "Derived criterion."),
+    )
+
+    prompt = build_codex_change_prompt(request).decode("utf-8")
+
+    for expected in (
+        "Existing service boundary is stable.",
+        "Change only the declared service module.",
+        "Exercise the public behavior.",
+        "Preserve the interface.",
+        "src/interface.py",
+        "src/existing.py",
+        request.baseline_head,
+        request.source_revision,
+        "Acceptance one",
+        "EFFECTIVE REQUIREMENTS",
+        "EFFECTIVE ACCEPTANCE CRITERIA",
+        "Source requirement.",
+        "Derived requirement.",
+        "Derived criterion.",
+    ):
+        assert expected in prompt
 
 
 def test_provider_uses_stdin_restricted_profile_and_engine_computes_existing_hash(

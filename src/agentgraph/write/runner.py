@@ -7,6 +7,7 @@ import json
 from collections.abc import Callable
 from pathlib import Path
 
+from agentgraph.agents import AgentProvider, DeclaredWorkAgentProvider
 from agentgraph.core import CommitMode, GraphEngine, PolicySnapshot, RunStatus, canonical_v1_graph
 from agentgraph.infra import GitAdapter, GitCommitIdentity, ProcessRunner
 from agentgraph.infra.errors import GitError, NotAGitRepositoryError
@@ -48,6 +49,7 @@ from agentgraph.runtime.codec import decode_value
 from agentgraph.runtime.ids import generate_run_id
 from agentgraph.work import InvalidWorkSourceError, WorkRisk, WorkScopeStatus, WorkSource
 
+from .analysis import AgentExecution
 from .capability import capability_fingerprint, reconcile_write_capability
 from .errors import WorkCapabilityMismatchError, WorkspaceError, WritePreparationError
 from .evidence import read_evidence, write_evidence
@@ -71,6 +73,7 @@ class WriteSliceRunner:
         work_source: WorkSource,
         change_provider: ChangeProvider,
         *,
+        agent_provider: AgentProvider | None = None,
         git_adapter: GitAdapter,
         project_registry: ProjectRegistry,
         process_runner: ProcessRunner | None = None,
@@ -86,6 +89,8 @@ class WriteSliceRunner:
         self.repository_root = Path(repository_root)
         self.work_source = work_source
         self.change_provider = change_provider
+        self.agent_provider = agent_provider or DeclaredWorkAgentProvider()
+        self._m008_agents_enabled = agent_provider is not None
         self.git = git_adapter
         self.registry = project_registry
         self.paths = runtime_paths or project_registry.paths
@@ -148,7 +153,7 @@ class WriteSliceRunner:
                 inspection=inspection,
                 selection=selection,
             )
-        if package.risk is WorkRisk.CRITICAL:
+        if package.risk is WorkRisk.CRITICAL and not self._m008_agents_enabled:
             return self._early(
                 WriteSliceOutcome.BLOCKED,
                 "critical_risk_not_supported_in_m006",
@@ -379,6 +384,15 @@ class WriteSliceRunner:
             inspection.repository,
             run_id,
             run_path,
+            AgentExecution(
+                inputs,
+                self.work_source,
+                self.agent_provider,
+                self.git,
+                inspection.repository,
+                run_id,
+                run_path,
+            ),
             self.identity,
             self.validation_timeout_seconds,
             rehydrating,
@@ -388,9 +402,9 @@ class WriteSliceRunner:
             "DISCOVER_PROJECT": DiscoverProjectNode(shadow, shadow=False),
             "PREFLIGHT": PreflightNode(shadow, shadow=False),
             "SELECT_WORK": SelectWorkNode(shadow),
-            "EXPLORE": ExploreNode(inputs),
-            "BUILD_TASK_PACKAGE": BuildTaskPackageNode(inputs),
-            "ASSESS_RISK": AssessRiskNode(inputs),
+            "EXPLORE": ExploreNode(inputs, execution.analysis),
+            "BUILD_TASK_PACKAGE": BuildTaskPackageNode(inputs, execution.analysis),
+            "ASSESS_RISK": AssessRiskNode(inputs, execution.analysis),
             "IMPLEMENT": ImplementNode(execution),
             "VALIDATE": ValidateNode(execution),
             "REVIEW": ReviewNode(execution),
@@ -428,7 +442,10 @@ class WriteSliceRunner:
         if outcome is not WriteSliceOutcome.LOCAL_COMMIT_CREATED:
             issues = (
                 WriteSliceIssue(
-                    execution.issue_code or state.failure.code or "write_run_not_completed",
+                    execution.issue_code
+                    or execution.analysis.issue_code
+                    or state.failure.code
+                    or "write_run_not_completed",
                     f"write run finalized with {state.run.status.value}",
                 ),
             )

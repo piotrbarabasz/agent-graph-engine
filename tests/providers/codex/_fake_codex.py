@@ -33,6 +33,7 @@ def main() -> int:
     if not args or args[0] != "exec":
         return 2
     prompt = sys.stdin.buffer.read().decode("utf-8")
+    schema = Path(args[args.index("--output-schema") + 1])
     output = Path(args[args.index("--output-last-message") + 1])
     mode = os.environ.get("FAKE_CODEX_MODE", "success")
     _increment(os.environ.get("FAKE_CODEX_COUNT"))
@@ -101,7 +102,7 @@ def main() -> int:
         target.write_text(_proposal(), encoding="utf-8")
         output.symlink_to(target)
     else:
-        output.write_text(os.environ.get("FAKE_CODEX_RESULT", _proposal()), encoding="utf-8")
+        output.write_text(_configured_result(schema), encoding="utf-8")
     return 0
 
 
@@ -116,6 +117,27 @@ def _proposal() -> str:
         },
         separators=(",", ":"),
     )
+
+
+def _configured_result(schema_path: Path) -> str:
+    direct = os.environ.get("FAKE_CODEX_RESULT")
+    if direct is not None:
+        return direct
+    configured = os.environ.get("FAKE_CODEX_RESULTS")
+    if configured is None:
+        return _proposal()
+    schema = json.loads(schema_path.read_text(encoding="utf-8"))
+    properties = schema.get("properties", {})
+    if "relevant_files" in properties:
+        role = "explore"
+    elif "objective" in properties:
+        role = "build_task_package"
+    elif "risk_level" in properties:
+        role = "assess_risk"
+    else:
+        role = "implement"
+    value = json.loads(configured)[role]
+    return json.dumps(value, separators=(",", ":"))
 
 
 def _increment(raw: str | None) -> None:

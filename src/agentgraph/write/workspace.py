@@ -37,6 +37,7 @@ from .provider import ChangeProvider, ChangeProviderContext
 
 if TYPE_CHECKING:
     from agentgraph.integration import ShadowInputs
+    from agentgraph.write.analysis import AgentExecution
 
 
 @dataclass(slots=True)
@@ -52,6 +53,7 @@ class WriteExecution:
     target: GitRepository
     run_id: str
     run_path: Path
+    analysis: AgentExecution
     commit_identity: GitCommitIdentity
     validation_timeout_seconds: float = 120.0
     rehydrating: bool = False
@@ -108,7 +110,7 @@ class WriteExecution:
             raise WorkspaceError("new worktree does not match pinned baseline")
         request = self.change_request()
         provider_directory = self.run_path / "provider"
-        provider_directory.mkdir()
+        provider_directory.mkdir(exist_ok=True)
         context = ChangeProviderContext(
             repository_root=self.workspace,
             runtime_directory=provider_directory,
@@ -367,6 +369,7 @@ class WriteExecution:
     def rehydrate(self, state: GraphState) -> None:
         """Restore execution facts from immutable evidence for the persisted cursor."""
 
+        cursor = state.graph.current_node
         if self.workspace.exists():
             if self.workspace.is_symlink():
                 raise WorkspaceError("persisted workspace is a symlink")
@@ -378,7 +381,6 @@ class WriteExecution:
                 raise WorkspaceError("persisted workspace branch differs from write inputs")
             self.workspace_repository = repository
 
-        cursor = state.graph.current_node
         after_implement = cursor in {
             "VALIDATE",
             "REVIEW",
@@ -524,6 +526,21 @@ class WriteExecution:
 
     def change_request(self) -> ChangeRequest:
         package = self.inputs.package
+        explore = self.analysis.explore_analysis
+        task_package = self.analysis.task_package
+        effective_requirements, effective_acceptance = self.analysis.implementation_requirements()
+        relevant_files = (
+            ()
+            if explore is None
+            else tuple(
+                dict.fromkeys(
+                    (
+                        *explore.relevant_files,
+                        *(() if task_package is None else task_package.supporting_read_paths),
+                    )
+                )
+            )
+        )
         return ChangeRequest(
             self.inputs.project_id,
             package.item_id,
@@ -542,7 +559,19 @@ class WriteExecution:
                 "no_source_closure",
                 "no_push_or_pull_request",
             ),
+            () if explore is None else explore.architecture_observations,
+            () if task_package is None else task_package.implementation_steps,
+            () if task_package is None else task_package.validation_focus,
+            () if explore is None else explore.derived_constraints,
+            relevant_files,
+            effective_requirements,
+            effective_acceptance,
         )
+
+    def prepare_implementation_analysis(self, state: GraphState) -> None:
+        """Reconstruct advisory context from GraphState-bound immutable evidence."""
+
+        self.analysis.prepare_implementation(state)
 
     def evidence_context(self) -> dict[str, object]:
         return {

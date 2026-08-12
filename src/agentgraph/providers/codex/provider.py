@@ -3,20 +3,13 @@
 from __future__ import annotations
 
 import hashlib
-import os
-import stat
 from pathlib import Path
 
 from agentgraph.infra import (
     CancellationToken,
-    CommandSpec,
     GitAdapter,
     ProcessRunner,
-    ProcessStatus,
 )
-from agentgraph.infra.errors import ProcessStartError
-from agentgraph.runtime.atomic import atomic_write_bytes
-from agentgraph.runtime.codec import canonical_json_bytes
 from agentgraph.write import (
     ChangeProviderContext,
     ChangeRequest,
@@ -27,20 +20,16 @@ from agentgraph.write import (
 )
 from agentgraph.write.evidence import write_evidence
 
-from .cli import CodexCliCapabilities, CodexCliProbe, sensitive_environment_keys
+from .cli import CodexCliCapabilities, CodexCliProbe
 from .config import CodexProviderConfig
 from .errors import (
-    CodexCliUnavailableError,
-    CodexInvocationError,
     CodexProposalError,
     CodexProviderBlockedError,
     CodexProviderContextError,
-    CodexResponseError,
-    CodexTimeoutError,
 )
 from .parser import parse_codex_proposal
-from .policy import restricted_permission_config_overrides
 from .prompt import build_codex_change_prompt
+from .runtime import CodexInvocationRuntime
 from .schema import CODEX_PROPOSAL_JSON_SCHEMA, CodexProposal, CodexProposalStatus
 
 
@@ -60,70 +49,33 @@ class CodexChangeProvider:
         self.git = git_adapter or GitAdapter(self.runner)
         self.cancellation = cancellation
         self.probe = CodexCliProbe(self.runner, self.config)
+        self.runtime = CodexInvocationRuntime(
+            self.runner, self.config, cancellation=self.cancellation, probe=self.probe
+        )
 
     def capabilities(self, repository_root: Path) -> CodexCliCapabilities:
         return self.probe.inspect(repository_root)
 
     def propose(self, request: ChangeRequest, context: ChangeProviderContext) -> ChangeSet:
         repository, provider_dir = self._validate_context(context)
-        capabilities = self.probe.inspect(repository.root)
         prompt = build_codex_change_prompt(request)
-        prompt_digest = _digest(prompt)
         codex_dir = provider_dir / "codex"
-        codex_dir.mkdir()
-        schema_path = codex_dir / "schema.json"
-        result_path = codex_dir / "final-result.json"
-        schema_bytes = canonical_json_bytes(CODEX_PROPOSAL_JSON_SCHEMA)
-        atomic_write_bytes(schema_path, schema_bytes)
-        argv = self._invocation(repository.root, schema_path, result_path, capabilities)
-        try:
-            result = self.runner.run(
-                CommandSpec(
-                    argv=argv,
-                    cwd=repository.root,
-                    timeout_seconds=self.config.timeout_seconds,
-                    stdin=prompt,
-                    max_stdout_bytes=256 * 1024,
-                    max_stderr_bytes=256 * 1024,
-                    unset_env=sensitive_environment_keys(),
-                ),
-                cancellation=self.cancellation,
-            )
-        except ProcessStartError as exc:
-            raise CodexCliUnavailableError("configured Codex CLI is unavailable") from exc
-
-        raw: bytes | None = None
-        output_error: Exception | None = None
-        try:
-            raw = _read_regular_bounded(result_path, self.config.max_result_bytes)
-        except Exception as exc:
-            output_error = exc
-        evidence_context = _evidence_context(request, context, prompt_digest)
-        write_evidence(
-            codex_dir / "codex-receipt.json",
-            context=evidence_context,
-            payload={
-                "codex_version": capabilities.version,
-                "prompt_digest": prompt_digest,
-                "output_digest": None if raw is None else _digest(raw),
-                "model": self.config.model,
-                "receipt": result.receipt,
-            },
+        evidence_context = _evidence_context(request, context)
+        result = self.runtime.invoke_structured(
+            prompt=prompt,
+            schema=CODEX_PROPOSAL_JSON_SCHEMA,
+            repository_root=repository.root,
+            artifact_directory=codex_dir,
+            evidence_context=evidence_context,
         )
-        if result.receipt.status is ProcessStatus.TIMED_OUT:
-            raise CodexTimeoutError("Codex proposal invocation timed out")
-        if result.receipt.status is not ProcessStatus.SUCCEEDED:
-            raise CodexInvocationError("Codex proposal invocation failed")
-        if result.receipt.stdout_truncated or result.receipt.stderr_truncated:
-            raise CodexInvocationError("Codex diagnostic output exceeded its bound")
-        if output_error is not None or raw is None:
-            raise CodexResponseError(
-                "Codex final result is unavailable or unsafe"
-            ) from output_error
-        proposal = parse_codex_proposal(raw)
+        proposal = parse_codex_proposal(result.raw)
         write_evidence(
             codex_dir / "codex-proposal.json",
-            context={**evidence_context, "proposal_digest": proposal.digest},
+            context={
+                **evidence_context,
+                "prompt_digest": result.prompt_digest,
+                "proposal_digest": proposal.digest,
+            },
             payload={"proposal": proposal, "proposal_digest": proposal.digest},
         )
         if proposal.status is CodexProposalStatus.BLOCKED:
@@ -162,40 +114,7 @@ class CodexChangeProvider:
         result_path: Path,
         capabilities: CodexCliCapabilities,
     ) -> tuple[str, ...]:
-        if not capabilities.required_supported:
-            raise AssertionError("unsupported Codex capabilities escaped probe")
-        values = [
-            self.config.executable,
-            *self.config.executable_arguments,
-            "exec",
-            "--cd",
-            str(repository_root),
-            "--ephemeral",
-            "--ignore-user-config",
-            "--ignore-rules",
-            "--strict-config",
-        ]
-        for override in (
-            *restricted_permission_config_overrides(),
-            'approval_policy="never"',
-            "mcp_servers={}",
-            'web_search="disabled"',
-        ):
-            values.extend(("--config", override))
-        values.extend(
-            (
-                "--output-schema",
-                str(schema_path),
-                "--output-last-message",
-                str(result_path),
-                "--color",
-                "never",
-            )
-        )
-        if self.config.model is not None:
-            values.extend(("--model", self.config.model))
-        values.append("-")
-        return tuple(values)
+        return self.runtime.invocation(repository_root, schema_path, result_path, capabilities)
 
 
 def _materialize(proposal: CodexProposal, request: ChangeRequest, root: Path) -> ChangeSet:
@@ -227,38 +146,17 @@ def _validate_candidate(root: Path, candidate: Path) -> None:
         raise CodexProposalError("Codex proposal target is not a regular file")
 
 
-def _read_regular_bounded(path: Path, limit: int) -> bytes:
-    try:
-        info = path.lstat()
-    except OSError as exc:
-        raise CodexResponseError("Codex final result file is missing") from exc
-    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode) or info.st_size > limit:
-        raise CodexResponseError("Codex final result file is unsafe or oversized")
-    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
-    try:
-        descriptor = os.open(path, flags)
-        with os.fdopen(descriptor, "rb") as stream:
-            raw = stream.read(limit + 1)
-    except OSError as exc:
-        raise CodexResponseError("Codex final result could not be read safely") from exc
-    if len(raw) > limit:
-        raise CodexResponseError("Codex final result exceeds its bound")
-    return raw
-
-
-def _digest(value: bytes) -> str:
-    return f"sha256:{hashlib.sha256(value).hexdigest()}"
-
-
 def _evidence_context(
-    request: ChangeRequest, context: ChangeProviderContext, prompt_digest: str
+    request: ChangeRequest, context: ChangeProviderContext, prompt_digest: str | None = None
 ) -> dict[str, object]:
-    return {
+    values = {
         "project_id": request.project_id,
         "run_id": context.runtime_directory.parent.name,
         "item_id": request.item_id,
         "scope_id": request.scope_id,
         "pinned_head": context.baseline_head,
         "source_revision": request.source_revision,
-        "prompt_digest": prompt_digest,
     }
+    if prompt_digest is not None:
+        values["prompt_digest"] = prompt_digest
+    return values

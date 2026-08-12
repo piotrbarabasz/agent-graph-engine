@@ -70,6 +70,13 @@ class ChangeRequest:
     source_revision: str
     baseline_head: str
     architecture_invariants: tuple[str, ...]
+    analysis_summary: tuple[str, ...] = ()
+    implementation_plan: tuple[str, ...] = ()
+    validation_focus: tuple[str, ...] = ()
+    derived_constraints: tuple[str, ...] = ()
+    relevant_files: tuple[str, ...] = ()
+    effective_requirements: tuple[str, ...] = ()
+    effective_acceptance_criteria: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

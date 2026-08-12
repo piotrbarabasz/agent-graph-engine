@@ -18,6 +18,10 @@ the target main working tree byte-identical and on its base branch.
 M007 adds a proposal-only integration with a locally configured Codex CLI. Codex can inspect the
 external worktree through a native least-privilege permission profile and return one strict
 structured change proposal.
+M008 adds a neutral read-only `AgentProvider` for canonical `EXPLORE`, `BUILD_TASK_PACKAGE`, and
+`ASSESS_RISK`. Codex is one concrete provider. Its structured analysis is advisory: WorkSource
+declarations remain authoritative, recommendations may only narrow write capability, and effective
+risk is the deterministic maximum of source and agent risk.
 
 Agent Graph Engine—not Codex—computes stale-file hashes, applies changes, runs validation, reviews
 the actual diff, stages files, and verifies the local commit. The provider receives a neutral read
@@ -80,3 +84,14 @@ schema. Provider provenance is stored under
 `<run>/provider/codex`; it contains digests, the normalized proposal, and a sanitized process receipt,
 not chain-of-thought or a resumable Codex session. Any tracked, staged, untracked, conflicted, branch,
 or HEAD mutation during the provider call stops `IMPLEMENT` before the engine applies a proposal.
+
+Read-only analysis agents inspect the pinned target repository using the same restricted Codex
+runtime. Every invocation is guarded by target Git and WorkSource revision snapshots before and
+after the call. Rich bounded responses and sanitized receipts are immutable, attempt-scoped
+evidence under `<run>/provider/<provider>/agents/<node>/<attempt>/`; GraphState stores only bounded
+projections and evidence digests. Completed analysis is reconstructed from that evidence on resume,
+without re-invoking completed nodes. Analysis never creates the external write worktree, executes
+validation, chooses graph transitions, closes source work, or gains Git/write authority.
+Malformed or contract-invalid agent output is classified as a design failure. Provider/runtime
+failures and detected repository mutation are infrastructure failures; pinned baseline or source
+drift and durable evidence mismatch block rather than guess.

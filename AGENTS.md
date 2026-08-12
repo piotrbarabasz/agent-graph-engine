@@ -57,3 +57,14 @@
   Provider repository mutation is detected before engine changes are applied.
 - Interrupted Codex `IMPLEMENT` remains fail-closed under M002 recovery. Ambient external tool
   integrations must not bypass the provider isolation boundary.
+- LLM read-only nodes analyze repository state but never own capabilities or transitions.
+- Source work declarations remain authoritative and cannot be weakened by agent output. Agent
+  recommendations may narrow write scope but never expand it.
+- Effective risk is `max(source risk, agent risk)`; a critical result or checkpoint request blocks
+  because M008 does not implement human approval.
+- Read-only agents reuse the M007 restricted Codex sandbox and are guarded by host-side target Git
+  and WorkSource revision snapshots around every invocation.
+- Rich agent output remains immutable attempt-scoped evidence; GraphState receives only bounded,
+  validated projections plus evidence references and digests.
+- Ordinary resume never re-invokes completed read-only nodes. Interrupted read-only recovery follows
+  M002 rules and creates new attempt-scoped evidence instead of overwriting earlier attempts.
