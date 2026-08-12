@@ -13,6 +13,10 @@ class RepositoryRootMismatchError(ProjectInspectionError):
     """The configured target is not the canonical Git root."""
 
 
+class WorkSourceRepositoryMismatchError(ProjectInspectionError):
+    """Work-source revision documents do not belong to the configured repository."""
+
+
 class ShadowRequestError(IntegrationError):
     """A shadow selection request is structurally invalid."""
 

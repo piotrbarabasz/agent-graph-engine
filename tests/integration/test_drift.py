@@ -12,9 +12,16 @@ from .conftest import make_runner
 
 
 class DriftingWorkSource:
-    def __init__(self, delegate, *, invalidate: bool = False) -> None:
+    def __init__(
+        self,
+        delegate,
+        *,
+        invalidate: bool = False,
+        repository_mismatch: bool = False,
+    ) -> None:
         self.delegate = delegate
         self.invalidate = invalidate
+        self.repository_mismatch = repository_mismatch
         self.snapshot_calls = 0
 
     def validate(self):
@@ -26,6 +33,11 @@ class DriftingWorkSource:
             if self.invalidate:
                 raise InvalidWorkSourceError(WorkSourceValidation())
             snapshot = self.delegate.snapshot()
+            if self.repository_mismatch:
+                first, *remaining = snapshot.revision.documents
+                mismatched = replace(first, sha256="sha256:" + "0" * 64)
+                revision = replace(snapshot.revision, documents=(mismatched, *remaining))
+                return replace(snapshot, revision=revision)
             revision = replace(snapshot.revision, fingerprint="sha256:" + "f" * 64)
             return replace(snapshot, revision=revision)
         return self.delegate.snapshot()
@@ -99,3 +111,17 @@ def test_repository_semantic_drift_never_returns_ready(target, tmp_path) -> None
 
     assert report.outcome is ShadowOutcome.DRIFTED
     assert "repository_drift" in {issue.code for issue in report.issues}
+
+
+def test_final_source_documents_are_reverified_against_target(target, tmp_path) -> None:
+    source = DriftingWorkSource(
+        SpecKitAdapter(SpecKitLayout(target)),
+        repository_mismatch=True,
+    )
+
+    report = make_runner(target, tmp_path / "runtime", work_source=source).run(
+        ShadowRequest(scope_id="E001")
+    )
+
+    assert report.outcome is ShadowOutcome.DRIFTED
+    assert "work_source_repository_mismatch" in {issue.code for issue in report.issues}

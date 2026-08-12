@@ -13,8 +13,8 @@ selection, and the unchanged canonical graph. The engine can now inspect a real 
 resolve work, and reach the `EXPLORE` boundary without executing an LLM or modifying the target
 repository.
 
-The project requires Python 3.11 or newer. It has no CLI, Codex, GitHub, Spec Kit,
-LLM provider, automatic coding workflow, or real coding-task execution.
+The project requires Python 3.11 or newer. It has no CLI, Codex, GitHub, LLM provider,
+automatic coding workflow, or real coding-task execution.
 
 ## Development
 

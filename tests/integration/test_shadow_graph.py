@@ -30,6 +30,8 @@ def test_ready_vertical_slice_reaches_explore_boundary_and_projects_state(target
     )
     assert report.work_package is not None
     assert report.work_package.source_revision.fingerprint == report.work_source_revision
+    assert report.selected_item_id == state.work.item.id
+    assert report.selected_scope_id == state.work.delivery_scope.id
     assert not (target / "executed.txt").exists()
 
 

@@ -20,8 +20,13 @@ from agentgraph.nodes import (
 from agentgraph.runtime import ProjectRegistry
 from agentgraph.work import InvalidWorkSourceError, WorkSource, WorkSourceError
 
-from .errors import RepositoryRootMismatchError, ShadowIntegrationError
-from .inspection import inspect_project
+from .errors import (
+    RepositoryRootMismatchError,
+    ShadowIntegrationError,
+    ShadowSelectionError,
+    WorkSourceRepositoryMismatchError,
+)
+from .inspection import inspect_project, verify_work_source_revision
 from .models import (
     BranchDisposition,
     IntegrationIssue,
@@ -77,6 +82,8 @@ class ShadowRunner:
             return self._invalid_project("git_repository_missing", str(exc))
         except GitError as exc:
             return self._invalid_project("git_repository_invalid", str(exc))
+        except WorkSourceRepositoryMismatchError as exc:
+            return self._invalid_source("work_source_repository_mismatch", str(exc))
         except InvalidWorkSourceError as exc:
             issues = tuple(
                 IntegrationIssue(
@@ -102,7 +109,12 @@ class ShadowRunner:
                 issues,
             )
 
-        selection, package = prepare_selection(self.work_source, inspection.work_snapshot, request)
+        try:
+            selection, package = prepare_selection(
+                self.work_source, inspection.work_snapshot, request
+            )
+        except ShadowSelectionError as exc:
+            return self._invalid_source("work_package_mismatch", str(exc))
         preflight = assess_preflight(inspection, selection)
         fingerprint = _input_fingerprint(inspection, request)
         inputs = ShadowInputs(inspection, preflight, selection, package, fingerprint)
@@ -154,6 +166,13 @@ class ShadowRunner:
                 self.git_adapter.discover_repository(self.repository_root)
             )
             final_work = self.work_source.snapshot()
+            verify_work_source_revision(self.repository_root, final_work.revision)
+        except WorkSourceRepositoryMismatchError as exc:
+            return IntegrationIssue(
+                "work_source_repository_mismatch",
+                IntegrationIssueSeverity.ERROR,
+                str(exc),
+            )
         except (GitError, WorkSourceError):
             return IntegrationIssue(
                 "shadow_inputs_invalidated",
@@ -180,6 +199,24 @@ class ShadowRunner:
         return ShadowReport(
             None,
             ShadowOutcome.INVALID_PROJECT,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            BranchDisposition.NOT_APPLICABLE,
+            (issue,),
+        )
+
+    @staticmethod
+    def _invalid_source(code: str, message: str) -> ShadowReport:
+        issue = IntegrationIssue(code, IntegrationIssueSeverity.ERROR, message)
+        return ShadowReport(
+            None,
+            ShadowOutcome.INVALID_SOURCE,
             None,
             None,
             None,

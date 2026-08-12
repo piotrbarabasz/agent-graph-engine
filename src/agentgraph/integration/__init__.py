@@ -8,8 +8,9 @@ from .errors import (
     ShadowIntegrationError,
     ShadowRequestError,
     ShadowSelectionError,
+    WorkSourceRepositoryMismatchError,
 )
-from .inspection import inspect_project
+from .inspection import inspect_project, verify_work_source_revision
 from .models import (
     BranchDisposition,
     IntegrationIssue,
@@ -47,7 +48,9 @@ __all__ = [
     "ShadowRequestError",
     "ShadowRunner",
     "ShadowSelectionError",
+    "WorkSourceRepositoryMismatchError",
     "assess_preflight",
     "inspect_project",
     "prepare_selection",
+    "verify_work_source_revision",
 ]

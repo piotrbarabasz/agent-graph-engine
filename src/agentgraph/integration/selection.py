@@ -11,6 +11,7 @@ from agentgraph.work import (
     WorkSourceSnapshot,
 )
 
+from .errors import ShadowSelectionError
 from .models import (
     IntegrationIssue,
     IntegrationIssueSeverity,
@@ -105,15 +106,14 @@ def prepare_selection(
     if selection.kind is SelectionKind.READY:
         assert selection.item_id is not None
         package = source.build_package(snapshot, selection.item_id)
-        return (
-            SelectionPlan(
-                SelectionDisposition.READY,
-                scope_id,
-                selection.item_id,
-                selection.reason_code,
-            ),
-            package,
+        plan = SelectionPlan(
+            SelectionDisposition.READY,
+            scope_id,
+            selection.item_id,
+            selection.reason_code,
         )
+        _reconcile_ready_package(snapshot, plan, package)
+        return plan, package
     if selection.kind in {SelectionKind.SCOPE_COMPLETE, SelectionKind.EMPTY_SCOPE}:
         return (
             SelectionPlan(
@@ -142,3 +142,26 @@ def prepare_selection(
 
 def _issue(code: str, message: str, related_ids: tuple[str, ...] = ()) -> IntegrationIssue:
     return IntegrationIssue(code, IntegrationIssueSeverity.ERROR, message, related_ids)
+
+
+def _reconcile_ready_package(
+    snapshot: WorkSourceSnapshot,
+    selection: SelectionPlan,
+    package: WorkPackage,
+) -> None:
+    """Bind a package to the exact selected item, scope, hierarchy, and revision."""
+
+    if package.item_id != selection.item_id:
+        raise ShadowSelectionError("work package item differs from selected item")
+    if package.scope_id != selection.scope_id:
+        raise ShadowSelectionError("work package scope differs from selected scope")
+    if package.source_revision.fingerprint != snapshot.revision.fingerprint:
+        raise ShadowSelectionError("work package source revision is stale")
+    item = next((value for value in snapshot.items if value.item_id == package.item_id), None)
+    if item is None or item.scope_id != package.scope_id:
+        raise ShadowSelectionError("work package item ownership differs from snapshot")
+    scope = next((value for value in snapshot.scopes if value.scope_id == package.scope_id), None)
+    if scope is None:
+        raise ShadowSelectionError("work package scope is absent from snapshot")
+    if scope.parent_scope_id is not None and package.parent_scope_id != scope.parent_scope_id:
+        raise ShadowSelectionError("work package parent scope differs from snapshot hierarchy")
