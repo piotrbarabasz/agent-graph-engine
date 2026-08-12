@@ -45,6 +45,27 @@ def test_add_worktree_uses_new_branch_and_exact_pinned_start(git_repo, tmp_path)
         adapter.add_worktree(repository, tmp_path / "other", "work/safe", pinned)
 
 
+def test_commit_tree_read_primitives_return_exact_local_objects(git_repo) -> None:
+    root, adapter, repository = git_repo
+    parent = adapter.snapshot(repository).head_sha
+    assert parent is not None
+    changed = root / "tracked.txt"
+    changed.write_text("committed bytes\n", encoding="utf-8")
+    adapter.stage_paths(repository, (changed,))
+    commit = adapter.commit(repository, "tree inspection", expected_paths=(changed,))
+
+    assert adapter.commit_parents(repository, commit.commit_sha) == (parent,)
+    assert adapter.diff_paths_between(repository, parent, commit.commit_sha) == (
+        Path("tracked.txt"),
+    )
+    entry = adapter.tree_entry(repository, commit.commit_sha, "tracked.txt")
+    assert entry is not None
+    assert entry.mode == "100644"
+    assert entry.object_type == "blob"
+    assert adapter.read_blob(repository, entry.object_id) == b"committed bytes\n"
+    assert adapter.tree_entry(repository, commit.commit_sha, "absent.txt") is None
+
+
 def test_stage_paths_handles_option_shaped_name_and_blocks_escape(git_repo, tmp_path) -> None:
     root, adapter, repository = git_repo
     evil = root / "--evil.txt"

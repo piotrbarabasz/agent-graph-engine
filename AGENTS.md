@@ -41,5 +41,9 @@
   workspace plus immutable operation evidence are preserved for diagnosis.
 - M006 atomic content writes preserve an existing file's mode and never introduce executable bits
   for new text files. A local commit is immediately bound to immutable witness evidence.
+- M006 accepts a local commit only after reading its parents, exact path delta, blobs, and regular-file
+  modes from the Git object database; any post-commit mismatch requires explicit recovery.
+- Caller initialization artifacts are written and synced in the staging run after `RUN_STARTED` and
+  before promotion, so every promoted M006 run already contains its immutable write inputs.
 - Cross-process M006 resume reconstructs only from content-digested write inputs, GraphState, and
   mutually consistent operation evidence; it never replays an interrupted side-effect node.

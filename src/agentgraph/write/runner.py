@@ -213,23 +213,24 @@ class WriteSliceRunner:
         )
         run_id = self.run_id_factory()
         self._last_run_id = run_id
-        run_path = self.paths.run(inspection.project_id, run_id)
         execution, coordinator = self._build_runtime(
             inspection, shadow, inputs, run_id, rehydrating=False
         )
         self._coordinator = coordinator
-        coordinator.start_run(run_id)
-        write_evidence(
-            run_path / "write-inputs.json",
-            context={
-                "project_id": inputs.project_id,
-                "run_id": run_id,
-                "item_id": inputs.package.item_id,
-                "scope_id": inputs.package.scope_id,
-                "pinned_head": inputs.baseline_head,
-                "source_revision": inputs.source_revision,
-            },
-            payload=inputs,
+        coordinator.start_run(
+            run_id,
+            initialize_artifacts=lambda staging: write_evidence(
+                staging / "write-inputs.json",
+                context={
+                    "project_id": inputs.project_id,
+                    "run_id": run_id,
+                    "item_id": inputs.package.item_id,
+                    "scope_id": inputs.package.scope_id,
+                    "pinned_head": inputs.baseline_head,
+                    "source_revision": inputs.source_revision,
+                },
+                payload=inputs,
+            ),
         )
         executed: list[str] = []
         with coordinator.open_session(run_id) as session:

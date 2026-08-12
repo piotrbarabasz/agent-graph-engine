@@ -60,5 +60,8 @@ with an invocation-local identity. Operation evidence remains under `<run>/opera
 Existing file modes are preserved by atomic content replacement, and deterministic review rejects
 unexpected mode changes. Durable runs persist content-digested `write-inputs.json`; a fresh
 `WriteSliceRunner.resume(run_id)` can reconstruct committed safe transitions from immutable
-operation evidence. The irreversible commit boundary writes `commit-witness.json` immediately
-after a commit is observed, and any later uncertainty remains a fail-closed recovery case.
+operation evidence. The write inputs are created and synced in the initializing run before that run
+is promoted or activated. The irreversible commit boundary writes `commit-witness.json` immediately
+after a commit is observed, then verifies the commit's sole parent, exact changed paths, blob hashes,
+and regular-file executable modes directly from the Git object database. Any later uncertainty or
+mismatch remains a fail-closed recovery case.

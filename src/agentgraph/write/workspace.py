@@ -288,6 +288,7 @@ class WriteExecution:
         except Exception as exc:
             raise PostCommitRecoveryRequired("commit witness finalization failed") from exc
         try:
+            self._verify_committed_tree(repository, result.commit_sha, applied)
             final = self.git.snapshot(repository)
             if (
                 final.dirty
@@ -310,6 +311,31 @@ class WriteExecution:
         except Exception as exc:
             raise PostCommitRecoveryRequired("post-commit verification requires recovery") from exc
         return result.commit_sha
+
+    def _verify_committed_tree(
+        self, repository: GitRepository, commit_sha: str, applied: AppliedChangeSet
+    ) -> None:
+        parents = self.git.commit_parents(repository, commit_sha)
+        if parents != (self.inputs.baseline_head,):
+            raise CommitVerificationError("commit parent differs from pinned baseline")
+        expected_paths = tuple(item.path for item in applied.files)
+        committed_paths = tuple(
+            path.as_posix()
+            for path in self.git.diff_paths_between(
+                repository, self.inputs.baseline_head, commit_sha
+            )
+        )
+        if set(committed_paths) != set(expected_paths) or len(committed_paths) != len(
+            expected_paths
+        ):
+            raise CommitVerificationError("committed paths differ from reviewed paths")
+        for item in applied.files:
+            entry = self.git.tree_entry(repository, commit_sha, item.path)
+            expected_mode = "100755" if item.after_mode & 0o111 else "100644"
+            if entry is None or entry.object_type != "blob" or entry.mode != expected_mode:
+                raise CommitVerificationError("committed entry type or mode is unsupported")
+            if _sha256(self.git.read_blob(repository, entry.object_id)) != item.after_sha256:
+                raise CommitVerificationError("committed blob differs from reviewed content")
 
     def rehydrate(self, state: GraphState) -> None:
         """Restore execution facts from immutable evidence for the persisted cursor."""

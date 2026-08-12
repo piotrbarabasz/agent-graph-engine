@@ -68,20 +68,44 @@ class DurableGraphCoordinator:
         self.now = now
         self.fault = fault or (lambda stage: None)
 
-    def start_run(self, run_id: str | None = None) -> RunHandle:
+    def start_run(
+        self,
+        run_id: str | None = None,
+        *,
+        initialize_artifacts: Callable[[Path], None] | None = None,
+    ) -> RunHandle:
         """Atomically initialize state version zero and RUN_STARTED under project lock."""
 
         selected = self.run_id_factory() if run_id is None else run_id
         validate_run_id(selected)
-        return self._start_run(selected, recover_incomplete=False)
+        return self._start_run(
+            selected,
+            recover_incomplete=False,
+            initialize_artifacts=initialize_artifacts,
+        )
 
-    def recover_incomplete_run_initialization(self, run_id: str) -> RunHandle:
+    def recover_incomplete_run_initialization(
+        self,
+        run_id: str,
+        *,
+        initialize_artifacts: Callable[[Path], None] | None = None,
+    ) -> RunHandle:
         """Preserve staging evidence and explicitly retry one incomplete initialization."""
 
         validate_run_id(run_id)
-        return self._start_run(run_id, recover_incomplete=True)
+        return self._start_run(
+            run_id,
+            recover_incomplete=True,
+            initialize_artifacts=initialize_artifacts,
+        )
 
-    def _start_run(self, selected: str, *, recover_incomplete: bool) -> RunHandle:
+    def _start_run(
+        self,
+        selected: str,
+        *,
+        recover_incomplete: bool,
+        initialize_artifacts: Callable[[Path], None] | None,
+    ) -> RunHandle:
         validate_run_id(selected)
         run_path = self.paths.run(self.project.project_id, selected)
         staging = self.paths.initializing_run(self.project.project_id, selected)
@@ -113,6 +137,10 @@ class DurableGraphCoordinator:
                 },
             )
             self.fault("after_run_started")
+            if initialize_artifacts is not None:
+                initialize_artifacts(staging)
+                self._fsync_directory(staging)
+            self.fault("after_initialization_artifacts")
             self.fault("before_run_promotion")
             os.replace(staging, run_path)
             self._fsync_runs_directory()
@@ -274,6 +302,16 @@ class DurableGraphCoordinator:
             return
         project = self.paths.project(self.project.project_id)
         descriptor = os.open(project, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+    @staticmethod
+    def _fsync_directory(directory: Path) -> None:
+        if os.name == "nt":
+            return
+        descriptor = os.open(directory, os.O_RDONLY)
         try:
             os.fsync(descriptor)
         finally:
