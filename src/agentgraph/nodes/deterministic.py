@@ -38,6 +38,7 @@ class StartNode:
 class DiscoverProjectNode:
     inputs: ShadowInputs
     node_id: str = "DISCOVER_PROJECT"
+    shadow: bool = True
 
     def run(self, state: GraphState, context: NodeContext) -> NodeResult:
         inspection = self.inputs.inspection
@@ -54,7 +55,7 @@ class DiscoverProjectNode:
                     "dirty": git.dirty,
                     "upstream": git.upstream,
                     "work_source_revision": revision,
-                    "shadow": True,
+                    "shadow": self.shadow,
                 },
             ),
             PatchOperation.set("project.name", inspection.project_name),
@@ -63,7 +64,7 @@ class DiscoverProjectNode:
                 {
                     "project_id": inspection.project_id,
                     "work_source_kind": inspection.work_source_kind,
-                    "shadow": True,
+                    "shadow": self.shadow,
                 },
             ),
             PatchOperation.set("baseline.revision", git.head_sha),
@@ -91,6 +92,7 @@ class DiscoverProjectNode:
 class PreflightNode:
     inputs: ShadowInputs
     node_id: str = "PREFLIGHT"
+    shadow: bool = True
 
     def run(self, state: GraphState, context: NodeContext) -> NodeResult:
         assessment = self.inputs.preflight
@@ -105,16 +107,29 @@ class PreflightNode:
             )
         revision = self.inputs.inspection.work_snapshot.revision.fingerprint
         head = self.inputs.inspection.git_snapshot.head_sha
+        invariants = (
+            (
+                "shadow_read_only",
+                "work_source_snapshot_pinned",
+                "repository_baseline_pinned",
+                "no_llm_execution",
+                "no_target_mutation",
+            )
+            if self.shadow
+            else (
+                "external_runtime_worktree_only",
+                "target_main_worktree_read_only",
+                "work_source_snapshot_pinned",
+                "repository_baseline_pinned",
+                "one_item_zero_repairs",
+                "no_source_closure",
+                "no_push_or_pull_request",
+            )
+        )
         operations = (
             PatchOperation.set(
                 "architecture_invariants.items",
-                (
-                    "shadow_read_only",
-                    "work_source_snapshot_pinned",
-                    "repository_baseline_pinned",
-                    "no_llm_execution",
-                    "no_target_mutation",
-                ),
+                invariants,
             ),
             PatchOperation.set(
                 "requirements.items",

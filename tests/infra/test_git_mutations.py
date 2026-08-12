@@ -6,7 +6,12 @@ from pathlib import Path
 import pytest
 
 from agentgraph.infra import GitCommitIdentity
-from agentgraph.infra.errors import GitCommandError, GitPathError, NothingToCommitError
+from agentgraph.infra.errors import (
+    GitCommandError,
+    GitPathError,
+    InvalidGitOperationError,
+    NothingToCommitError,
+)
 from tests.infra.conftest import git_command
 
 
@@ -21,6 +26,23 @@ def test_create_and_switch_branch_without_force_overwrite(git_repo) -> None:
     assert adapter.snapshot(repository).branch == original
     with pytest.raises(GitCommandError):
         adapter.create_branch(repository, "feature/safe")
+
+
+def test_add_worktree_uses_new_branch_and_exact_pinned_start(git_repo, tmp_path) -> None:
+    _, adapter, repository = git_repo
+    pinned = adapter.snapshot(repository).head_sha
+    assert pinned is not None
+    workspace = tmp_path / "external" / "workspace"
+
+    result = adapter.add_worktree(repository, workspace, "work/safe", pinned)
+
+    assert result.repository.root == workspace.resolve()
+    assert adapter.local_branch_exists(repository, "work/safe")
+    assert adapter.resolve_ref(repository, "refs/heads/work/safe") == pinned
+    assert adapter.snapshot(result.repository).branch == "work/safe"
+    assert adapter.snapshot(result.repository).head_sha == pinned
+    with pytest.raises(InvalidGitOperationError, match="already exists"):
+        adapter.add_worktree(repository, tmp_path / "other", "work/safe", pinned)
 
 
 def test_stage_paths_handles_option_shaped_name_and_blocks_escape(git_repo, tmp_path) -> None:

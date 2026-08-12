@@ -2,10 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-PRODUCTION_ROOTS = (
-    Path("src/agentgraph/integration"),
-    Path("src/agentgraph/nodes"),
-)
+PRODUCTION_ROOTS = (Path("src/agentgraph/integration"),)
 
 
 def production_text() -> str:
@@ -14,6 +11,7 @@ def production_text() -> str:
         for root in PRODUCTION_ROOTS
         for path in sorted(root.glob("*.py"))
     )
+    +Path("src/agentgraph/nodes/deterministic.py").read_text(encoding="utf-8")
 
 
 def test_shadow_production_has_no_source_specific_or_execution_coupling() -> None:

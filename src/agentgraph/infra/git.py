@@ -80,6 +80,14 @@ class GitCommitResult:
 
 
 @dataclass(frozen=True, slots=True)
+class GitWorktreeResult:
+    """A newly-created local worktree plus the structural command receipt."""
+
+    repository: GitRepository
+    receipt: CommandReceipt
+
+
+@dataclass(frozen=True, slots=True)
 class _StatusPaths:
     staged: tuple[Path, ...]
     unstaged: tuple[Path, ...]
@@ -232,6 +240,62 @@ class GitAdapter:
         result = self._run(repository, ("switch", name))
         self._require_success(result, "Git branch switch failed")
         return result.receipt
+
+    def local_branch_exists(self, repository: GitRepository, name: str) -> bool:
+        """Return whether an exact local branch ref exists, without remote lookup."""
+
+        self._validate_branch(repository, name)
+        result = self._run(repository, ("show-ref", "--verify", "--quiet", f"refs/heads/{name}"))
+        if result.receipt.status is ProcessStatus.SUCCEEDED:
+            return True
+        if result.receipt.status is ProcessStatus.FAILED and result.receipt.exit_code == 1:
+            return False
+        self._require_success(result, "Git local branch inspection failed")
+        raise AssertionError("unreachable")
+
+    def resolve_ref(self, repository: GitRepository, reference: str) -> str | None:
+        """Resolve an exact local commit-ish to a commit SHA, or return None."""
+
+        if (
+            not isinstance(reference, str)
+            or not reference
+            or reference.startswith("-")
+            or "\x00" in reference
+        ):
+            raise InvalidGitReferenceError("invalid Git reference")
+        result = self._run(
+            repository, ("rev-parse", "--verify", "--quiet", f"{reference}^{{commit}}")
+        )
+        if result.receipt.status is ProcessStatus.SUCCEEDED:
+            return self._single_text(result)
+        if result.receipt.status is ProcessStatus.FAILED:
+            return None
+        self._require_success(result, "Git reference resolution failed")
+        raise AssertionError("unreachable")
+
+    def add_worktree(
+        self,
+        repository: GitRepository,
+        workspace: Path | str,
+        branch: str,
+        start_sha: str,
+    ) -> GitWorktreeResult:
+        """Create one new branch in a new local worktree from a pinned commit."""
+
+        self._validate_branch(repository, branch)
+        self._validate_start_point(repository, start_sha)
+        destination = Path(workspace).expanduser().resolve()
+        if destination.exists() or destination.is_symlink():
+            raise GitPathError("worktree destination already exists")
+        if self.local_branch_exists(repository, branch):
+            raise InvalidGitOperationError("local branch already exists")
+        result = self._run(
+            repository,
+            ("worktree", "add", "-b", branch, os.fspath(destination), start_sha),
+            timeout_seconds=self.commit_timeout_seconds,
+        )
+        self._require_success(result, "Git worktree creation failed")
+        return GitWorktreeResult(self.discover_repository(destination), result.receipt)
 
     def stage_paths(self, repository: GitRepository, paths: Iterable[Path | str]) -> CommandReceipt:
         relative_paths = self._normalize_paths(repository, paths)
