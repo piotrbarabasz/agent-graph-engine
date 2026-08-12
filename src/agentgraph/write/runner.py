@@ -428,7 +428,7 @@ class WriteSliceRunner:
         if outcome is not WriteSliceOutcome.LOCAL_COMMIT_CREATED:
             issues = (
                 WriteSliceIssue(
-                    state.failure.code or "write_run_not_completed",
+                    execution.issue_code or state.failure.code or "write_run_not_completed",
                     f"write run finalized with {state.run.status.value}",
                 ),
             )

@@ -25,13 +25,14 @@ from .conftest import git, initialize_target, semantic_git_state, working_tree_b
 
 
 class NewFileProvider:
-    def propose(self, request):
+    def propose(self, request, context):
         assert not hasattr(request, "workspace_path")
+        assert context.repository_root.name == "workspace"
         return ChangeSet.create((FileChange("src/t001.py", None, "value = 1\n"),))
 
 
 class OutOfScopeProvider:
-    def propose(self, request):
+    def propose(self, request, context):
         return ChangeSet.create((FileChange("README.md", None, "escalation\n"),))
 
 
@@ -39,7 +40,7 @@ class ExistingScriptProvider:
     def __init__(self, before: str):
         self.before = before
 
-    def propose(self, request):
+    def propose(self, request, context):
         return ChangeSet.create(
             (FileChange("scripts/run.sh", self.before, "#!/bin/sh\necho changed\n"),)
         )

@@ -3,15 +3,18 @@
 from .apply import apply_changeset
 from .capability import (
     capability_fingerprint,
+    normalize_repo_path,
     path_is_allowed,
     reconcile_write_capability,
     stable_path_union,
 )
 from .errors import (
     ChangePathError,
+    ChangeProviderBlockedError,
     ChangeSetError,
     CommitVerificationError,
     PostCommitRecoveryRequired,
+    ProviderMutationError,
     StaleFileError,
     UnsupportedWriteScopeError,
     ValidationExecutionError,
@@ -33,13 +36,15 @@ from .models import (
     WriteSliceReport,
     WriteSliceRequest,
 )
-from .provider import ChangeProvider
+from .provider import ChangeProvider, ChangeProviderContext
 
 __all__ = [
     "AppliedChangeSet",
     "AppliedFile",
     "ChangePathError",
     "ChangeProvider",
+    "ChangeProviderBlockedError",
+    "ChangeProviderContext",
     "ChangeRequest",
     "ChangeSet",
     "ChangeSetError",
@@ -47,6 +52,7 @@ __all__ = [
     "CommitWitness",
     "FileChange",
     "PostCommitRecoveryRequired",
+    "ProviderMutationError",
     "StaleFileError",
     "UnsupportedWriteScopeError",
     "ValidationExecutionError",
@@ -62,6 +68,7 @@ __all__ = [
     "WriteSliceRunner",
     "apply_changeset",
     "capability_fingerprint",
+    "normalize_repo_path",
     "path_is_allowed",
     "reconcile_write_capability",
     "stable_path_union",

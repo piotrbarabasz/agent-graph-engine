@@ -15,10 +15,14 @@ repository.
 M006 adds the first controlled local-write vertical slice. It can create one deterministically
 reviewed local commit on a new scope branch in an external durable-run Git worktree while keeping
 the target main working tree byte-identical and on its base branch.
+M007 adds a proposal-only integration with a locally configured Codex CLI. Codex can inspect the
+external worktree through a native least-privilege permission profile and return one strict
+structured change proposal.
 
-M006 does not update the source task, push, open a pull request, merge, or invoke Codex. The
-injected `ChangeProvider` returns a bounded structured text `ChangeSet`; it receives neither a
-workspace path nor a writable repository capability. The project has no CLI or remote workflow.
+Agent Graph Engine—not Codex—computes stale-file hashes, applies changes, runs validation, reviews
+the actual diff, stages files, and verifies the local commit. The provider receives a neutral read
+context but no Git mutation or engine write capability. The project does not update source tasks,
+push, open pull requests, merge, perform automatic repair, or expose an AgentGraph CLI.
 
 ## Development
 
@@ -65,3 +69,14 @@ is promoted or activated. The irreversible commit boundary writes `commit-witnes
 after a commit is observed, then verifies the commit's sole parent, exact changed paths, blob hashes,
 and regular-file executable modes directly from the Git object database. Any later uncertainty or
 mismatch remains a fail-closed recovery case.
+
+`agentgraph.providers.codex.CodexChangeProvider` probes the installed CLI before use, requires
+non-interactive execution with an explicit Codex working root and a runtime-only permission profile.
+That profile denies filesystem-root access, grants read-only access to Codex's minimal helper paths
+and the external worktree, and disables tool network access. The invocation also ignores ambient
+user configuration and rules and disables MCP and web-search tools. It sends the deterministic
+prompt through stdin and accepts only the bounded final-result file validated against an exact
+schema. Provider provenance is stored under
+`<run>/provider/codex`; it contains digests, the normalized proposal, and a sanitized process receipt,
+not chain-of-thought or a resumable Codex session. Any tracked, staged, untracked, conflicted, branch,
+or HEAD mutation during the provider call stops `IMPLEMENT` before the engine applies a proposal.
