@@ -8,7 +8,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from agentgraph.core import GraphState, ReviewVerdict, ValidationVerdict
+from agentgraph.core import (
+    FailureCategory,
+    GraphState,
+    RepairClassification,
+    ReviewVerdict,
+    ValidationVerdict,
+)
 from agentgraph.infra import (
     CommandReceipt,
     CommandSpec,
@@ -23,16 +29,32 @@ from agentgraph.runtime.codec import decode_value
 from agentgraph.work import WorkSource
 
 from .apply import apply_changeset
+from .capability import normalize_repo_path, path_is_allowed
 from .errors import (
     CommitVerificationError,
     PostCommitRecoveryRequired,
     ProviderMutationError,
+    RepairFailureContextError,
+    RepairLineageError,
+    RepairWorkspaceLineageError,
     ValidationExecutionError,
     WorkspaceError,
+    WorkspaceManifestError,
     WriteBaselineDriftError,
 )
 from .evidence import read_evidence, write_evidence
-from .models import AppliedChangeSet, ChangeRequest, ChangeSet, CommitWitness, WriteInputs
+from .models import (
+    AppliedChangeSet,
+    ChangeIntent,
+    ChangeRequest,
+    ChangeSet,
+    CommitWitness,
+    RepairFailureContext,
+    RepairValidationDiagnostic,
+    WorkspaceManifest,
+    WorkspaceManifestEntry,
+    WriteInputs,
+)
 from .provider import ChangeProvider, ChangeProviderContext
 
 if TYPE_CHECKING:
@@ -62,6 +84,7 @@ class WriteExecution:
     workspace_repository: GitRepository | None = field(default=None, init=False)
     changeset: ChangeSet | None = field(default=None, init=False)
     applied: AppliedChangeSet | None = field(default=None, init=False)
+    manifest: WorkspaceManifest | None = field(default=None, init=False)
     validation_receipts: tuple[CommandReceipt, ...] = field(default=(), init=False)
     diff_check: DiffCheckResult | None = field(default=None, init=False)
     validation_passed: bool = field(default=False, init=False)
@@ -89,7 +112,7 @@ class WriteExecution:
         if not self.rehydrating and (self.workspace.exists() or self.workspace.is_symlink()):
             raise WorkspaceError("workspace path already exists")
 
-    def implement(self) -> AppliedChangeSet:
+    def implement(self, node_attempt_id: str) -> AppliedChangeSet:
         self.live_recheck("write_baseline_drift")
         if self.git.local_branch_exists(self.target, self.inputs.scope_branch):
             raise WriteBaselineDriftError("scope_branch_already_exists")
@@ -115,6 +138,11 @@ class WriteExecution:
             repository_root=self.workspace,
             runtime_directory=provider_directory,
             baseline_head=self.inputs.baseline_head,
+            run_id=self.run_id,
+            node_id="IMPLEMENT",
+            node_attempt_id=node_attempt_id,
+            provider_invocation_id=node_attempt_id,
+            repair_cycle=0,
         )
         provider_error: BaseException | None = None
         proposed = None
@@ -150,12 +178,19 @@ class WriteExecution:
             context=self.evidence_context(),
             payload={"applied": applied, "workspace_snapshot": _snapshot_evidence(snapshot)},
         )
+        self.manifest = self.capture_manifest(0)
+        write_evidence(
+            self.operations / "workspace-manifest.json",
+            context=self.evidence_context(),
+            payload={"manifest": self.manifest},
+        )
         return applied
 
-    def validate(self) -> bool:
+    def validate(self, cycle: int) -> bool:
         repository = self._require_workspace()
-        if (self.operations / "validation.json").exists():
-            self._restore_validation_evidence()
+        path = self._cycle_evidence_path(cycle, "validation.json")
+        if path.exists():
+            self._restore_validation_evidence(cycle)
             return self.validation_passed
         receipts = []
         passed = True
@@ -178,9 +213,11 @@ class WriteExecution:
         self.diff_check = diff
         self.validation_passed = passed and diff.ok
         write_evidence(
-            self.operations / "validation.json",
+            path,
             context=self.evidence_context(),
             payload={
+                "cycle": cycle,
+                "workspace_manifest_digest": self._require_manifest().digest,
                 "commands": self.validation_receipts,
                 "diff_check": diff,
                 "passed": self.validation_passed,
@@ -188,25 +225,23 @@ class WriteExecution:
         )
         return self.validation_passed
 
-    def review(self) -> tuple[bool, tuple[str, ...]]:
+    def review(self, cycle: int) -> tuple[bool, tuple[str, ...]]:
         repository = self._require_workspace()
-        applied = self._require_applied()
-        if (self.operations / "review.json").exists():
-            self._restore_review_evidence()
+        manifest = self._require_manifest()
+        path = self._cycle_evidence_path(cycle, "review.json")
+        if path.exists():
+            self._restore_review_evidence(cycle)
             return self.review_passed, self.review_findings
         snapshot = self.git.snapshot(repository)
         findings: list[str] = []
-        expected = {item.path for item in applied.files}
-        actual = {
-            path.as_posix()
-            for group in (
-                snapshot.staged_paths,
-                snapshot.unstaged_paths,
-                snapshot.untracked_paths,
-                snapshot.conflicted_paths,
-            )
-            for path in group
-        }
+        expected = {item.path for item in manifest.files}
+        try:
+            observed_manifest = self.capture_manifest(cycle)
+        except WorkspaceError:
+            observed_manifest = None
+        actual = (
+            set() if observed_manifest is None else {item.path for item in observed_manifest.files}
+        )
         if snapshot.branch != self.inputs.scope_branch:
             findings.append("workspace_branch_mismatch")
         if snapshot.head_sha != self.inputs.baseline_head:
@@ -217,15 +252,17 @@ class WriteExecution:
             findings.append("workspace_conflicts")
         if actual != expected:
             findings.append("changed_paths_mismatch")
-        for item in applied.files:
+        if observed_manifest != manifest:
+            findings.append("workspace_manifest_mismatch")
+        if not manifest.files:
+            findings.append("no_effective_changes")
+        for item in manifest.files:
             candidate = repository.root.joinpath(*item.path.split("/"))
             if not candidate.is_file() or candidate.is_symlink():
                 findings.append(f"final_file_missing:{item.path}")
-            elif _sha256(candidate.read_bytes()) != item.after_sha256:
+            elif _sha256(candidate.read_bytes()) != item.sha256:
                 findings.append(f"final_hash_mismatch:{item.path}")
-            elif stat.S_IMODE(candidate.stat().st_mode) != item.after_mode:
-                findings.append(f"final_mode_mismatch:{item.path}")
-            elif item.before_mode is not None and item.after_mode != item.before_mode:
+            elif _file_mode(candidate) != item.mode:
                 findings.append(f"unexpected_mode_change:{item.path}")
         if not self.validation_passed or self.diff_check is None or not self.diff_check.ok:
             findings.append("validation_not_passed")
@@ -236,36 +273,281 @@ class WriteExecution:
         self.review_findings = tuple(dict.fromkeys(findings))
         self.review_passed = not self.review_findings
         write_evidence(
-            self.operations / "review.json",
+            path,
             context=self.evidence_context(),
-            payload={"passed": self.review_passed, "findings": self.review_findings},
+            payload={
+                "cycle": cycle,
+                "workspace_manifest_digest": manifest.digest,
+                "passed": self.review_passed,
+                "findings": self.review_findings,
+            },
         )
         return self.review_passed, self.review_findings
+
+    def capture_manifest(self, cycle: int) -> WorkspaceManifest:
+        """Capture the exact current effective diff against the pinned baseline."""
+
+        repository = self._require_workspace()
+        snapshot = self.git.snapshot(repository)
+        if (
+            snapshot.head_sha != self.inputs.baseline_head
+            or snapshot.branch != self.inputs.scope_branch
+            or snapshot.detached_head
+            or snapshot.staged_paths
+            or snapshot.conflicted_paths
+        ):
+            raise WorkspaceManifestError("workspace_manifest_invalid")
+        raw_paths = (*snapshot.unstaged_paths, *snapshot.untracked_paths)
+        names = tuple(sorted({path.as_posix() for path in raw_paths}, key=lambda x: x.encode()))
+        entries: list[WorkspaceManifestEntry] = []
+        root = repository.root.resolve(strict=True)
+        for name in names:
+            pure = normalize_repo_path(name)
+            if not path_is_allowed(name, self.inputs.expected_allowed_paths):
+                raise WorkspaceManifestError("workspace_manifest_invalid")
+            candidate = root.joinpath(*pure.parts)
+            try:
+                candidate.resolve(strict=True).relative_to(root)
+            except (OSError, ValueError) as exc:
+                raise WorkspaceManifestError("workspace_manifest_invalid") from exc
+            if not candidate.is_file() or candidate.is_symlink():
+                raise WorkspaceManifestError("workspace_manifest_invalid")
+            raw = candidate.read_bytes()
+            try:
+                raw.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise WorkspaceManifestError("workspace_manifest_invalid") from exc
+            baseline = self.git.tree_entry(repository, self.inputs.baseline_head, name)
+            if baseline is not None:
+                if baseline.object_type != "blob" or baseline.mode not in {"100644", "100755"}:
+                    raise WorkspaceManifestError("workspace_manifest_invalid")
+                mode = 0o755 if baseline.mode == "100755" else 0o644
+                if _file_mode(candidate) != mode:
+                    raise WorkspaceManifestError("workspace_manifest_invalid")
+                if raw == self.git.read_blob(repository, baseline.object_id):
+                    # Git status can briefly report a path whose bytes have returned to baseline.
+                    continue
+            else:
+                mode = 0o644
+                if _file_mode(candidate) != mode:
+                    raise WorkspaceManifestError("workspace_manifest_invalid")
+            entries.append(WorkspaceManifestEntry(name, _sha256(raw), len(raw), mode))
+        return WorkspaceManifest.create(cycle, self.inputs.baseline_head, tuple(entries))
+
+    def verify_current_manifest(self) -> str:
+        manifest = self._require_manifest()
+        try:
+            observed = self.capture_manifest(manifest.cycle)
+        except WorkspaceError as exc:
+            raise RepairWorkspaceLineageError("repair_workspace_lineage_mismatch") from exc
+        if observed != manifest:
+            raise RepairWorkspaceLineageError("repair_workspace_lineage_mismatch")
+        return observed.digest
+
+    def prepare_failure_context(self, state: GraphState) -> RepairFailureContext:
+        if len(state.repair.history) != state.repair.count:
+            raise RepairFailureContextError("repair_failure_context_mismatch")
+        source_node = state.graph.previous_node
+        if source_node not in {"VALIDATE", "REVIEW"}:
+            raise RepairFailureContextError("repair_failure_context_mismatch")
+        manifest = self._require_manifest()
+        self.verify_current_manifest()
+        cycle = state.repair.count
+        if source_node == "VALIDATE":
+            if (
+                state.validation.verdict is not ValidationVerdict.FAIL
+                or state.failure.category
+                not in {
+                    FailureCategory.VALIDATION,
+                    FailureCategory.IMPLEMENTATION,
+                    FailureCategory.DESIGN,
+                }
+            ):
+                raise RepairFailureContextError("repair_failure_context_mismatch")
+            self._restore_validation_evidence(cycle)
+            if self.validation_passed:
+                raise RepairFailureContextError("repair_failure_context_mismatch")
+            receipts = self.validation_receipts
+            review_findings: tuple[str, ...] = ()
+        else:
+            if (
+                state.validation.verdict is not ValidationVerdict.PASS
+                or state.review.verdict is not ReviewVerdict.FAIL
+                or (state.review.findings != self.review_findings and self.review_findings)
+            ):
+                raise RepairFailureContextError("repair_failure_context_mismatch")
+            self._restore_validation_evidence(cycle)
+            self._restore_review_evidence(cycle)
+            if (
+                not self.validation_passed
+                or self.review_passed
+                or state.review.findings != self.review_findings
+            ):
+                raise RepairFailureContextError("repair_failure_context_mismatch")
+            receipts = self.validation_receipts
+            review_findings = self.review_findings
+        diagnostics = tuple(
+            RepairValidationDiagnostic(
+                item.command_id,
+                item.status.value,
+                item.exit_code,
+                item.stdout_preview,
+                item.stderr_preview,
+                item.stdout_truncated,
+                item.stderr_truncated,
+            )
+            for item in receipts
+        )
+        requirements, acceptance = self.analysis.implementation_requirements()
+        context = RepairFailureContext(
+            cycle + 1,
+            source_node,
+            state.failure.category or FailureCategory.VALIDATION,
+            state.failure.code or "repairable_failure",
+            manifest.digest,
+            tuple(item.path for item in manifest.files),
+            diagnostics,
+            review_findings,
+            requirements,
+            acceptance,
+            self.inputs.expected_allowed_paths,
+            self.inputs.baseline_head,
+            self.inputs.source_revision,
+        )
+        path = self._cycle_evidence_path(cycle + 1, "context.json")
+        if path.exists():
+            try:
+                restored = decode_value(self._payload_path(path), RepairFailureContext)
+            except Exception as exc:
+                raise RepairFailureContextError("repair_failure_context_mismatch") from exc
+            if restored != context:
+                raise RepairFailureContextError("repair_failure_context_mismatch")
+        else:
+            write_evidence(path, context=self.evidence_context(), payload=context)
+        return context
+
+    def repair(
+        self,
+        state: GraphState,
+        node_id: str,
+        node_attempt_id: str,
+        classification: RepairClassification,
+    ) -> tuple[AppliedChangeSet, WorkspaceManifest]:
+        cycle = state.repair.count
+        if cycle < 1 or len(state.repair.history) != cycle:
+            raise RepairFailureContextError("repair_failure_context_mismatch")
+        expected_record = state.repair.history[-1]
+        if (
+            expected_record.id != f"repair-{cycle:03d}"
+            or expected_record.classification is not classification
+        ):
+            raise RepairFailureContextError("repair_failure_context_mismatch")
+        context_path = self._cycle_evidence_path(cycle, "context.json")
+        try:
+            failure_context = decode_value(self._payload_path(context_path), RepairFailureContext)
+        except Exception as exc:
+            raise RepairFailureContextError("repair_failure_context_mismatch") from exc
+        if failure_context.cycle != cycle or failure_context.classification not in {
+            None,
+            classification,
+        }:
+            raise RepairFailureContextError("repair_failure_context_mismatch")
+        before = self._require_manifest()
+        self.verify_current_manifest()
+        request = self.change_request(
+            intent=(
+                ChangeIntent.PROGRAMMER_REPAIR
+                if classification is RepairClassification.PROGRAMMER
+                else ChangeIntent.DEBUGGER
+            ),
+            failure_context=failure_context,
+        )
+        provider_directory = self.run_path / "provider" / "repairs" / f"{cycle:03d}"
+        provider_directory.mkdir(parents=True, exist_ok=False)
+        provider_invocation_id = f"{node_attempt_id}-repair-{cycle:03d}"
+        provider_context = ChangeProviderContext(
+            self.workspace,
+            provider_directory,
+            self.inputs.baseline_head,
+            self.run_id,
+            node_id,
+            node_attempt_id,
+            provider_invocation_id,
+            cycle,
+        )
+        provider_error: BaseException | None = None
+        proposed = None
+        try:
+            proposed = self.provider.propose(request, provider_context)
+        except BaseException as exc:
+            provider_error = exc
+        try:
+            after_provider = self.capture_manifest(before.cycle)
+        except WorkspaceError as exc:
+            self.issue_code = "provider_mutated_repository"
+            raise ProviderMutationError("provider_mutated_repository") from provider_error or exc
+        self.live_recheck("write_baseline_drift_after_repair_provider")
+        if after_provider != before:
+            self.issue_code = "provider_mutated_repository"
+            raise ProviderMutationError("provider_mutated_repository") from provider_error
+        if provider_error is not None:
+            raise provider_error
+        if not isinstance(proposed, ChangeSet):
+            raise WorkspaceError("ChangeProvider returned a non-ChangeSet value")
+        repair_dir = self.operations / "repairs" / f"{cycle:03d}"
+        write_evidence(
+            repair_dir / "proposal.json",
+            context=self.evidence_context(),
+            payload={"request": request, "changeset": proposed},
+        )
+        applied = apply_changeset(self.workspace, proposed, self.inputs.expected_allowed_paths)
+        manifest = self.capture_manifest(cycle)
+        write_evidence(
+            repair_dir / "applied.json",
+            context=self.evidence_context(),
+            payload={
+                "applied": applied,
+                "workspace_snapshot": _snapshot_evidence(
+                    self.git.snapshot(self._require_workspace())
+                ),
+            },
+        )
+        write_evidence(
+            repair_dir / "workspace-manifest.json",
+            context=self.evidence_context(),
+            payload={"manifest": manifest},
+        )
+        self.changeset = proposed
+        self.applied = applied
+        self.manifest = manifest
+        self.validation_passed = False
+        self.review_passed = False
+        self.validation_receipts = ()
+        self.review_findings = ()
+        return applied, manifest
 
     def commit(self) -> str:
         if not self.review_passed:
             raise CommitVerificationError("review has not authorized close")
         self.live_recheck("write_baseline_drift_before_commit")
         repository = self._require_workspace()
-        applied = self._require_applied()
+        manifest = self._require_manifest()
+        if not manifest.files:
+            raise CommitVerificationError("no effective changes to commit")
+        self.verify_current_manifest()
         before = self.git.snapshot(repository)
         if before.staged_paths or before.conflicted_paths:
             raise CommitVerificationError("workspace changed after review")
-        expected = tuple(item.path for item in applied.files)
-        actual = {
-            path.as_posix()
-            for group in (before.unstaged_paths, before.untracked_paths)
-            for path in group
-        }
-        if actual != set(expected):
+        expected = tuple(item.path for item in manifest.files)
+        if {item.path for item in self.capture_manifest(manifest.cycle).files} != set(expected):
             raise CommitVerificationError("workspace paths changed after review")
-        for item in applied.files:
+        for item in manifest.files:
             candidate = repository.root.joinpath(*item.path.split("/"))
             if (
                 not candidate.is_file()
                 or candidate.is_symlink()
-                or _sha256(candidate.read_bytes()) != item.after_sha256
-                or stat.S_IMODE(candidate.stat().st_mode) != item.after_mode
+                or _sha256(candidate.read_bytes()) != item.sha256
+                or _file_mode(candidate) != item.mode
             ):
                 raise CommitVerificationError("reviewed file content or mode changed before commit")
         final_diff_check = self.git.diff_check(repository)
@@ -317,13 +599,9 @@ class WriteExecution:
         except Exception as exc:
             raise PostCommitRecoveryRequired("commit witness finalization failed") from exc
         try:
-            self._verify_committed_tree(repository, result.commit_sha, applied)
+            self._verify_committed_tree(repository, result.commit_sha, manifest)
             final = self.git.snapshot(repository)
-            if (
-                final.dirty
-                or final.branch != self.inputs.scope_branch
-                or final.head_sha != result.commit_sha
-            ):
+            if not self._snapshot_matches_head(repository, final, result.commit_sha):
                 raise CommitVerificationError("committed workspace verification failed")
             if self.git.resolve_ref(self.target, scope_ref) != result.commit_sha:
                 raise CommitVerificationError("scope branch ref does not equal commit")
@@ -341,13 +619,42 @@ class WriteExecution:
             raise PostCommitRecoveryRequired("post-commit verification requires recovery") from exc
         return result.commit_sha
 
+    def _snapshot_matches_head(
+        self, repository: GitRepository, snapshot: object, commit_sha: str
+    ) -> bool:
+        if (
+            snapshot.branch != self.inputs.scope_branch
+            or snapshot.head_sha != commit_sha
+            or snapshot.staged_paths
+            or snapshot.conflicted_paths
+        ):
+            return False
+        paths = {
+            path.as_posix()
+            for group in (snapshot.unstaged_paths, snapshot.untracked_paths)
+            for path in group
+        }
+        for name in paths:
+            candidate = repository.root.joinpath(*normalize_repo_path(name).parts)
+            entry = self.git.tree_entry(repository, commit_sha, name)
+            if (
+                entry is None
+                or entry.object_type != "blob"
+                or not candidate.is_file()
+                or candidate.is_symlink()
+                or candidate.read_bytes() != self.git.read_blob(repository, entry.object_id)
+                or _file_mode(candidate) != (0o755 if entry.mode == "100755" else 0o644)
+            ):
+                return False
+        return True
+
     def _verify_committed_tree(
-        self, repository: GitRepository, commit_sha: str, applied: AppliedChangeSet
+        self, repository: GitRepository, commit_sha: str, manifest: WorkspaceManifest
     ) -> None:
         parents = self.git.commit_parents(repository, commit_sha)
         if parents != (self.inputs.baseline_head,):
             raise CommitVerificationError("commit parent differs from pinned baseline")
-        expected_paths = tuple(item.path for item in applied.files)
+        expected_paths = tuple(item.path for item in manifest.files)
         committed_paths = tuple(
             path.as_posix()
             for path in self.git.diff_paths_between(
@@ -358,12 +665,12 @@ class WriteExecution:
             expected_paths
         ):
             raise CommitVerificationError("committed paths differ from reviewed paths")
-        for item in applied.files:
+        for item in manifest.files:
             entry = self.git.tree_entry(repository, commit_sha, item.path)
-            expected_mode = "100755" if item.after_mode & 0o111 else "100644"
+            expected_mode = "100755" if item.mode & 0o111 else "100644"
             if entry is None or entry.object_type != "blob" or entry.mode != expected_mode:
                 raise CommitVerificationError("committed entry type or mode is unsupported")
-            if _sha256(self.git.read_blob(repository, entry.object_id)) != item.after_sha256:
+            if _sha256(self.git.read_blob(repository, entry.object_id)) != item.sha256:
                 raise CommitVerificationError("committed blob differs from reviewed content")
 
     def rehydrate(self, state: GraphState) -> None:
@@ -385,49 +692,93 @@ class WriteExecution:
             "VALIDATE",
             "REVIEW",
             "CLASSIFY_FAILURE",
+            "PROGRAMMER_REPAIR",
+            "DEBUGGER",
             "CLOSE_TASK",
             "MORE_WORK",
             "FINALIZE",
         } or bool(state.changes.identifiers)
         if after_implement:
+            self.analysis.prepare_implementation(state)
             proposal = self._payload("implement-proposal.json")
             applied_payload = self._payload("implement-applied.json")
             self.changeset = decode_value(proposal["changeset"], ChangeSet)
             self.applied = decode_value(applied_payload["applied"], AppliedChangeSet)
             if self.changeset.digest != self.applied.changeset_digest:
                 raise WorkspaceError("proposal and applied evidence disagree")
-            expected_identifier = f"changeset:{self.changeset.digest}"
-            applied_paths = tuple(item.path for item in self.applied.files)
+            self.manifest = decode_value(
+                self._payload("workspace-manifest.json")["manifest"], WorkspaceManifest
+            )
+            if self.manifest.cycle != 0:
+                raise RepairLineageError("repair_lineage_mismatch")
+            identifiers = state.changes.identifiers
             if (
-                expected_identifier not in state.changes.identifiers
-                or state.changes.agent_reported_files != applied_paths
-                or state.changes.count != len(applied_paths)
+                f"changeset:{self.changeset.digest}" not in identifiers
+                or f"workspace_manifest:0:{self.manifest.digest}" not in identifiers
             ):
-                raise WorkspaceError("GraphState and implement evidence disagree")
+                raise RepairLineageError("repair_lineage_mismatch")
+            successful_cycles: list[int] = []
+            for value in identifiers:
+                if value.startswith("workspace_manifest:"):
+                    parts = value.split(":", 2)
+                    if len(parts) != 3 or not parts[1].isdigit():
+                        raise RepairLineageError("repair_lineage_mismatch")
+                    successful_cycles.append(int(parts[1]))
+            if sorted(successful_cycles) != list(range(max(successful_cycles, default=-1) + 1)):
+                raise RepairLineageError("repair_lineage_mismatch")
+            if successful_cycles and max(successful_cycles) > state.repair.count:
+                raise RepairLineageError("repair_lineage_mismatch")
+            for cycle in range(1, max(successful_cycles, default=0) + 1):
+                repair_dir = self.operations / "repairs" / f"{cycle:03d}"
+                try:
+                    proposal_payload = self._payload_path(repair_dir / "proposal.json")
+                    applied_payload = self._payload_path(repair_dir / "applied.json")
+                    manifest_payload = self._payload_path(repair_dir / "workspace-manifest.json")
+                    changeset = decode_value(proposal_payload["changeset"], ChangeSet)
+                    applied = decode_value(applied_payload["applied"], AppliedChangeSet)
+                    manifest = decode_value(manifest_payload["manifest"], WorkspaceManifest)
+                except Exception as exc:
+                    raise RepairLineageError("repair_lineage_mismatch") from exc
+                if (
+                    applied.changeset_digest != changeset.digest
+                    or manifest.cycle != cycle
+                    or f"repair_changeset:{cycle}:{changeset.digest}" not in identifiers
+                    or f"workspace_manifest:{cycle}:{manifest.digest}" not in identifiers
+                ):
+                    raise RepairLineageError("repair_lineage_mismatch")
+                self.changeset, self.applied, self.manifest = changeset, applied, manifest
+            manifest = self._require_manifest()
+            manifest_paths = tuple(item.path for item in manifest.files)
+            if state.changes.agent_reported_files != manifest_paths or state.changes.count != len(
+                manifest_paths
+            ):
+                raise RepairLineageError("repair_lineage_mismatch")
+            witness_exists = (self.operations / "commit-witness.json").exists()
+            if cursor not in {"MORE_WORK", "FINALIZE", "END"} and not witness_exists:
+                self.verify_current_manifest()
 
+        current_cycle = 0 if self.manifest is None else self.manifest.cycle
+        validation_path = self._cycle_evidence_path(current_cycle, "validation.json", create=False)
         after_validation = (
-            cursor
-            in {
-                "REVIEW",
-                "CLASSIFY_FAILURE",
-                "CLOSE_TASK",
-                "MORE_WORK",
-                "FINALIZE",
-            }
-            or state.validation.verdict is not ValidationVerdict.UNKNOWN
+            validation_path.exists()
+            and state.validation.verdict is not ValidationVerdict.UNKNOWN
+            and cursor not in {"PROGRAMMER_REPAIR", "DEBUGGER", "VALIDATE"}
         )
         if after_validation:
-            self._restore_validation_evidence()
+            self._restore_validation_evidence(current_cycle)
             expected = ValidationVerdict.PASS if self.validation_passed else ValidationVerdict.FAIL
             receipt_ids = tuple(receipt.command_id for receipt in self.validation_receipts)
             if state.validation.verdict is not expected or state.validation.checks != receipt_ids:
                 raise WorkspaceError("GraphState and validation evidence disagree")
 
-        after_review = cursor in {"CLOSE_TASK", "MORE_WORK", "FINALIZE"} or (
-            state.review.verdict is not ReviewVerdict.UNKNOWN
+        review_path = self._cycle_evidence_path(current_cycle, "review.json", create=False)
+        after_review = (
+            review_path.exists()
+            and state.review.verdict is not ReviewVerdict.UNKNOWN
+            and cursor not in {"PROGRAMMER_REPAIR", "DEBUGGER", "VALIDATE", "REVIEW"}
         )
         if after_review:
-            self._restore_review_evidence()
+            self._restore_review_evidence(current_cycle)
             expected = ReviewVerdict.PASS if self.review_passed else ReviewVerdict.FAIL
             if (
                 state.review.verdict is not expected
@@ -446,10 +797,12 @@ class WriteExecution:
                 or witness.scope_id != self.inputs.package.scope_id
                 or witness.base_head != self.inputs.baseline_head
                 or witness.previous_branch_head != self.inputs.baseline_head
-                or witness.changeset_digest
-                != (None if self.changeset is None else self.changeset.digest)
-                or witness.reviewed_paths
-                != (() if self.applied is None else tuple(item.path for item in self.applied.files))
+                or self.changeset is None
+                or witness.changeset_digest != self.changeset.digest
+                or self.manifest is None
+                or witness.workspace_manifest_digest != self.manifest.digest
+                or witness.repair_count != self.manifest.cycle
+                or witness.reviewed_paths != tuple(item.path for item in self.manifest.files)
             ):
                 raise WorkspaceError("commit witness differs from persisted write inputs")
             self.commit_sha = witness.commit_sha
@@ -458,7 +811,8 @@ class WriteExecution:
         self, previous_branch_head: str, commit_sha: str | None, reviewed_paths: tuple[str, ...]
     ) -> None:
         changeset = self.changeset
-        if changeset is None:
+        manifest = self.manifest
+        if changeset is None or manifest is None:
             raise WorkspaceError("commit witness requires a changeset")
         witness = CommitWitness(
             self.inputs.project_id,
@@ -470,6 +824,8 @@ class WriteExecution:
             commit_sha,
             changeset.digest,
             reviewed_paths,
+            manifest.digest,
+            manifest.cycle,
         )
         write_evidence(
             self.operations / "commit-witness.json",
@@ -477,19 +833,36 @@ class WriteExecution:
             payload=witness,
         )
 
-    def _restore_validation_evidence(self) -> None:
-        validation = self._payload("validation.json")
+    def _restore_validation_evidence(self, cycle: int) -> None:
+        validation = self._payload_path(
+            self._cycle_evidence_path(cycle, "validation.json", create=False)
+        )
+        manifest = self._require_manifest()
+        if (
+            validation.get("cycle") != cycle
+            or validation.get("workspace_manifest_digest") != manifest.digest
+        ):
+            raise RepairFailureContextError("repair_failure_context_mismatch")
         self.validation_receipts = decode_value(validation["commands"], tuple[CommandReceipt, ...])
         self.diff_check = decode_value(validation["diff_check"], DiffCheckResult)
         self.validation_passed = bool(validation["passed"])
 
-    def _restore_review_evidence(self) -> None:
-        review = self._payload("review.json")
+    def _restore_review_evidence(self, cycle: int) -> None:
+        review = self._payload_path(self._cycle_evidence_path(cycle, "review.json", create=False))
+        manifest = self._require_manifest()
+        if (
+            review.get("cycle") != cycle
+            or review.get("workspace_manifest_digest") != manifest.digest
+        ):
+            raise RepairFailureContextError("repair_failure_context_mismatch")
         self.review_passed = bool(review["passed"])
         self.review_findings = tuple(review["findings"])
 
     def _payload(self, name: str) -> dict[str, object]:
-        document = read_evidence(self.operations / name)
+        return self._payload_path(self.operations / name)
+
+    def _payload_path(self, path: Path) -> dict[str, object]:
+        document = read_evidence(path)
         if (
             document.get("run_id") != self.run_id
             or document.get("project_id") != self.inputs.project_id
@@ -524,7 +897,12 @@ class WriteExecution:
         if snapshot.revision.fingerprint != self.inputs.source_revision:
             raise WriteBaselineDriftError(code)
 
-    def change_request(self) -> ChangeRequest:
+    def change_request(
+        self,
+        *,
+        intent: ChangeIntent = ChangeIntent.IMPLEMENT,
+        failure_context: RepairFailureContext | None = None,
+    ) -> ChangeRequest:
         package = self.inputs.package
         explore = self.analysis.explore_analysis
         task_package = self.analysis.task_package
@@ -555,7 +933,7 @@ class WriteExecution:
             (
                 "external_runtime_worktree_only",
                 "target_main_worktree_read_only",
-                "one_item_zero_repairs",
+                "one_item_bounded_repairs",
                 "no_source_closure",
                 "no_push_or_pull_request",
             ),
@@ -566,6 +944,22 @@ class WriteExecution:
             relevant_files,
             effective_requirements,
             effective_acceptance,
+            intent,
+            0 if failure_context is None else failure_context.cycle,
+            None if failure_context is None else failure_context.failure_category,
+            None if failure_context is None else failure_context.failure_code,
+            None if failure_context is None else failure_context.failure_source_node,
+            ()
+            if failure_context is None
+            else tuple(
+                f"{item.command_id} status={item.status} exit={item.exit_code} "
+                f"stdout={item.stdout_preview!r} stderr={item.stderr_preview!r} "
+                f"stdout_truncated={item.stdout_truncated} stderr_truncated={item.stderr_truncated}"
+                for item in failure_context.validation_diagnostics
+            ),
+            () if failure_context is None else failure_context.review_findings,
+            () if failure_context is None else failure_context.current_changed_paths,
+            None if failure_context is None else failure_context.current_manifest_digest,
         )
 
     def prepare_implementation_analysis(self, state: GraphState) -> None:
@@ -594,9 +988,28 @@ class WriteExecution:
             raise WorkspaceError("changes have not been applied")
         return self.applied
 
+    def _require_manifest(self) -> WorkspaceManifest:
+        if self.manifest is None:
+            raise WorkspaceError("workspace manifest has not been captured")
+        return self.manifest
+
+    def _cycle_evidence_path(self, cycle: int, name: str, *, create: bool = True) -> Path:
+        if type(cycle) is not int or cycle < 0 or cycle > 2:
+            raise WorkspaceError("repair cycle is outside the M009 bound")
+        if cycle == 0:
+            return self.operations / name
+        directory = self.operations / "repairs" / f"{cycle:03d}"
+        if create:
+            directory.mkdir(parents=True, exist_ok=True)
+        return directory / name
+
 
 def _sha256(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
+
+
+def _file_mode(path: Path) -> int:
+    return 0o755 if stat.S_IMODE(path.stat().st_mode) & 0o111 else 0o644
 
 
 def _repository_semantics(snapshot) -> tuple[object, ...]:

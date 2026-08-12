@@ -22,11 +22,15 @@ M008 adds a neutral read-only `AgentProvider` for canonical `EXPLORE`, `BUILD_TA
 `ASSESS_RISK`. Codex is one concrete provider. Its structured analysis is advisory: WorkSource
 declarations remain authoritative, recommendations may only narrow write capability, and effective
 risk is the deterministic maximum of source and agent risk.
+M009 enables up to two explicit graph repair cycles. Validation or deterministic review failures
+route through `CLASSIFY_FAILURE`, then `PROGRAMMER_REPAIR` or `DEBUGGER`, before returning to the
+canonical `VALIDATE` and `REVIEW` nodes. Repairs remain uncommitted until one final verified local
+commit.
 
 Agent Graph Engine—not Codex—computes stale-file hashes, applies changes, runs validation, reviews
 the actual diff, stages files, and verifies the local commit. The provider receives a neutral read
 context but no Git mutation or engine write capability. The project does not update source tasks,
-push, open pull requests, merge, perform automatic repair, or expose an AgentGraph CLI.
+push, open pull requests, merge, or expose an AgentGraph CLI.
 
 ## Development
 
@@ -61,7 +65,8 @@ snapshot through deterministic `START`, `DISCOVER_PROJECT`, `PREFLIGHT`, and `SE
 It stops before `EXPLORE`, never executes validation commands, and does not create a durable run.
 
 `agentgraph.write.WriteSliceRunner` reuses pinned M005 preparation and the unchanged canonical
-graph, then executes exactly one eligible planned-scope item with zero repairs. Generated text
+graph, then executes exactly one eligible planned-scope item with a configurable bound of zero,
+one, or two graph-driven repairs. Generated text
 changes are preflighted against independently reconstructed path capabilities, atomically applied
 under `<run>/workspace`, validated there, reviewed against exact paths and hashes, and committed
 with an invocation-local identity. Operation evidence remains under `<run>/operations`.
@@ -73,6 +78,14 @@ is promoted or activated. The irreversible commit boundary writes `commit-witnes
 after a commit is observed, then verifies the commit's sole parent, exact changed paths, blob hashes,
 and regular-file executable modes directly from the Git object database. Any later uncertainty or
 mismatch remains a fail-closed recovery case.
+
+M009 stores an engine-computed `WorkspaceManifest` after initial implementation and after each
+successful repair. It describes the exact effective diff against the pinned baseline, including
+paths, content hashes, sizes, and executable semantics, so it may shrink when a repair restores a
+file. Validation and deterministic review evidence are stored per cycle. The failure classifier
+reads the current dirty external worktree under a content-hash mutation guard; repair providers
+remain proposal-only. Final review, staging, tree verification, and the single commit are all bound
+to the latest manifest.
 
 `agentgraph.providers.codex.CodexChangeProvider` probes the installed CLI before use, requires
 non-interactive execution with an explicit Codex working root and a runtime-only permission profile.

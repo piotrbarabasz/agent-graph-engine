@@ -8,7 +8,14 @@ from collections.abc import Callable
 from pathlib import Path
 
 from agentgraph.agents import AgentProvider, DeclaredWorkAgentProvider
-from agentgraph.core import CommitMode, GraphEngine, PolicySnapshot, RunStatus, canonical_v1_graph
+from agentgraph.core import (
+    CommitMode,
+    GraphEngine,
+    PolicySnapshot,
+    RepairClassification,
+    RunStatus,
+    canonical_v1_graph,
+)
 from agentgraph.infra import GitAdapter, GitCommitIdentity, ProcessRunner
 from agentgraph.infra.errors import GitError, NotAGitRepositoryError
 from agentgraph.integration import (
@@ -33,6 +40,7 @@ from agentgraph.nodes import (
     ImplementNode,
     MoreWorkNode,
     PreflightNode,
+    RepairNode,
     ReviewNode,
     SelectWorkNode,
     StartNode,
@@ -51,7 +59,12 @@ from agentgraph.work import InvalidWorkSourceError, WorkRisk, WorkScopeStatus, W
 
 from .analysis import AgentExecution
 from .capability import capability_fingerprint, reconcile_write_capability
-from .errors import WorkCapabilityMismatchError, WorkspaceError, WritePreparationError
+from .errors import (
+    RepairPolicyError,
+    WorkCapabilityMismatchError,
+    WorkspaceError,
+    WritePreparationError,
+)
 from .evidence import read_evidence, write_evidence
 from .models import (
     WriteInputs,
@@ -65,7 +78,7 @@ from .workspace import WriteExecution
 
 
 class WriteSliceRunner:
-    """Prepare pinned inputs, then execute exactly one item with zero repairs."""
+    """Prepare pinned inputs, then execute one item with bounded graph repairs."""
 
     def __init__(
         self,
@@ -83,9 +96,12 @@ class WriteSliceRunner:
         fault: Callable[[str], None] | None = None,
         validation_timeout_seconds: float = 120.0,
         max_steps: int = 30,
+        max_repair_cycles: int = 0,
     ) -> None:
         if validation_timeout_seconds <= 0 or max_steps < 1:
             raise ValueError("write runner bounds must be positive")
+        if type(max_repair_cycles) is not int or max_repair_cycles not in {0, 1, 2}:
+            raise RepairPolicyError("M009 supports max_repair_cycles values 0, 1, or 2")
         self.repository_root = Path(repository_root)
         self.work_source = work_source
         self.change_provider = change_provider
@@ -102,6 +118,7 @@ class WriteSliceRunner:
         self.fault = fault
         self.validation_timeout_seconds = validation_timeout_seconds
         self.max_steps = max_steps
+        self.max_repair_cycles = max_repair_cycles
         self._coordinator: DurableGraphCoordinator | None = None
         self._last_run_id: str | None = None
 
@@ -215,6 +232,7 @@ class WriteSliceRunner:
             package.item_validation_checks,
             package.scope_required_checks,
             capability_fingerprint(allowed),
+            self.max_repair_cycles,
         )
         run_id = self.run_id_factory()
         self._last_run_id = run_id
@@ -257,7 +275,7 @@ class WriteSliceRunner:
         except (WritePreparationError, WorkspaceError, RepositoryRootMismatchError) as exc:
             return self._early(
                 WriteSliceOutcome.RECOVERY_REQUIRED,
-                "write_resume_inputs_invalid",
+                getattr(exc, "code", None) or "write_resume_inputs_invalid",
                 str(exc),
             )
         self._coordinator = coordinator
@@ -351,9 +369,12 @@ class WriteSliceRunner:
             package.item_validation_checks,
             package.scope_required_checks,
             capability_fingerprint(allowed),
+            inputs.max_repair_cycles,
         )
         if reconstructed != inputs:
             raise WritePreparationError("live source differs from persisted write inputs")
+        if inputs.max_repair_cycles != self.max_repair_cycles:
+            raise RepairPolicyError("resume repair policy differs from persisted write inputs")
         preflight = assess_preflight(inspection, selection)
         shadow = ShadowInputs(
             inspection,
@@ -408,13 +429,17 @@ class WriteSliceRunner:
             "IMPLEMENT": ImplementNode(execution),
             "VALIDATE": ValidateNode(execution),
             "REVIEW": ReviewNode(execution),
-            "CLASSIFY_FAILURE": ClassifyFailureNode(),
+            "CLASSIFY_FAILURE": ClassifyFailureNode(execution),
+            "PROGRAMMER_REPAIR": RepairNode(
+                execution, RepairClassification.PROGRAMMER, "PROGRAMMER_REPAIR"
+            ),
+            "DEBUGGER": RepairNode(execution, RepairClassification.DEBUGGER, "DEBUGGER"),
             "CLOSE_TASK": CloseTaskNode(execution),
             "MORE_WORK": MoreWorkNode(),
             "FINALIZE": FinalizeNode(),
         }
         policy = PolicySnapshot(
-            max_repair_cycles=0,
+            max_repair_cycles=inputs.max_repair_cycles,
             max_work_items_per_run=1,
             commit_mode=CommitMode.PER_WORK_ITEM,
         )
@@ -467,8 +492,8 @@ class WriteSliceRunner:
             issues,
             None if execution.changeset is None else execution.changeset.digest,
             ()
-            if execution.applied is None
-            else tuple(item.path for item in execution.applied.files),
+            if execution.manifest is None
+            else tuple(item.path for item in execution.manifest.files),
         )
 
     def _recovery_required(
@@ -510,7 +535,11 @@ class WriteSliceRunner:
             report.commit_sha,
             report.runtime_path,
             report.workspace_path,
-            issues=(WriteSliceIssue("write_rehydration_mismatch", str(error)),),
+            issues=(
+                WriteSliceIssue(
+                    getattr(error, "code", None) or "write_rehydration_mismatch", str(error)
+                ),
+            ),
             changeset_digest=report.changeset_digest,
             changed_paths=report.changed_paths,
         )

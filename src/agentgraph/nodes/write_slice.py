@@ -15,6 +15,7 @@ from agentgraph.agents import (
 )
 from agentgraph.agents.prompts import (
     build_explore_prompt,
+    build_failure_classification_prompt,
     build_risk_prompt,
     build_task_package_prompt,
 )
@@ -33,7 +34,7 @@ from agentgraph.core import (
     StatePatch,
     ValidationVerdict,
 )
-from agentgraph.core.state import GraphState
+from agentgraph.core.state import GraphState, RepairRecord
 from agentgraph.work import WorkRisk
 from agentgraph.write.analysis import AgentExecution
 from agentgraph.write.errors import (
@@ -344,13 +345,14 @@ class ImplementNode:
         except Exception as exc:
             return _agent_failure(self.node_id, context, exc, self.execution.analysis)
         try:
-            applied = self.execution.implement()
+            applied = self.execution.implement(context.node_attempt_id)
         except ChangeProviderBlockedError as exc:
             return _blocked(self.node_id, context, exc.reason_code, exc.message)
         except WriteBaselineDriftError as exc:
             code = str(exc) or "write_baseline_drift"
             return _blocked(self.node_id, context, code, "pinned write inputs drifted")
         except WriteSliceError as exc:
+            self.execution.issue_code = _error_code(exc)
             return _failed(
                 self.node_id,
                 context,
@@ -366,7 +368,9 @@ class ImplementNode:
                 "change proposal or application failed",
                 FailureCategory.IMPLEMENTATION,
             )
-        paths = tuple(item.path for item in applied.files)
+        manifest = self.execution.manifest
+        assert manifest is not None
+        paths = tuple(item.path for item in manifest.files)
         digest = applied.changeset_digest
         return NodeResult(
             self.node_id,
@@ -381,6 +385,7 @@ class ImplementNode:
                         (
                             f"changeset:{digest}",
                             "operation_receipt:operations/implement-applied.json",
+                            f"workspace_manifest:0:{manifest.digest}",
                         ),
                     ),
                     PatchOperation.set("changes.count", len(paths)),
@@ -398,7 +403,8 @@ class ValidateNode:
 
     def run(self, state: GraphState, context: NodeContext) -> NodeResult:
         try:
-            passed = self.execution.validate()
+            cycle = state.repair.count
+            passed = self.execution.validate(cycle)
         except WriteSliceError as exc:
             return _failed(
                 self.node_id,
@@ -428,13 +434,20 @@ class ValidateNode:
                     PatchOperation.set("failure.code", "validation_failed"),
                 )
             )
+        else:
+            operations.extend(
+                (
+                    PatchOperation.clear("failure.category"),
+                    PatchOperation.clear("failure.code"),
+                )
+            )
         result = _success(self.node_id, context, state, *operations)
         return NodeResult(
             result.node_id,
             result.attempt_id,
             result.status,
             state_patch=result.state_patch,
-            evidence=(Evidence("validation", "operations/validation.json"),),
+            evidence=(Evidence("validation", _cycle_reference(cycle, "validation.json")),),
         )
 
 
@@ -445,7 +458,8 @@ class ReviewNode:
 
     def run(self, state: GraphState, context: NodeContext) -> NodeResult:
         try:
-            passed, findings = self.execution.review()
+            cycle = state.repair.count
+            passed, findings = self.execution.review(cycle)
         except WriteSliceError as exc:
             return _failed(
                 self.node_id,
@@ -476,31 +490,139 @@ class ReviewNode:
                     PatchOperation.set("failure.code", "deterministic_review_failed"),
                 )
             )
+        else:
+            operations.extend(
+                (
+                    PatchOperation.clear("failure.category"),
+                    PatchOperation.clear("failure.code"),
+                )
+            )
         result = _success(self.node_id, context, state, *operations)
         return NodeResult(
             result.node_id,
             result.attempt_id,
             result.status,
             state_patch=result.state_patch,
-            evidence=(Evidence("review", "operations/review.json"),),
+            evidence=(Evidence("review", _cycle_reference(cycle, "review.json")),),
         )
 
 
 @dataclass(frozen=True, slots=True)
 class ClassifyFailureNode:
+    execution: WriteExecution
     node_id: str = "CLASSIFY_FAILURE"
 
     def run(self, state: GraphState, context: NodeContext) -> NodeResult:
-        classification = (
-            RepairClassification.DEBUGGER
-            if state.failure.category is FailureCategory.VALIDATION
-            else RepairClassification.PROGRAMMER
+        if state.repair.count >= state.repair.max_cycles:
+            return _success(self.node_id, context, state)
+        try:
+            failure_context = self.execution.prepare_failure_context(state)
+            category = failure_context.failure_category
+            if category in {FailureCategory.IMPLEMENTATION, FailureCategory.DESIGN}:
+                classification = RepairClassification.PROGRAMMER
+                evidence: tuple[Evidence, ...] = ()
+            elif category is FailureCategory.VALIDATION:
+                result = self.execution.analysis.classify_failure(
+                    context.node_attempt_id,
+                    build_failure_classification_prompt(failure_context),
+                    repository_root=self.execution.workspace,
+                    expected_workspace_digest=failure_context.current_manifest_digest,
+                    workspace_digest=self.execution.verify_current_manifest,
+                )
+                value = result.value
+                if value.status is AgentAnalysisStatus.BLOCKED:
+                    assert value.reason_code is not None and value.message is not None
+                    self.execution.analysis.issue_code = value.reason_code
+                    return _blocked(
+                        self.node_id,
+                        context,
+                        value.reason_code,
+                        value.message,
+                        (Evidence("failure_classification", result.evidence_reference),),
+                    )
+                assert value.classification is not None
+                classification = value.classification
+                evidence = (Evidence("failure_classification", result.evidence_reference),)
+            else:
+                return _failed(
+                    self.node_id,
+                    context,
+                    "failure_not_repairable_in_m009",
+                    "failure category is outside the M009 repair policy",
+                    FailureCategory.INFRASTRUCTURE,
+                )
+            record = RepairRecord(f"repair-{state.repair.count + 1:03d}", classification)
+            if any(item.id == record.id for item in state.repair.history):
+                raise ValueError("repair history collision")
+            success = _success(
+                self.node_id,
+                context,
+                state,
+                PatchOperation.set("repair.classification", classification),
+                PatchOperation.append_unique("repair.history", record),
+            )
+            return NodeResult(
+                success.node_id,
+                success.attempt_id,
+                success.status,
+                state_patch=success.state_patch,
+                evidence=evidence,
+            )
+        except Exception as exc:
+            return _agent_failure(self.node_id, context, exc, self.execution.analysis)
+
+
+@dataclass(frozen=True, slots=True)
+class RepairNode:
+    execution: WriteExecution
+    classification: RepairClassification
+    node_id: str
+
+    def run(self, state: GraphState, context: NodeContext) -> NodeResult:
+        try:
+            applied, manifest = self.execution.repair(
+                state, self.node_id, context.node_attempt_id, self.classification
+            )
+        except ChangeProviderBlockedError as exc:
+            return _blocked(self.node_id, context, exc.reason_code, exc.message)
+        except WriteSliceError as exc:
+            self.execution.issue_code = _error_code(exc)
+            return _failed(
+                self.node_id,
+                context,
+                _error_code(exc),
+                str(exc),
+                FailureCategory.IMPLEMENTATION,
+            )
+        except Exception:
+            return _failed(
+                self.node_id,
+                context,
+                "repair_provider_failed",
+                "repair proposal or application failed",
+                FailureCategory.IMPLEMENTATION,
+            )
+        cycle = state.repair.count
+        identifiers = (
+            *state.changes.identifiers,
+            f"repair_changeset:{cycle}:{applied.changeset_digest}",
+            f"workspace_manifest:{cycle}:{manifest.digest}",
         )
-        return _success(
+        paths = tuple(item.path for item in manifest.files)
+        return NodeResult(
             self.node_id,
-            context,
-            state,
-            PatchOperation.set("repair.classification", classification),
+            context.node_attempt_id,
+            NodeStatus.SUCCEEDED,
+            state_patch=StatePatch(
+                state.state_version,
+                (
+                    PatchOperation.set("changes.agent_reported_files", paths),
+                    PatchOperation.set("changes.identifiers", identifiers),
+                    PatchOperation.set("changes.count", len(paths)),
+                ),
+            ),
+            evidence=(Evidence("repair_applied", _cycle_reference(cycle, "applied.json")),),
+            external_effects=(ExternalEffect("workspace_changes", manifest.digest),),
         )
 
 
@@ -580,3 +702,7 @@ def _error_code(exc: Exception) -> str:
     if value and " " not in value and value.replace("_", "").isalnum():
         return value
     return type(exc).__name__.replace("Error", "").lower() or "write_slice_error"
+
+
+def _cycle_reference(cycle: int, name: str) -> str:
+    return f"operations/{name}" if cycle == 0 else f"operations/repairs/{cycle:03d}/{name}"

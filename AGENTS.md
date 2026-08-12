@@ -68,3 +68,17 @@
   validated projections plus evidence references and digests.
 - Ordinary resume never re-invokes completed read-only nodes. Interrupted read-only recovery follows
   M002 rules and creates new attempt-scoped evidence instead of overwriting earlier attempts.
+- Repair execution is graph-driven; no hidden retry loop exists outside canonical transitions.
+- `repair.count` remains engine-owned and is incremented only on transition into a repair node.
+- At most two repair cycles are supported in M009.
+- `CLASSIFY_FAILURE` is read-only; `PROGRAMMER_REPAIR` and `DEBUGGER` are proposal-only
+  `LLM_WRITE` nodes.
+- All repairs operate in the same uncommitted external worktree and never create intermediate
+  commits.
+- A `WorkspaceManifest` represents the exact current effective diff against the pinned baseline.
+- Validation and review evidence are cycle-aware and never reuse a previous repair-cycle result.
+- Repair cannot adopt mutations introduced by validation, review, or a provider outside
+  engine-owned apply.
+- Final staging and commit use the final `WorkspaceManifest`, not the latest repair proposal or a
+  union of touched files.
+- Interrupted repair nodes remain fail-closed under M002.

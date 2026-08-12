@@ -151,7 +151,11 @@ def _evidence_context(
 ) -> dict[str, object]:
     values = {
         "project_id": request.project_id,
-        "run_id": context.runtime_directory.parent.name,
+        "run_id": context.run_id or context.runtime_directory.parent.name,
+        "node_id": context.node_id,
+        "node_attempt_id": context.node_attempt_id,
+        "provider_invocation_id": context.provider_invocation_id,
+        "repair_cycle": context.repair_cycle,
         "item_id": request.item_id,
         "scope_id": request.scope_id,
         "pinned_head": context.baseline_head,
