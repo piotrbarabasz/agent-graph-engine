@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from agentgraph.adapters.speckit import SpecKitLayout
-from agentgraph.adapters.speckit.paths import parse_repo_path_spec
+from agentgraph.adapters.speckit.paths import parse_repo_path_list, parse_repo_path_spec
 from agentgraph.work import WorkSourcePathError
 
 
@@ -62,3 +62,46 @@ def test_layout_rejects_traversal_before_adapter_reads(tmp_path) -> None:
     root.mkdir()
     with pytest.raises(WorkSourcePathError):
         SpecKitLayout(root, workstreams_dir="../outside")
+
+
+@pytest.mark.parametrize("declared", ["none", "`none`", "None", "N/A", "[]"])
+def test_none_like_path_declarations_are_empty(tmp_path, declared: str) -> None:
+    assert parse_repo_path_list(tmp_path.resolve(), declared) == ()
+
+
+def test_explanatory_none_path_declaration_is_empty(tmp_path) -> None:
+    declared = "`none` (documentation or configuration validation is covered by repository checks)"
+
+    assert parse_repo_path_list(tmp_path.resolve(), declared) == ()
+
+
+def test_conditional_none_extracts_only_explicit_markdown_code_paths(tmp_path) -> None:
+    declared = (
+        "`none` unless a minimal test seam correction is required in "
+        "`backend/app/providers/chatterbox_v3.py`"
+    )
+
+    paths = parse_repo_path_list(tmp_path.resolve(), declared)
+
+    assert tuple(path.path for path in paths) == ("backend/app/providers/chatterbox_v3.py",)
+
+
+@pytest.mark.parametrize(
+    "declared",
+    [
+        "none unless maybe backend/foo.py",
+        "none something random",
+        "none or perhaps files elsewhere",
+        "`none` (see `backend/foo.py`)",
+    ],
+)
+def test_ambiguous_annotated_none_path_declarations_fail_closed(tmp_path, declared: str) -> None:
+    with pytest.raises(WorkSourcePathError):
+        parse_repo_path_list(tmp_path.resolve(), declared)
+
+
+def test_normal_markdown_path_list_behavior_is_preserved(tmp_path) -> None:
+    paths = parse_repo_path_list(tmp_path.resolve(), "`a.py`, `b.py`, `dir/`")
+
+    assert tuple(path.path for path in paths) == ("a.py", "b.py", "dir")
+    assert paths[-1].directory_hint is True

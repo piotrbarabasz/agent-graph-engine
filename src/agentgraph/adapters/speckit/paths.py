@@ -2,10 +2,19 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
 from agentgraph.work import RepoPathSpec, WorkSourceConfigurationError, WorkSourcePathError
+
+_NONE_TOKEN = r"(?:none|n/a|na|\[\])"
+_NONE_VALUE = rf"(?:`{_NONE_TOKEN}`|{_NONE_TOKEN})"
+_EXACT_NONE = re.compile(rf"^{_NONE_VALUE}$", re.IGNORECASE)
+_EXPLANATORY_NONE = re.compile(rf"^{_NONE_VALUE}\s+\((?P<annotation>[^()]*)\)$", re.IGNORECASE)
+_CONDITIONAL_NONE = re.compile(rf"^{_NONE_VALUE}\s+unless\b(?P<body>.+)$", re.IGNORECASE)
+_NONE_PREFIX = re.compile(rf"^(?:`?{_NONE_TOKEN}`?)(?:\s|$)", re.IGNORECASE)
+_CODE_PATH = re.compile(r"`([^`\r\n]+)`")
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,9 +71,31 @@ def parse_repo_path_spec(root: Path, declared: str) -> RepoPathSpec:
 
 
 def parse_repo_path_list(root: Path, raw: str) -> tuple[RepoPathSpec, ...]:
-    if raw.strip().casefold() in {"none", "n/a", "na", "[]"}:
+    declaration = raw.strip()
+    if _EXACT_NONE.fullmatch(declaration):
         return ()
-    values = tuple(part.strip() for part in raw.split(","))
+    explanatory = _EXPLANATORY_NONE.fullmatch(declaration)
+    if explanatory is not None:
+        annotation = explanatory.group("annotation").strip()
+        if not annotation or any(character in annotation for character in ("`", "/", "\\")):
+            raise WorkSourcePathError("annotated none path declaration is ambiguous")
+        return ()
+    conditional = _CONDITIONAL_NONE.fullmatch(declaration)
+    if conditional is not None:
+        body = conditional.group("body").strip()
+        matches = tuple(_CODE_PATH.finditer(body))
+        remainder = _CODE_PATH.sub("", body)
+        if not matches or any(character in remainder for character in ("`", "/", "\\")):
+            raise WorkSourcePathError(
+                "conditional none path declaration requires explicit Markdown-code paths"
+            )
+        values = tuple(match.group(1).strip() for match in matches)
+        if any(not value or _EXACT_NONE.fullmatch(value) or "," in value for value in values):
+            raise WorkSourcePathError("conditional path declaration contains an invalid path span")
+        return tuple(parse_repo_path_spec(root, value) for value in values)
+    if _NONE_PREFIX.match(declaration):
+        raise WorkSourcePathError("annotated none path declaration is ambiguous")
+    values = tuple(part.strip() for part in declaration.split(","))
     if any(not value for value in values):
         raise WorkSourcePathError("declared repository path list contains an empty value")
     return tuple(parse_repo_path_spec(root, value) for value in values)

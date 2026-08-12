@@ -7,23 +7,11 @@ import shlex
 from .errors import WorkSourceFormatError
 from .models import SourceLocation, ValidationCheck, ValidationOrigin
 
-_FORBIDDEN_GIT_OPERATIONS = {
-    "push",
-    "fetch",
-    "pull",
-    "merge",
-    "rebase",
-    "reset",
-    "clean",
-    "stash",
-    "commit",
-    "add",
-    "checkout",
-    "switch",
-    "cherry-pick",
-    "tag",
-}
-_FORBIDDEN_TEXT = ("&&", "||", "|", ">", "<", "`", "\n", "\r")
+_FORBIDDEN_TEXT = ("&&", "||", "|", ">", "<", "\n", "\r")
+_SAFE_GIT_GLOBAL_OPTIONS = {"--no-pager"}
+_SAFE_GIT_SUBCOMMANDS = {"diff", "ls-files", "rev-parse", "status"}
+_FORBIDDEN_GIT_DIFF_OPTIONS = {"--ext-diff", "--textconv"}
+_SAFE_GIT_DIFF_OPTIONS = {"--check", "--no-ext-diff", "--no-textconv"}
 
 
 def parse_validation_checks(
@@ -38,21 +26,56 @@ def parse_validation_checks(
         raise WorkSourceFormatError("validation command declaration is empty")
     if any(token in raw for token in _FORBIDDEN_TEXT):
         raise WorkSourceFormatError("validation command contains a forbidden shell operator")
-    segments = _split_segments(raw)
+    declaration = _strip_markdown_code_span(raw.strip())
+    segments = _split_segments(declaration)
     checks = []
     for segment in segments:
+        segment = _strip_markdown_code_span(segment)
+        if "`" in segment:
+            raise WorkSourceFormatError("validation command contains a forbidden backtick")
         try:
             argv = tuple(shlex.split(segment, posix=True))
         except ValueError as exc:
             raise WorkSourceFormatError("validation command contains invalid quoting") from exc
         if not argv:
             raise WorkSourceFormatError("validation command segment is empty")
-        if argv[0].casefold() == "git" and any(
-            argument.casefold() in _FORBIDDEN_GIT_OPERATIONS for argument in argv[1:]
-        ):
-            raise WorkSourceFormatError("destructive or network Git validation is forbidden")
+        if argv[0].casefold() in {"git", "git.exe"}:
+            _validate_git_command(argv)
         checks.append(ValidationCheck(argv, segment, origin, source_location))
     return tuple(checks)
+
+
+def _strip_markdown_code_span(value: str) -> str:
+    """Remove exactly one outer Markdown code span, never embedded backticks."""
+
+    stripped = value.strip()
+    if stripped.count("`") == 2 and stripped.startswith("`") and stripped.endswith("`"):
+        stripped = stripped[1:-1].strip()
+    if not stripped:
+        raise WorkSourceFormatError("validation command segment is empty")
+    return stripped
+
+
+def _validate_git_command(argv: tuple[str, ...]) -> None:
+    """Allow only a small read-only Git command grammar without config or alias hooks."""
+
+    position = 1
+    while position < len(argv) and argv[position].casefold() in _SAFE_GIT_GLOBAL_OPTIONS:
+        position += 1
+    if position >= len(argv):
+        raise WorkSourceFormatError("Git validation command requires a safe subcommand")
+    subcommand = argv[position].casefold()
+    if subcommand not in _SAFE_GIT_SUBCOMMANDS:
+        raise WorkSourceFormatError("Git validation subcommand is not allowlisted")
+    if subcommand == "diff":
+        for argument in argv[position + 1 :]:
+            option = argument.casefold()
+            if option in _FORBIDDEN_GIT_DIFF_OPTIONS or any(
+                option.startswith(f"{forbidden}=") for forbidden in _FORBIDDEN_GIT_DIFF_OPTIONS
+            ):
+                raise WorkSourceFormatError("Git diff execution hooks are forbidden")
+            if option not in _SAFE_GIT_DIFF_OPTIONS:
+                raise WorkSourceFormatError("Git diff validation option is not allowlisted")
 
 
 def _split_segments(raw: str) -> tuple[str, ...]:
