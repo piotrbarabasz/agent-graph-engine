@@ -41,7 +41,7 @@ class CountingProvider:
     def __init__(self):
         self.count = 0
 
-    def propose(self, request):
+    def propose(self, request, context):
         from agentgraph.write import ChangeSet, FileChange
 
         self.count += 1

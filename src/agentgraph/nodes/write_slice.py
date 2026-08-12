@@ -23,6 +23,7 @@ from agentgraph.core.state import GraphState
 from agentgraph.work import WorkRisk
 from agentgraph.write.errors import (
     ChangePathError,
+    ChangeProviderBlockedError,
     PostCommitRecoveryRequired,
     StaleFileError,
     WriteBaselineDriftError,
@@ -141,6 +142,8 @@ class ImplementNode:
     def run(self, state: GraphState, context: NodeContext) -> NodeResult:
         try:
             applied = self.execution.implement()
+        except ChangeProviderBlockedError as exc:
+            return _blocked(self.node_id, context, exc.reason_code, exc.message)
         except WriteBaselineDriftError as exc:
             code = str(exc) or "write_baseline_drift"
             return _blocked(self.node_id, context, code, "pinned write inputs drifted")
@@ -363,6 +366,9 @@ class MoreWorkNode:
 
 
 def _error_code(exc: Exception) -> str:
+    code = getattr(exc, "code", None)
+    if isinstance(code, str) and code:
+        return code
     if isinstance(exc, ChangePathError):
         return "out_of_scope_change" if str(exc) == "out_of_scope_change" else "unsafe_change_path"
     if isinstance(exc, StaleFileError):

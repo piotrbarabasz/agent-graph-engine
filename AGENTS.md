@@ -47,3 +47,11 @@
   before promotion, so every promoted M006 run already contains its immutable write inputs.
 - Cross-process M006 resume reconstructs only from content-digested write inputs, GraphState, and
   mutually consistent operation evidence; it never replays an interrupted side-effect node.
+- Codex is proposal-only and executes with a read-only view of the external runtime worktree. It
+  never owns filesystem mutation, Git mutation, validation, staging, or commit authority.
+- Provider output is strict structured data; free-form output never becomes a `ChangeSet`.
+  Existing-file before hashes are computed from the pinned external workspace, never by the model.
+- One Codex invocation occurs per `IMPLEMENT` attempt, with no hidden retries or session resume.
+  Provider repository mutation is detected before engine changes are applied.
+- Interrupted Codex `IMPLEMENT` remains fail-closed under M002 recovery. Ambient external tool
+  integrations must not bypass the provider isolation boundary.

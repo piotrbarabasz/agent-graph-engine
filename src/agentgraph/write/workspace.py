@@ -26,13 +26,14 @@ from .apply import apply_changeset
 from .errors import (
     CommitVerificationError,
     PostCommitRecoveryRequired,
+    ProviderMutationError,
     ValidationExecutionError,
     WorkspaceError,
     WriteBaselineDriftError,
 )
 from .evidence import read_evidence, write_evidence
 from .models import AppliedChangeSet, ChangeRequest, ChangeSet, CommitWitness, WriteInputs
-from .provider import ChangeProvider
+from .provider import ChangeProvider, ChangeProviderContext
 
 if TYPE_CHECKING:
     from agentgraph.integration import ShadowInputs
@@ -65,6 +66,7 @@ class WriteExecution:
     review_passed: bool = field(default=False, init=False)
     review_findings: tuple[str, ...] = field(default=(), init=False)
     commit_sha: str | None = field(default=None, init=False)
+    issue_code: str | None = field(default=None, init=False)
 
     def __post_init__(self) -> None:
         self.workspace = self.run_path / "workspace"
@@ -101,10 +103,35 @@ class WriteExecution:
             workspace_snapshot.head_sha != self.inputs.baseline_head
             or workspace_snapshot.branch != self.inputs.scope_branch
             or workspace_snapshot.dirty
+            or workspace_snapshot.conflicted_paths
         ):
             raise WorkspaceError("new worktree does not match pinned baseline")
         request = self.change_request()
-        proposed = self.provider.propose(request)
+        provider_directory = self.run_path / "provider"
+        provider_directory.mkdir()
+        context = ChangeProviderContext(
+            repository_root=self.workspace,
+            runtime_directory=provider_directory,
+            baseline_head=self.inputs.baseline_head,
+        )
+        provider_error: BaseException | None = None
+        proposed = None
+        try:
+            proposed = self.provider.propose(request, context)
+        except BaseException as exc:
+            provider_error = exc
+        provider_snapshot = self.git.snapshot(result.repository)
+        self.live_recheck("write_baseline_drift_after_provider")
+        if _repository_semantics(provider_snapshot) != _repository_semantics(workspace_snapshot):
+            self.issue_code = "provider_mutated_repository"
+            raise ProviderMutationError("provider_mutated_repository") from provider_error
+        if provider_error is not None:
+            self.issue_code = getattr(
+                provider_error,
+                "reason_code",
+                getattr(provider_error, "code", "change_provider_failed"),
+            )
+            raise provider_error
         if not isinstance(proposed, ChangeSet):
             raise WorkspaceError("ChangeProvider returned a non-ChangeSet value")
         self.changeset = proposed
@@ -541,6 +568,19 @@ class WriteExecution:
 
 def _sha256(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
+
+
+def _repository_semantics(snapshot) -> tuple[object, ...]:
+    return (
+        snapshot.head_sha,
+        snapshot.branch,
+        snapshot.detached_head,
+        snapshot.staged_paths,
+        snapshot.unstaged_paths,
+        snapshot.untracked_paths,
+        snapshot.conflicted_paths,
+        snapshot.dirty,
+    )
 
 
 def _snapshot_evidence(snapshot) -> dict[str, object]:
