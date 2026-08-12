@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import hashlib
+import os
 import shutil
 from dataclasses import replace
 from pathlib import Path
+
+import pytest
 
 from agentgraph.adapters.speckit import SpecKitAdapter, SpecKitLayout
 from agentgraph.core import RunStatus
@@ -31,9 +35,27 @@ class OutOfScopeProvider:
         return ChangeSet.create((FileChange("README.md", None, "escalation\n"),))
 
 
-def _runner(target: Path, runtime: Path, provider=None) -> WriteSliceRunner:
+class ExistingScriptProvider:
+    def __init__(self, before: str):
+        self.before = before
+
+    def propose(self, request):
+        return ChangeSet.create(
+            (FileChange("scripts/run.sh", self.before, "#!/bin/sh\necho changed\n"),)
+        )
+
+
+def _runner(
+    target: Path,
+    runtime: Path,
+    provider=None,
+    *,
+    git_adapter=None,
+    process_runner=None,
+    fault=None,
+) -> WriteSliceRunner:
     executable = shutil.which("git") or "git"
-    adapter = GitAdapter(executable=executable)
+    adapter = git_adapter or GitAdapter(executable=executable)
     paths = RuntimePaths.resolve(runtime)
     registry = ProjectRegistry(paths, project_id_factory=lambda: "prj_m006_fixture")
     return WriteSliceRunner(
@@ -42,8 +64,10 @@ def _runner(target: Path, runtime: Path, provider=None) -> WriteSliceRunner:
         provider or NewFileProvider(),
         git_adapter=adapter,
         project_registry=registry,
+        process_runner=process_runner,
         commit_identity=GitCommitIdentity("M006 Test", "m006@example.test"),
         run_id_factory=lambda: "run_m006_fixture",
+        fault=fault,
     )
 
 
@@ -127,6 +151,16 @@ def test_existing_scope_branch_blocks_before_durable_run(tmp_path) -> None:
     assert report.outcome is WriteSliceOutcome.BLOCKED
     assert report.run_id is None
     assert report.issues[0].code == "scope_branch_already_exists"
+
+
+def test_repository_root_mismatch_returns_typed_early_report(tmp_path) -> None:
+    target = _target(tmp_path)
+
+    report = _runner(target / "specs", tmp_path / "runtime").run()
+
+    assert report.outcome is WriteSliceOutcome.BLOCKED
+    assert report.run_id is None
+    assert report.issues[0].code == "repository_root_mismatch"
 
 
 def test_active_scope_and_critical_item_are_blocked_without_worktree(tmp_path) -> None:
@@ -237,3 +271,50 @@ def test_package_allowlist_and_branch_escalation_fail_before_durable_run(tmp_pat
         assert report.run_id is None
         assert report.issues[0].code == "work_package_capability_mismatch"
         assert not git(target, "branch", "--list", "work/e001").strip()
+
+
+def _executable_target(tmp_path: Path, validation: str) -> tuple[Path, str]:
+    target = _target(tmp_path, validation)
+    script = target / "scripts" / "run.sh"
+    script.parent.mkdir()
+    script.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    script.chmod(0o755)
+    tasks = target / "specs" / "one" / "tasks.md"
+    tasks.write_text(
+        tasks.read_text(encoding="utf-8").replace(
+            "Implementation files: `src/t001.py`",
+            "Implementation files: `scripts/run.sh`",
+        ),
+        encoding="utf-8",
+    )
+    git(target, "add", "--all")
+    git(target, "commit", "--quiet", "-m", "executable fixture")
+    return target, hashlib.sha256(script.read_bytes()).hexdigest()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX executable-bit semantics are unavailable")
+def test_content_only_commit_preserves_executable_mode(tmp_path) -> None:
+    target, before = _executable_target(tmp_path, "python -c \"print('ok')\"")
+    report = _runner(target, tmp_path / "runtime", ExistingScriptProvider(before)).run(
+        WriteSliceRequest(scope_id="E001")
+    )
+
+    assert report.outcome is WriteSliceOutcome.LOCAL_COMMIT_CREATED
+    assert report.commit_sha is not None
+    tree = git(target, "ls-tree", report.commit_sha, "scripts/run.sh").split()
+    assert tree[0] == b"100755"
+    summary = git(target, "diff-tree", "--summary", f"{report.base_head}..{report.commit_sha}")
+    assert b"mode change" not in summary
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX executable-bit semantics are unavailable")
+def test_validation_mode_change_fails_deterministic_review(tmp_path) -> None:
+    command = "python -c \"import os; os.chmod('scripts/run.sh', 0o644)\""
+    target, before = _executable_target(tmp_path, command)
+    report = _runner(target, tmp_path / "runtime", ExistingScriptProvider(before)).run(
+        WriteSliceRequest(scope_id="E001")
+    )
+
+    assert report.outcome is WriteSliceOutcome.FAILED
+    assert report.graph_state is not None
+    assert "final_mode_mismatch:scripts/run.sh" in report.graph_state.review.findings

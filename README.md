@@ -57,3 +57,8 @@ graph, then executes exactly one eligible planned-scope item with zero repairs. 
 changes are preflighted against independently reconstructed path capabilities, atomically applied
 under `<run>/workspace`, validated there, reviewed against exact paths and hashes, and committed
 with an invocation-local identity. Operation evidence remains under `<run>/operations`.
+Existing file modes are preserved by atomic content replacement, and deterministic review rejects
+unexpected mode changes. Durable runs persist content-digested `write-inputs.json`; a fresh
+`WriteSliceRunner.resume(run_id)` can reconstruct committed safe transitions from immutable
+operation evidence. The irreversible commit boundary writes `commit-witness.json` immediately
+after a commit is observed, and any later uncertainty remains a fail-closed recovery case.

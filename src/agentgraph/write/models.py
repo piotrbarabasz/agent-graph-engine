@@ -78,12 +78,27 @@ class AppliedFile:
     before_sha256: str | None
     after_sha256: str
     size_bytes: int
+    before_mode: int | None
+    after_mode: int
 
 
 @dataclass(frozen=True, slots=True)
 class AppliedChangeSet:
     files: tuple[AppliedFile, ...]
     changeset_digest: str
+
+
+@dataclass(frozen=True, slots=True)
+class CommitWitness:
+    project_id: str
+    run_id: str
+    item_id: str
+    scope_id: str
+    base_head: str
+    previous_branch_head: str
+    commit_sha: str | None
+    changeset_digest: str
+    reviewed_paths: tuple[str, ...]
 
 
 @dataclass(frozen=True, slots=True)

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import os
+import stat
 
 import pytest
 
@@ -67,6 +69,42 @@ def test_existing_file_requires_matching_before_hash(tmp_path) -> None:
         )
 
     assert target.read_text(encoding="utf-8") == "old\n"
+
+
+def test_new_text_file_is_not_created_executable(tmp_path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    applied = apply_changeset(
+        workspace,
+        ChangeSet.create((FileChange("new.py", None, "value = 1\n"),)),
+        (RepoPathSpec("new.py"),),
+    )
+
+    mode = stat.S_IMODE((workspace / "new.py").stat().st_mode)
+    assert mode & 0o111 == 0
+    assert applied.files[0].before_mode is None
+    assert applied.files[0].after_mode == mode
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX executable-bit semantics are unavailable")
+def test_atomic_replacement_preserves_existing_executable_mode(tmp_path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    target = workspace / "run.sh"
+    target.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    target.chmod(0o755)
+    before = hashlib.sha256(target.read_bytes()).hexdigest()
+
+    applied = apply_changeset(
+        workspace,
+        ChangeSet.create((FileChange("run.sh", before, "#!/bin/sh\necho ok\n"),)),
+        (RepoPathSpec("run.sh"),),
+    )
+
+    assert stat.S_IMODE(target.stat().st_mode) == 0o755
+    assert applied.files[0].before_mode == 0o755
+    assert applied.files[0].after_mode == 0o755
 
 
 def test_symlink_escape_is_rejected_when_supported(tmp_path) -> None:

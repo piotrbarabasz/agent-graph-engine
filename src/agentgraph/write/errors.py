@@ -43,3 +43,7 @@ class ValidationExecutionError(WriteSliceError):
 
 class CommitVerificationError(WriteSliceError):
     pass
+
+
+class PostCommitRecoveryRequired(WriteSliceError):
+    """A commit exists or may exist, so normal node failure is unsafe."""

@@ -39,3 +39,7 @@
   M006 processes one item with zero automatic repairs and does not close source state.
 - M006 never pushes or opens a PR. Interrupted write/external nodes fail closed, and external
   workspace plus immutable operation evidence are preserved for diagnosis.
+- M006 atomic content writes preserve an existing file's mode and never introduce executable bits
+  for new text files. A local commit is immediately bound to immutable witness evidence.
+- Cross-process M006 resume reconstructs only from content-digested write inputs, GraphState, and
+  mutually consistent operation evidence; it never replays an interrupted side-effect node.

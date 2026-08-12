@@ -12,6 +12,7 @@ from agentgraph.infra import GitAdapter, GitCommitIdentity, ProcessRunner
 from agentgraph.infra.errors import GitError, NotAGitRepositoryError
 from agentgraph.integration import (
     BranchDisposition,
+    RepositoryRootMismatchError,
     ShadowInputs,
     ShadowRequest,
     ShadowSelectionError,
@@ -39,14 +40,17 @@ from agentgraph.nodes import (
 from agentgraph.runtime import (
     DurableGraphCoordinator,
     ProjectRegistry,
+    RecoveryAction,
     RecoveryAssessment,
     RuntimePaths,
 )
+from agentgraph.runtime.codec import decode_value
 from agentgraph.runtime.ids import generate_run_id
 from agentgraph.work import InvalidWorkSourceError, WorkRisk, WorkScopeStatus, WorkSource
 
 from .capability import capability_fingerprint, reconcile_write_capability
-from .errors import WorkCapabilityMismatchError, WritePreparationError
+from .errors import WorkCapabilityMismatchError, WorkspaceError, WritePreparationError
+from .evidence import read_evidence, write_evidence
 from .models import (
     WriteInputs,
     WriteSliceIssue,
@@ -111,6 +115,8 @@ class WriteSliceRunner:
                 inspection.work_snapshot,
                 ShadowRequest(request.scope_id, request.parent_scope_id),
             )
+        except RepositoryRootMismatchError as exc:
+            return self._early(WriteSliceOutcome.BLOCKED, "repository_root_mismatch", str(exc))
         except WorkSourceRepositoryMismatchError as exc:
             return self._early(
                 WriteSliceOutcome.INVALID_SOURCE, "work_source_repository_mismatch", str(exc)
@@ -208,6 +214,160 @@ class WriteSliceRunner:
         run_id = self.run_id_factory()
         self._last_run_id = run_id
         run_path = self.paths.run(inspection.project_id, run_id)
+        execution, coordinator = self._build_runtime(
+            inspection, shadow, inputs, run_id, rehydrating=False
+        )
+        self._coordinator = coordinator
+        coordinator.start_run(run_id)
+        write_evidence(
+            run_path / "write-inputs.json",
+            context={
+                "project_id": inputs.project_id,
+                "run_id": run_id,
+                "item_id": inputs.package.item_id,
+                "scope_id": inputs.package.scope_id,
+                "pinned_head": inputs.baseline_head,
+                "source_revision": inputs.source_revision,
+            },
+            payload=inputs,
+        )
+        executed: list[str] = []
+        with coordinator.open_session(run_id) as session:
+            state = session.store.load()
+            for _ in range(self.max_steps):
+                if state.graph.current_node == "END":
+                    break
+                executed.append(state.graph.current_node)
+                state = session.step()
+            else:
+                raise WritePreparationError("write graph exceeded its bounded step count")
+        return self._report(state, execution, tuple(executed))
+
+    def resume(self, run_id: str) -> WriteSliceReport:
+        """Reconstruct a durable run from immutable inputs and continue only when safe."""
+
+        try:
+            execution, coordinator = self._existing_runtime(run_id)
+        except (WritePreparationError, WorkspaceError, RepositoryRootMismatchError) as exc:
+            return self._early(
+                WriteSliceOutcome.RECOVERY_REQUIRED,
+                "write_resume_inputs_invalid",
+                str(exc),
+            )
+        self._coordinator = coordinator
+        self._last_run_id = run_id
+        executed: list[str] = []
+        with coordinator.open_session(run_id, recovery=True) as session:
+            assessment = session.assess_recovery()
+            if assessment.action is RecoveryAction.BLOCKED:
+                state = session.store.load()
+                try:
+                    execution.rehydrate(state)
+                except WorkspaceError as exc:
+                    return self._rehydration_required(state, execution, exc)
+                return self._recovery_required(state, execution, assessment)
+            if assessment.action in {
+                RecoveryAction.REAPPLY_RECORDED_RESULT,
+                RecoveryAction.COMPLETE_TRANSITION_MARKER,
+            }:
+                assessment = session.recover()
+                if assessment.action is RecoveryAction.BLOCKED:
+                    state = session.store.load()
+                    try:
+                        execution.rehydrate(state)
+                    except WorkspaceError as exc:
+                        return self._rehydration_required(state, execution, exc)
+                    return self._recovery_required(state, execution, assessment)
+            state = session.store.load()
+            try:
+                execution.rehydrate(state)
+            except WorkspaceError as exc:
+                return self._rehydration_required(state, execution, exc)
+            if assessment.action is RecoveryAction.COMPLETED:
+                return self._report(state, execution, ())
+            if assessment.action not in {
+                RecoveryAction.CLEAN_RESUME,
+                RecoveryAction.RERUN_INTERRUPTED_NODE,
+            }:
+                return self._recovery_required(state, execution, assessment)
+            for _ in range(self.max_steps):
+                if state.graph.current_node == "END":
+                    break
+                executed.append(state.graph.current_node)
+                state = session.step()
+            else:
+                raise WritePreparationError("resumed write graph exceeded its step bound")
+        return self._report(state, execution, tuple(executed))
+
+    def assess_recovery(self, run_id: str | None = None) -> RecoveryAssessment:
+        selected = run_id or self._last_run_id
+        if selected is None:
+            raise WritePreparationError("a durable run ID is required")
+        _, coordinator = self._existing_runtime(selected)
+        with coordinator.open_session(selected, recovery=True) as session:
+            return session.assess_recovery()
+
+    def _existing_runtime(self, run_id: str) -> tuple[WriteExecution, DurableGraphCoordinator]:
+        configured = self.repository_root.expanduser().resolve()
+        repository = self.git.discover_repository(configured)
+        if repository.root != configured:
+            raise RepositoryRootMismatchError("configured target must equal the canonical Git root")
+        project = self.registry.find_by_root(repository.root)
+        if project is None:
+            raise WritePreparationError("target repository is absent from the runtime registry")
+        run_path = self.paths.run(project.project_id, run_id)
+        document = read_evidence(run_path / "write-inputs.json")
+        if document.get("project_id") != project.project_id or document.get("run_id") != run_id:
+            raise WritePreparationError("write-inputs identity differs from requested run")
+        inputs = decode_value(document.get("payload"), WriteInputs)
+        inspection = inspect_project(
+            repository.root,
+            git_adapter=self.git,
+            project_registry=self.registry,
+            work_source=self.work_source,
+        )
+        selection, package = prepare_selection(
+            self.work_source,
+            inspection.work_snapshot,
+            ShadowRequest(scope_id=inputs.package.scope_id),
+        )
+        if package is None:
+            raise WritePreparationError("persisted selection is no longer reconstructable")
+        allowed = reconcile_write_capability(inspection.work_snapshot, selection, package)
+        reconstructed = WriteInputs(
+            inspection.project_id,
+            package,
+            allowed,
+            inspection.work_snapshot.revision.fingerprint,
+            inputs.baseline_head,
+            inputs.base_branch,
+            inputs.scope_branch,
+            package.item_validation_checks,
+            package.scope_required_checks,
+            capability_fingerprint(allowed),
+        )
+        if reconstructed != inputs:
+            raise WritePreparationError("live source differs from persisted write inputs")
+        preflight = assess_preflight(inspection, selection)
+        shadow = ShadowInputs(
+            inspection,
+            preflight,
+            selection,
+            package,
+            _input_fingerprint(inspection, WriteSliceRequest(scope_id=package.scope_id)),
+        )
+        return self._build_runtime(inspection, shadow, inputs, run_id, rehydrating=True)
+
+    def _build_runtime(
+        self,
+        inspection,
+        shadow: ShadowInputs,
+        inputs: WriteInputs,
+        run_id: str,
+        *,
+        rehydrating: bool,
+    ) -> tuple[WriteExecution, DurableGraphCoordinator]:
+        run_path = self.paths.run(inspection.project_id, run_id)
         execution = WriteExecution(
             shadow,
             inputs,
@@ -220,6 +380,7 @@ class WriteSliceRunner:
             run_path,
             self.identity,
             self.validation_timeout_seconds,
+            rehydrating,
         )
         nodes = {
             "START": StartNode(),
@@ -250,18 +411,11 @@ class WriteSliceRunner:
             run_id_factory=lambda: run_id,
             fault=self.fault,
         )
-        self._coordinator = coordinator
-        coordinator.start_run(run_id)
-        executed: list[str] = []
-        with coordinator.open_session(run_id) as session:
-            state = session.store.load()
-            for _ in range(self.max_steps):
-                if state.graph.current_node == "END":
-                    break
-                executed.append(state.graph.current_node)
-                state = session.step()
-            else:
-                raise WritePreparationError("write graph exceeded its bounded step count")
+        return execution, coordinator
+
+    def _report(
+        self, state, execution: WriteExecution, executed: tuple[str, ...]
+    ) -> WriteSliceReport:
         outcome = (
             WriteSliceOutcome.LOCAL_COMMIT_CREATED
             if execution.commit_sha is not None and state.run.status is RunStatus.PAUSED
@@ -269,42 +423,79 @@ class WriteSliceRunner:
             if state.run.status is RunStatus.BLOCKED
             else WriteSliceOutcome.FAILED
         )
-        issue = ()
+        issues = ()
         if outcome is not WriteSliceOutcome.LOCAL_COMMIT_CREATED:
-            issue = (
+            issues = (
                 WriteSliceIssue(
                     state.failure.code or "write_run_not_completed",
                     f"write run finalized with {state.run.status.value}",
                 ),
             )
+        inputs = execution.inputs
         return WriteSliceReport(
             outcome,
-            inspection.project_id,
-            run_id,
+            inputs.project_id,
+            execution.run_id,
             state,
-            selection.item_id,
-            selection.scope_id,
+            inputs.package.item_id,
+            inputs.package.scope_id,
             inputs.source_revision,
             inputs.baseline_head,
             inputs.scope_branch,
             execution.commit_sha,
-            str(run_path),
+            str(execution.run_path),
             str(execution.workspace) if execution.workspace.exists() else None,
-            tuple(executed),
-            issue,
+            executed,
+            issues,
             None if execution.changeset is None else execution.changeset.digest,
             ()
             if execution.applied is None
             else tuple(item.path for item in execution.applied.files),
         )
 
-    def assess_recovery(self, run_id: str | None = None) -> RecoveryAssessment:
-        coordinator = self._coordinator
-        selected = run_id or self._last_run_id
-        if coordinator is None or selected is None:
-            raise WritePreparationError("runner has no interrupted durable run")
-        with coordinator.open_session(selected, recovery=True) as session:
-            return session.assess_recovery()
+    def _recovery_required(
+        self, state, execution: WriteExecution, assessment: RecoveryAssessment
+    ) -> WriteSliceReport:
+        report = self._report(state, execution, ())
+        return WriteSliceReport(
+            WriteSliceOutcome.RECOVERY_REQUIRED,
+            report.project_id,
+            report.run_id,
+            report.graph_state,
+            report.selected_item_id,
+            report.selected_scope_id,
+            report.source_revision,
+            report.baseline_head,
+            report.scope_branch,
+            report.commit_sha,
+            report.runtime_path,
+            report.workspace_path,
+            issues=(WriteSliceIssue(assessment.reason_code, assessment.human_readable_reason),),
+            changeset_digest=report.changeset_digest,
+            changed_paths=report.changed_paths,
+        )
+
+    def _rehydration_required(
+        self, state, execution: WriteExecution, error: WorkspaceError
+    ) -> WriteSliceReport:
+        report = self._report(state, execution, ())
+        return WriteSliceReport(
+            WriteSliceOutcome.RECOVERY_REQUIRED,
+            report.project_id,
+            report.run_id,
+            report.graph_state,
+            report.selected_item_id,
+            report.selected_scope_id,
+            report.source_revision,
+            report.baseline_head,
+            report.scope_branch,
+            report.commit_sha,
+            report.runtime_path,
+            report.workspace_path,
+            issues=(WriteSliceIssue("write_rehydration_mismatch", str(error)),),
+            changeset_digest=report.changeset_digest,
+            changed_paths=report.changed_paths,
+        )
 
     def _early(
         self,

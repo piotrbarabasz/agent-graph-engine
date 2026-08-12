@@ -23,6 +23,7 @@ from agentgraph.core.state import GraphState
 from agentgraph.work import WorkRisk
 from agentgraph.write.errors import (
     ChangePathError,
+    PostCommitRecoveryRequired,
     StaleFileError,
     WriteBaselineDriftError,
     WriteSliceError,
@@ -305,6 +306,8 @@ class CloseTaskNode:
     def run(self, state: GraphState, context: NodeContext) -> NodeResult:
         try:
             commit = self.execution.commit()
+        except PostCommitRecoveryRequired:
+            raise
         except WriteBaselineDriftError as exc:
             return _blocked(
                 self.node_id,

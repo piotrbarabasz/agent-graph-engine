@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import hashlib
+import os
+import stat
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -20,6 +22,7 @@ class _PreparedWrite:
     relative: str
     before: str | None
     data: bytes
+    before_mode: int | None
 
 
 def apply_changeset(
@@ -32,9 +35,22 @@ def apply_changeset(
         raise WorkspaceError("workspace must be a real directory")
     prepared = tuple(_prepare(root, change, allowed_paths) for change in changeset.changes)
     for item in prepared:
-        atomic_write_bytes(item.destination, item.data)
+        atomic_write_bytes(
+            item.destination,
+            item.data,
+            before_replace=lambda temporary, destination, mode=item.before_mode: _set_mode(
+                temporary, destination, mode
+            ),
+        )
     files = tuple(
-        AppliedFile(item.relative, item.before, _digest(item.data), len(item.data))
+        AppliedFile(
+            item.relative,
+            item.before,
+            _digest(item.data),
+            len(item.data),
+            item.before_mode,
+            stat.S_IMODE(item.destination.stat().st_mode),
+        )
         for item in sorted(prepared, key=lambda value: value.relative.encode("utf-8"))
     )
     return AppliedChangeSet(files, changeset.digest)
@@ -59,13 +75,17 @@ def _prepare(root: Path, change: object, allowed: tuple[RepoPathSpec, ...]) -> _
         if not destination.is_file():
             raise ChangePathError("existing change target is not a regular file")
         before = _digest(destination.read_bytes())
+        before_mode = stat.S_IMODE(destination.stat().st_mode)
         if change.expected_before_sha256 is None or before != change.expected_before_sha256:
             raise StaleFileError("existing file hash differs from proposal")
     else:
         before = None
+        before_mode = None
         if change.expected_before_sha256 is not None:
             raise StaleFileError("new file proposal supplied an existing-file hash")
-    return _PreparedWrite(destination, change.path, before, change.content.encode("utf-8"))
+    return _PreparedWrite(
+        destination, change.path, before, change.content.encode("utf-8"), before_mode
+    )
 
 
 def _verify_ancestors(root: Path, parent: Path) -> None:
@@ -83,3 +103,12 @@ def _verify_ancestors(root: Path, parent: Path) -> None:
 
 def _digest(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def _set_mode(temporary: Path, destination: Path, original_mode: int | None) -> None:
+    del destination
+    if original_mode is not None:
+        os.chmod(temporary, original_mode)
+        return
+    safe_mode = stat.S_IMODE(temporary.stat().st_mode) & ~0o111
+    os.chmod(temporary, safe_mode)

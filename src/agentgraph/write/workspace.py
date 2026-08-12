@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import hashlib
+import stat
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
 
+from agentgraph.core import GraphState, ReviewVerdict, ValidationVerdict
 from agentgraph.infra import (
     CommandReceipt,
     CommandSpec,
@@ -16,19 +19,23 @@ from agentgraph.infra import (
     ProcessRunner,
     ProcessStatus,
 )
-from agentgraph.integration import ShadowInputs, verify_work_source_revision
+from agentgraph.runtime.codec import decode_value
 from agentgraph.work import WorkSource
 
 from .apply import apply_changeset
 from .errors import (
     CommitVerificationError,
+    PostCommitRecoveryRequired,
     ValidationExecutionError,
     WorkspaceError,
     WriteBaselineDriftError,
 )
-from .evidence import write_evidence
-from .models import AppliedChangeSet, ChangeRequest, ChangeSet, WriteInputs
+from .evidence import read_evidence, write_evidence
+from .models import AppliedChangeSet, ChangeRequest, ChangeSet, CommitWitness, WriteInputs
 from .provider import ChangeProvider
+
+if TYPE_CHECKING:
+    from agentgraph.integration import ShadowInputs
 
 
 @dataclass(slots=True)
@@ -46,6 +53,7 @@ class WriteExecution:
     run_path: Path
     commit_identity: GitCommitIdentity
     validation_timeout_seconds: float = 120.0
+    rehydrating: bool = False
     workspace: Path = field(init=False)
     operations: Path = field(init=False)
     workspace_repository: GitRepository | None = field(default=None, init=False)
@@ -74,7 +82,7 @@ class WriteExecution:
             pass
         else:
             raise WorkspaceError("workspace must be outside target repository")
-        if self.workspace.exists() or self.workspace.is_symlink():
+        if not self.rehydrating and (self.workspace.exists() or self.workspace.is_symlink()):
             raise WorkspaceError("workspace path already exists")
 
     def implement(self) -> AppliedChangeSet:
@@ -117,6 +125,9 @@ class WriteExecution:
 
     def validate(self) -> bool:
         repository = self._require_workspace()
+        if (self.operations / "validation.json").exists():
+            self._restore_validation_evidence()
+            return self.validation_passed
         receipts = []
         passed = True
         for check in (*self.inputs.item_validation_checks, *self.inputs.scope_required_checks):
@@ -151,6 +162,9 @@ class WriteExecution:
     def review(self) -> tuple[bool, tuple[str, ...]]:
         repository = self._require_workspace()
         applied = self._require_applied()
+        if (self.operations / "review.json").exists():
+            self._restore_review_evidence()
+            return self.review_passed, self.review_findings
         snapshot = self.git.snapshot(repository)
         findings: list[str] = []
         expected = {item.path for item in applied.files}
@@ -180,6 +194,10 @@ class WriteExecution:
                 findings.append(f"final_file_missing:{item.path}")
             elif _sha256(candidate.read_bytes()) != item.after_sha256:
                 findings.append(f"final_hash_mismatch:{item.path}")
+            elif stat.S_IMODE(candidate.stat().st_mode) != item.after_mode:
+                findings.append(f"final_mode_mismatch:{item.path}")
+            elif item.before_mode is not None and item.after_mode != item.before_mode:
+                findings.append(f"unexpected_mode_change:{item.path}")
         if not self.validation_passed or self.diff_check is None or not self.diff_check.ok:
             findings.append("validation_not_passed")
         try:
@@ -218,44 +236,220 @@ class WriteExecution:
                 not candidate.is_file()
                 or candidate.is_symlink()
                 or _sha256(candidate.read_bytes()) != item.after_sha256
+                or stat.S_IMODE(candidate.stat().st_mode) != item.after_mode
             ):
-                raise CommitVerificationError("reviewed file content changed before commit")
+                raise CommitVerificationError("reviewed file content or mode changed before commit")
         final_diff_check = self.git.diff_check(repository)
         if not final_diff_check.ok:
             raise CommitVerificationError("workspace diff check changed after review")
+        scope_ref = f"refs/heads/{self.inputs.scope_branch}"
+        previous_branch_head = self.git.resolve_ref(self.target, scope_ref)
+        if previous_branch_head != before.head_sha:
+            raise CommitVerificationError("scope branch changed before commit")
         stage = self.git.stage_paths(repository, expected)
-        result = self.git.commit(
-            repository,
-            f"agentgraph({self.inputs.package.item_id}): {self.inputs.package.title}",
-            expected_paths=expected,
-            identity=self.commit_identity,
-        )
-        final = self.git.snapshot(repository)
-        if (
-            final.dirty
-            or final.branch != self.inputs.scope_branch
-            or final.head_sha != result.commit_sha
-        ):
-            raise CommitVerificationError("committed workspace verification failed")
-        if (
-            self.git.resolve_ref(self.target, f"refs/heads/{self.inputs.scope_branch}")
-            != result.commit_sha
-        ):
-            raise CommitVerificationError("scope branch ref does not equal commit")
-        self.live_recheck("write_baseline_drift_after_commit")
+        try:
+            result = self.git.commit(
+                repository,
+                f"agentgraph({self.inputs.package.item_id}): {self.inputs.package.title}",
+                expected_paths=expected,
+                identity=self.commit_identity,
+            )
+        except Exception as exc:
+            resolution_failed = False
+            try:
+                observed = self.git.resolve_ref(self.target, scope_ref)
+            except Exception:
+                observed = None
+                resolution_failed = True
+            if observed is not None and observed != previous_branch_head:
+                self.commit_sha = observed
+                try:
+                    self._write_commit_witness(previous_branch_head, observed, expected)
+                except Exception as witness_exc:
+                    raise PostCommitRecoveryRequired(
+                        "commit advanced but witness finalization failed"
+                    ) from witness_exc
+                raise PostCommitRecoveryRequired(
+                    "commit side effect occurred before GitAdapter returned"
+                ) from exc
+            if resolution_failed:
+                try:
+                    self._write_commit_witness(previous_branch_head, None, expected)
+                except Exception as witness_exc:
+                    raise PostCommitRecoveryRequired(
+                        "commit outcome and witness finalization are uncertain"
+                    ) from witness_exc
+                raise PostCommitRecoveryRequired("commit outcome could not be resolved") from exc
+            raise
+
         self.commit_sha = result.commit_sha
-        write_evidence(
-            self.operations / "commit.json",
-            context=self.evidence_context(),
-            payload={
-                "commit_sha": result.commit_sha,
-                "stage_receipt": stage,
-                "commit_receipt": result.receipt,
-            },
-        )
+        try:
+            self._write_commit_witness(previous_branch_head, result.commit_sha, expected)
+        except Exception as exc:
+            raise PostCommitRecoveryRequired("commit witness finalization failed") from exc
+        try:
+            final = self.git.snapshot(repository)
+            if (
+                final.dirty
+                or final.branch != self.inputs.scope_branch
+                or final.head_sha != result.commit_sha
+            ):
+                raise CommitVerificationError("committed workspace verification failed")
+            if self.git.resolve_ref(self.target, scope_ref) != result.commit_sha:
+                raise CommitVerificationError("scope branch ref does not equal commit")
+            self.live_recheck("write_baseline_drift_after_commit")
+            write_evidence(
+                self.operations / "commit.json",
+                context=self.evidence_context(),
+                payload={
+                    "commit_sha": result.commit_sha,
+                    "stage_receipt": stage,
+                    "commit_receipt": result.receipt,
+                },
+            )
+        except Exception as exc:
+            raise PostCommitRecoveryRequired("post-commit verification requires recovery") from exc
         return result.commit_sha
 
+    def rehydrate(self, state: GraphState) -> None:
+        """Restore execution facts from immutable evidence for the persisted cursor."""
+
+        if self.workspace.exists():
+            if self.workspace.is_symlink():
+                raise WorkspaceError("persisted workspace is a symlink")
+            repository = self.git.discover_repository(self.workspace)
+            if repository.root != self.workspace.resolve():
+                raise WorkspaceError("persisted workspace root differs from expected path")
+            snapshot = self.git.snapshot(repository)
+            if snapshot.branch != self.inputs.scope_branch:
+                raise WorkspaceError("persisted workspace branch differs from write inputs")
+            self.workspace_repository = repository
+
+        cursor = state.graph.current_node
+        after_implement = cursor in {
+            "VALIDATE",
+            "REVIEW",
+            "CLASSIFY_FAILURE",
+            "CLOSE_TASK",
+            "MORE_WORK",
+            "FINALIZE",
+        } or bool(state.changes.identifiers)
+        if after_implement:
+            proposal = self._payload("implement-proposal.json")
+            applied_payload = self._payload("implement-applied.json")
+            self.changeset = decode_value(proposal["changeset"], ChangeSet)
+            self.applied = decode_value(applied_payload["applied"], AppliedChangeSet)
+            if self.changeset.digest != self.applied.changeset_digest:
+                raise WorkspaceError("proposal and applied evidence disagree")
+            expected_identifier = f"changeset:{self.changeset.digest}"
+            applied_paths = tuple(item.path for item in self.applied.files)
+            if (
+                expected_identifier not in state.changes.identifiers
+                or state.changes.agent_reported_files != applied_paths
+                or state.changes.count != len(applied_paths)
+            ):
+                raise WorkspaceError("GraphState and implement evidence disagree")
+
+        after_validation = (
+            cursor
+            in {
+                "REVIEW",
+                "CLASSIFY_FAILURE",
+                "CLOSE_TASK",
+                "MORE_WORK",
+                "FINALIZE",
+            }
+            or state.validation.verdict is not ValidationVerdict.UNKNOWN
+        )
+        if after_validation:
+            self._restore_validation_evidence()
+            expected = ValidationVerdict.PASS if self.validation_passed else ValidationVerdict.FAIL
+            receipt_ids = tuple(receipt.command_id for receipt in self.validation_receipts)
+            if state.validation.verdict is not expected or state.validation.checks != receipt_ids:
+                raise WorkspaceError("GraphState and validation evidence disagree")
+
+        after_review = cursor in {"CLOSE_TASK", "MORE_WORK", "FINALIZE"} or (
+            state.review.verdict is not ReviewVerdict.UNKNOWN
+        )
+        if after_review:
+            self._restore_review_evidence()
+            expected = ReviewVerdict.PASS if self.review_passed else ReviewVerdict.FAIL
+            if (
+                state.review.verdict is not expected
+                or state.review.safe_to_close is not self.review_passed
+                or state.review.findings != self.review_findings
+            ):
+                raise WorkspaceError("GraphState and review evidence disagree")
+
+        witness_path = self.operations / "commit-witness.json"
+        if witness_path.exists():
+            witness = decode_value(self._payload("commit-witness.json"), CommitWitness)
+            if (
+                witness.project_id != self.inputs.project_id
+                or witness.run_id != self.run_id
+                or witness.item_id != self.inputs.package.item_id
+                or witness.scope_id != self.inputs.package.scope_id
+                or witness.base_head != self.inputs.baseline_head
+                or witness.previous_branch_head != self.inputs.baseline_head
+                or witness.changeset_digest
+                != (None if self.changeset is None else self.changeset.digest)
+                or witness.reviewed_paths
+                != (() if self.applied is None else tuple(item.path for item in self.applied.files))
+            ):
+                raise WorkspaceError("commit witness differs from persisted write inputs")
+            self.commit_sha = witness.commit_sha
+
+    def _write_commit_witness(
+        self, previous_branch_head: str, commit_sha: str | None, reviewed_paths: tuple[str, ...]
+    ) -> None:
+        changeset = self.changeset
+        if changeset is None:
+            raise WorkspaceError("commit witness requires a changeset")
+        witness = CommitWitness(
+            self.inputs.project_id,
+            self.run_id,
+            self.inputs.package.item_id,
+            self.inputs.package.scope_id,
+            self.inputs.baseline_head,
+            previous_branch_head,
+            commit_sha,
+            changeset.digest,
+            reviewed_paths,
+        )
+        write_evidence(
+            self.operations / "commit-witness.json",
+            context=self.evidence_context(),
+            payload=witness,
+        )
+
+    def _restore_validation_evidence(self) -> None:
+        validation = self._payload("validation.json")
+        self.validation_receipts = decode_value(validation["commands"], tuple[CommandReceipt, ...])
+        self.diff_check = decode_value(validation["diff_check"], DiffCheckResult)
+        self.validation_passed = bool(validation["passed"])
+
+    def _restore_review_evidence(self) -> None:
+        review = self._payload("review.json")
+        self.review_passed = bool(review["passed"])
+        self.review_findings = tuple(review["findings"])
+
+    def _payload(self, name: str) -> dict[str, object]:
+        document = read_evidence(self.operations / name)
+        if (
+            document.get("run_id") != self.run_id
+            or document.get("project_id") != self.inputs.project_id
+            or document.get("item_id") != self.inputs.package.item_id
+            or document.get("scope_id") != self.inputs.package.scope_id
+        ):
+            raise WorkspaceError("operation evidence identity differs from write inputs")
+        payload = document.get("payload")
+        if not isinstance(payload, dict):
+            raise WorkspaceError("operation evidence payload is invalid")
+        return payload
+
     def live_recheck(self, code: str) -> None:
+        from agentgraph.integration import verify_work_source_revision
+
         current = self.git.snapshot(self.target)
         pinned = self.shadow.inspection.git_snapshot
         if (

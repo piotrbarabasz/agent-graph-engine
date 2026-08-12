@@ -5,11 +5,14 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import PurePosixPath
+from typing import TYPE_CHECKING
 
-from agentgraph.integration import SelectionPlan
 from agentgraph.work import RepoPathSpec, WorkItem, WorkPackage, WorkScope, WorkSourceSnapshot
 
 from .errors import ChangePathError, WorkCapabilityMismatchError
+
+if TYPE_CHECKING:
+    from agentgraph.integration import SelectionPlan
 
 
 def reconcile_write_capability(
