@@ -1,5 +1,6 @@
 """Public proposal-only Codex CLI provider API."""
 
+from .agent_provider import CodexAgentProvider
 from .cli import CodexCliCapabilities, CodexCliProbe
 from .config import CodexProviderConfig
 from .errors import (
@@ -17,6 +18,7 @@ from .parser import parse_codex_proposal
 from .policy import CODEX_PERMISSION_PROFILE_NAME, restricted_permission_config_overrides
 from .prompt import build_codex_change_prompt
 from .provider import CodexChangeProvider
+from .runtime import CodexInvocationRuntime, CodexStructuredResult
 from .schema import (
     CODEX_PROPOSAL_JSON_SCHEMA,
     CodexFileProposal,
@@ -27,6 +29,7 @@ from .schema import (
 __all__ = [
     "CODEX_PERMISSION_PROFILE_NAME",
     "CODEX_PROPOSAL_JSON_SCHEMA",
+    "CodexAgentProvider",
     "CodexChangeProvider",
     "CodexCliCapabilities",
     "CodexCliProbe",
@@ -34,6 +37,7 @@ __all__ = [
     "CodexCliUnsupportedError",
     "CodexFileProposal",
     "CodexInvocationError",
+    "CodexInvocationRuntime",
     "CodexProposal",
     "CodexProposalError",
     "CodexProposalStatus",
@@ -42,6 +46,7 @@ __all__ = [
     "CodexProviderContextError",
     "CodexProviderError",
     "CodexResponseError",
+    "CodexStructuredResult",
     "CodexTimeoutError",
     "build_codex_change_prompt",
     "parse_codex_proposal",
