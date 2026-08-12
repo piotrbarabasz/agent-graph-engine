@@ -8,9 +8,13 @@ infrastructure with bounded output, cancellation, redacted receipts, machine-rea
 repository snapshots, and explicit safe local Git mutations.
 M004 adds neutral immutable WorkSource contracts and a read-only SpecKit compatibility adapter
 for validating, selecting, and packaging declared repository work from content-based snapshots.
+M005 adds read-only shadow integration across project identity, local Git inspection, WorkSource
+selection, and the unchanged canonical graph. The engine can now inspect a real target repository,
+resolve work, and reach the `EXPLORE` boundary without executing an LLM or modifying the target
+repository.
 
-The project requires Python 3.11 or newer. It has no CLI, Codex, GitHub, Spec Kit,
-LLM provider, automatic coding workflow, or real coding-task execution.
+The project requires Python 3.11 or newer. It has no CLI, Codex, GitHub, LLM provider,
+automatic coding workflow, or real coding-task execution.
 
 ## Development
 
@@ -39,4 +43,6 @@ and no reset, clean, merge, rebase, or other destructive workflow primitives.
 
 `agentgraph.adapters.speckit.SpecKitAdapter` can inspect, validate, deterministically select,
 and package source work. It cannot execute work, run declared checks, mutate task checkboxes or
-scope status, or integrate the source with graph execution yet.
+scope status. `agentgraph.integration.ShadowRunner` can project one immutable repository/work
+snapshot through deterministic `START`, `DISCOVER_PROJECT`, `PREFLIGHT`, and `SELECT_WORK` nodes.
+It stops before `EXPLORE`, never executes validation commands, and does not create a durable run.
