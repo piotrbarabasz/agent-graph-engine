@@ -17,9 +17,15 @@ class CodexProviderConfig:
         if not self.executable or "\x00" in self.executable:
             raise ValueError("Codex executable must be non-empty and NUL-free")
         if not all(
-            isinstance(value, str) and "\x00" not in value for value in self.executable_arguments
+            isinstance(value, str)
+            and bool(value)
+            and "\x00" not in value
+            and not value.startswith("-")
+            for value in self.executable_arguments
         ):
-            raise ValueError("Codex executable arguments must be NUL-free strings")
+            raise ValueError(
+                "Codex executable arguments must be non-empty, NUL-free, non-option strings"
+            )
         if isinstance(self.timeout_seconds, bool) or self.timeout_seconds <= 0:
             raise ValueError("Codex timeout must be positive")
         if self.model is not None and (not self.model or "\x00" in self.model):

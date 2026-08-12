@@ -16,7 +16,8 @@ M006 adds the first controlled local-write vertical slice. It can create one det
 reviewed local commit on a new scope branch in an external durable-run Git worktree while keeping
 the target main working tree byte-identical and on its base branch.
 M007 adds a proposal-only integration with a locally configured Codex CLI. Codex can inspect the
-external worktree under a read-only sandbox and return one strict structured change proposal.
+external worktree through a native least-privilege permission profile and return one strict
+structured change proposal.
 
 Agent Graph Engine—not Codex—computes stale-file hashes, applies changes, runs validation, reviews
 the actual diff, stages files, and verifies the local commit. The provider receives a neutral read
@@ -70,9 +71,12 @@ and regular-file executable modes directly from the Git object database. Any lat
 mismatch remains a fail-closed recovery case.
 
 `agentgraph.providers.codex.CodexChangeProvider` probes the installed CLI before use, requires
-non-interactive read-only execution, ignores ambient user configuration and rules, disables MCP and
-web-search tools for the invocation, sends the deterministic prompt through stdin, and accepts only
-the bounded final-result file validated against an exact schema. Provider provenance is stored under
+non-interactive execution with an explicit Codex working root and a runtime-only permission profile.
+That profile denies filesystem-root access, grants read-only access to Codex's minimal helper paths
+and the external worktree, and disables tool network access. The invocation also ignores ambient
+user configuration and rules and disables MCP and web-search tools. It sends the deterministic
+prompt through stdin and accepts only the bounded final-result file validated against an exact
+schema. Provider provenance is stored under
 `<run>/provider/codex`; it contains digests, the normalized proposal, and a sanitized process receipt,
 not chain-of-thought or a resumable Codex session. Any tracked, staged, untracked, conflicted, branch,
 or HEAD mutation during the provider call stops `IMPLEMENT` before the engine applies a proposal.

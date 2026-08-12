@@ -20,11 +20,16 @@ def main() -> int:
             print("Run Codex non-interactively")
             return 0
         print(
-            "Run Codex non-interactively --sandbox read-only --config --strict-config "
+            "Run Codex non-interactively --ask-for-approval never --config --strict-config "
             "--ephemeral --ignore-user-config --ignore-rules --output-schema "
-            "--output-last-message --model"
+            "--output-last-message --model --cd"
         )
         return 0
+    if args == ["sandbox", "--help"]:
+        print("Run commands within a Codex-provided sandbox --permission-profile --cd --config")
+        return 0
+    if args and args[0] == "sandbox":
+        return 7 if os.environ.get("FAKE_CODEX_PROFILE_UNSUPPORTED") == "1" else 0
     if not args or args[0] != "exec":
         return 2
     prompt = sys.stdin.buffer.read().decode("utf-8")

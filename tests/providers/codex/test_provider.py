@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import tomllib
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 
@@ -12,15 +14,17 @@ from agentgraph.providers.codex import (
     CodexInvocationError,
     CodexProposalError,
     CodexProviderBlockedError,
+    CodexProviderConfig,
     CodexProviderContextError,
     CodexResponseError,
     CodexTimeoutError,
+    restricted_permission_config_overrides,
 )
 from agentgraph.write.evidence import read_evidence
 from tests.providers.codex.conftest import proposal
 
 
-def test_provider_uses_stdin_read_only_mode_and_engine_computes_existing_hash(
+def test_provider_uses_stdin_restricted_profile_and_engine_computes_existing_hash(
     codex_fixture, monkeypatch
 ) -> None:
     monkeypatch.setenv("FAKE_CODEX_RESULT", proposal("src/existing.py", "value = 2\n"))
@@ -37,19 +41,82 @@ def test_provider_uses_stdin_read_only_mode_and_engine_computes_existing_hash(
     argv = capture["argv"]
     assert codex_fixture["request"].goal not in " ".join(argv)
     assert codex_fixture["request"].goal in capture["prompt"]
-    assert argv[argv.index("--sandbox") :][:2] == ["--sandbox", "read-only"]
+    assert argv[argv.index("--cd") :][:2] == [
+        "--cd",
+        str(codex_fixture["repository"].resolve()),
+    ]
+    assert capture["cwd"] == str(codex_fixture["repository"].resolve())
+    assert "--sandbox" not in argv
+    assert 'default_permissions="agentgraph_provider"' in argv
+    profile = next(value for value in argv if value.startswith("permissions.agentgraph_provider="))
+    assert '":root" = "deny"' in profile
+    assert '":minimal" = "read"' in profile
+    assert '":workspace_roots" = { "." = "read" }' in profile
+    assert "network = { enabled = false }" in profile
     assert 'approval_policy="never"' in argv
     assert "mcp_servers={}" in argv
     assert 'web_search="disabled"' in argv
     assert "--output-schema" in argv and "--output-last-message" in argv
+    for required_flag in (
+        "--strict-config",
+        "--ephemeral",
+        "--ignore-user-config",
+        "--ignore-rules",
+    ):
+        assert required_flag in argv
     assert argv[-1] == "-"
-    assert not {"workspace-write", "danger-full-access", "--full-auto"}.intersection(argv)
+    invocation = "\n".join(argv)
+    for forbidden in (
+        "workspace-write",
+        "danger-full-access",
+        "--full-auto",
+        '":root" = "read"',
+    ):
+        assert forbidden not in invocation
     codex_dir = codex_fixture["context"].runtime_directory / "codex"
     receipt = read_evidence(codex_dir / "codex-receipt.json")
     evidence = read_evidence(codex_dir / "codex-proposal.json")
     assert receipt["payload"]["prompt_digest"].startswith("sha256:")
     assert evidence["payload"]["proposal_digest"].startswith("sha256:")
     assert set(evidence["payload"]) == {"proposal", "proposal_digest"}
+
+
+def test_restricted_permission_policy_grants_only_workspace_read(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    outside = tmp_path / "outside"
+    workspace.mkdir()
+    outside.mkdir()
+    (workspace / "src").mkdir()
+    (workspace / "src" / "a.py").write_text("value = 1\n", encoding="utf-8")
+    (outside / "secret.txt").write_text("sentinel\n", encoding="utf-8")
+
+    policy = tomllib.loads("\n".join(restricted_permission_config_overrides()))
+    profile = policy["permissions"]["agentgraph_provider"]
+
+    assert policy["default_permissions"] == "agentgraph_provider"
+    assert profile["filesystem"] == {
+        ":root": "deny",
+        ":minimal": "read",
+        ":workspace_roots": {".": "read"},
+    }
+    assert profile["network"] == {"enabled": False}
+    assert str(outside.resolve()) not in "\n".join(restricted_permission_config_overrides())
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    (
+        ("--cd", "outside"),
+        ("-C", "outside"),
+        ("--sandbox", "danger-full-access"),
+        ("--config", 'sandbox_mode="danger-full-access"'),
+    ),
+)
+def test_executable_arguments_reject_codex_option_escape(arguments) -> None:
+    with pytest.raises(ValueError, match="non-option"):
+        CodexProviderConfig(executable_arguments=arguments)
 
 
 @pytest.mark.parametrize(

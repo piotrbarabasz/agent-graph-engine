@@ -14,6 +14,7 @@ from .errors import (
     CodexTimeoutError,
 )
 from .parser import parse_codex_proposal
+from .policy import CODEX_PERMISSION_PROFILE_NAME, restricted_permission_config_overrides
 from .prompt import build_codex_change_prompt
 from .provider import CodexChangeProvider
 from .schema import (
@@ -24,6 +25,7 @@ from .schema import (
 )
 
 __all__ = [
+    "CODEX_PERMISSION_PROFILE_NAME",
     "CODEX_PROPOSAL_JSON_SCHEMA",
     "CodexChangeProvider",
     "CodexCliCapabilities",
@@ -43,4 +45,5 @@ __all__ = [
     "CodexTimeoutError",
     "build_codex_change_prompt",
     "parse_codex_proposal",
+    "restricted_permission_config_overrides",
 ]

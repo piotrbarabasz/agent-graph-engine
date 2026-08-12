@@ -12,29 +12,36 @@ from agentgraph.infra.redaction import is_sensitive_environment_key
 
 from .config import CodexProviderConfig
 from .errors import CodexCliUnavailableError, CodexCliUnsupportedError
+from .policy import CODEX_PERMISSION_PROFILE_NAME, restricted_permission_config_overrides
 
 
 @dataclass(frozen=True, slots=True)
 class CodexCliCapabilities:
     version: str
     supports_exec: bool
-    supports_read_only_sandbox: bool
     supports_noninteractive_no_approval: bool
+    supports_runtime_config_overrides: bool
+    supports_strict_config: bool
     supports_structured_output: bool
     supports_final_output_file: bool
     supports_model_override: bool
     supports_isolated_configuration: bool
+    supports_pinned_cwd: bool
+    supports_restricted_filesystem_permissions: bool
 
     @property
     def required_supported(self) -> bool:
         return all(
             (
                 self.supports_exec,
-                self.supports_read_only_sandbox,
                 self.supports_noninteractive_no_approval,
+                self.supports_runtime_config_overrides,
+                self.supports_strict_config,
                 self.supports_structured_output,
                 self.supports_final_output_file,
                 self.supports_isolated_configuration,
+                self.supports_pinned_cwd,
+                self.supports_restricted_filesystem_permissions,
             )
         )
 
@@ -50,13 +57,16 @@ class CodexCliProbe:
             return self._cached
         version = self._run((*self._prefix(), "--version"), cwd)
         help_text = self._run((*self._prefix(), "exec", "--help"), cwd)
+        sandbox_help = self._run((*self._prefix(), "sandbox", "--help"), cwd)
+        supports_permission_profile = "--permission-profile" in sandbox_help
+        if supports_permission_profile:
+            supports_permission_profile = self._validate_restricted_profile(cwd)
         capabilities = CodexCliCapabilities(
             version=version.strip(),
             supports_exec="Run Codex non-interactively" in help_text,
-            supports_read_only_sandbox=("--sandbox" in help_text and "read-only" in help_text),
-            supports_noninteractive_no_approval=(
-                "--config" in help_text and "--strict-config" in help_text
-            ),
+            supports_noninteractive_no_approval="--config" in help_text,
+            supports_runtime_config_overrides="--config" in help_text,
+            supports_strict_config="--strict-config" in help_text,
             supports_structured_output="--output-schema" in help_text,
             supports_final_output_file="--output-last-message" in help_text,
             supports_model_override="--model" in help_text,
@@ -64,6 +74,8 @@ class CodexCliProbe:
                 flag in help_text
                 for flag in ("--ephemeral", "--ignore-user-config", "--ignore-rules")
             ),
+            supports_pinned_cwd="--cd" in help_text,
+            supports_restricted_filesystem_permissions=supports_permission_profile,
         )
         if not capabilities.required_supported:
             raise CodexCliUnsupportedError(
@@ -78,6 +90,38 @@ class CodexCliProbe:
 
     def _prefix(self) -> tuple[str, ...]:
         return (self.config.executable, *self.config.executable_arguments)
+
+    def _validate_restricted_profile(self, cwd: Path) -> bool:
+        command = (
+            ("cmd.exe", "/d", "/c", "exit", "0") if os.name == "nt" else ("/bin/sh", "-c", "exit 0")
+        )
+        values = [
+            *self._prefix(),
+            "sandbox",
+            "--cd",
+            str(cwd),
+        ]
+        for override in restricted_permission_config_overrides():
+            values.extend(("--config", override))
+        values.extend(("--permission-profile", CODEX_PERMISSION_PROFILE_NAME, *command))
+        try:
+            result = self.runner.run(
+                CommandSpec(
+                    argv=tuple(values),
+                    cwd=cwd,
+                    timeout_seconds=min(max(self.config.timeout_seconds, 5.0), 30.0),
+                    max_stdout_bytes=256 * 1024,
+                    max_stderr_bytes=256 * 1024,
+                    unset_env=sensitive_environment_keys(),
+                )
+            )
+        except ProcessStartError as exc:
+            raise CodexCliUnavailableError("configured Codex CLI is unavailable") from exc
+        return (
+            result.receipt.status is ProcessStatus.SUCCEEDED
+            and not result.receipt.stdout_truncated
+            and not result.receipt.stderr_truncated
+        )
 
     def _run(self, argv: tuple[str, ...], cwd: Path) -> str:
         try:

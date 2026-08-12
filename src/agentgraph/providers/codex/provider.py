@@ -39,12 +39,13 @@ from .errors import (
     CodexTimeoutError,
 )
 from .parser import parse_codex_proposal
+from .policy import restricted_permission_config_overrides
 from .prompt import build_codex_change_prompt
 from .schema import CODEX_PROPOSAL_JSON_SCHEMA, CodexProposal, CodexProposalStatus
 
 
 class CodexChangeProvider:
-    """Invoke exactly one isolated read-only Codex proposal turn."""
+    """Invoke exactly one native-profile-isolated Codex proposal turn."""
 
     def __init__(
         self,
@@ -74,7 +75,7 @@ class CodexChangeProvider:
         result_path = codex_dir / "final-result.json"
         schema_bytes = canonical_json_bytes(CODEX_PROPOSAL_JSON_SCHEMA)
         atomic_write_bytes(schema_path, schema_bytes)
-        argv = self._invocation(schema_path, result_path, capabilities)
+        argv = self._invocation(repository.root, schema_path, result_path, capabilities)
         try:
             result = self.runner.run(
                 CommandSpec(
@@ -155,7 +156,11 @@ class CodexChangeProvider:
         return repository, provider_dir
 
     def _invocation(
-        self, schema_path: Path, result_path: Path, capabilities: CodexCliCapabilities
+        self,
+        repository_root: Path,
+        schema_path: Path,
+        result_path: Path,
+        capabilities: CodexCliCapabilities,
     ) -> tuple[str, ...]:
         if not capabilities.required_supported:
             raise AssertionError("unsupported Codex capabilities escaped probe")
@@ -163,25 +168,30 @@ class CodexChangeProvider:
             self.config.executable,
             *self.config.executable_arguments,
             "exec",
-            "--sandbox",
-            "read-only",
+            "--cd",
+            str(repository_root),
             "--ephemeral",
             "--ignore-user-config",
             "--ignore-rules",
             "--strict-config",
-            "--config",
-            'approval_policy="never"',
-            "--config",
-            "mcp_servers={}",
-            "--config",
-            'web_search="disabled"',
-            "--output-schema",
-            str(schema_path),
-            "--output-last-message",
-            str(result_path),
-            "--color",
-            "never",
         ]
+        for override in (
+            *restricted_permission_config_overrides(),
+            'approval_policy="never"',
+            "mcp_servers={}",
+            'web_search="disabled"',
+        ):
+            values.extend(("--config", override))
+        values.extend(
+            (
+                "--output-schema",
+                str(schema_path),
+                "--output-last-message",
+                str(result_path),
+                "--color",
+                "never",
+            )
+        )
         if self.config.model is not None:
             values.extend(("--model", self.config.model))
         values.append("-")
