@@ -28,3 +28,8 @@
 - The M004 source adapter is strictly read-only and fails closed on invalid dependencies or unsafe
   paths. Validation commands are declarative argv, and source revisions are content-based.
 - Work-source inspection never writes target files or creates adapter caches and metadata.
+- M005 shadow integration is target-read-only and pins one immutable Git/work input snapshot per
+  probe. Selection requires an explicit selector or active-scope evidence and never guesses globally.
+- Shadow nodes never execute declared validation commands, invoke an LLM, or mutate the canonical
+  graph. The in-memory probe stops before invoking `EXPLORE` and creates no durable graph run.
+- Active scope and branch evidence must agree, and final repository/source drift fails closed.
