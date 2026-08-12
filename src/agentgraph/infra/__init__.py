@@ -6,6 +6,8 @@ from .git import (
     GitCommitIdentity,
     GitCommitResult,
     GitRepository,
+    GitTreeEntry,
+    GitWorktreeResult,
     RepositorySnapshot,
 )
 from .process import CancellationToken, CommandSpec, ProcessRunner
@@ -22,6 +24,8 @@ __all__ = [
     "GitCommitIdentity",
     "GitCommitResult",
     "GitRepository",
+    "GitTreeEntry",
+    "GitWorktreeResult",
     "ProcessRunner",
     "ProcessStatus",
     "ProcessTermination",

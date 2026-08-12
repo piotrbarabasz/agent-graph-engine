@@ -33,3 +33,17 @@
 - Shadow nodes never execute declared validation commands, invoke an LLM, or mutate the canonical
   graph. The in-memory probe stops before invoking `EXPLORE` and creates no durable graph run.
 - Active scope and branch evidence must agree, and final repository/source drift fails closed.
+- M006 generated writes occur only in an external durable-run Git worktree; the target main
+  working tree never switches branch. `ChangeProvider` returns data and receives no write capability.
+- Write-package capabilities and branch hints are independently reconciled before a durable run.
+  M006 processes one item with zero automatic repairs and does not close source state.
+- M006 never pushes or opens a PR. Interrupted write/external nodes fail closed, and external
+  workspace plus immutable operation evidence are preserved for diagnosis.
+- M006 atomic content writes preserve an existing file's mode and never introduce executable bits
+  for new text files. A local commit is immediately bound to immutable witness evidence.
+- M006 accepts a local commit only after reading its parents, exact path delta, blobs, and regular-file
+  modes from the Git object database; any post-commit mismatch requires explicit recovery.
+- Caller initialization artifacts are written and synced in the staging run after `RUN_STARTED` and
+  before promotion, so every promoted M006 run already contains its immutable write inputs.
+- Cross-process M006 resume reconstructs only from content-digested write inputs, GraphState, and
+  mutually consistent operation evidence; it never replays an interrupted side-effect node.

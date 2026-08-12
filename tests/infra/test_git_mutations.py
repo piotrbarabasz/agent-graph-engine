@@ -6,7 +6,12 @@ from pathlib import Path
 import pytest
 
 from agentgraph.infra import GitCommitIdentity
-from agentgraph.infra.errors import GitCommandError, GitPathError, NothingToCommitError
+from agentgraph.infra.errors import (
+    GitCommandError,
+    GitPathError,
+    InvalidGitOperationError,
+    NothingToCommitError,
+)
 from tests.infra.conftest import git_command
 
 
@@ -21,6 +26,44 @@ def test_create_and_switch_branch_without_force_overwrite(git_repo) -> None:
     assert adapter.snapshot(repository).branch == original
     with pytest.raises(GitCommandError):
         adapter.create_branch(repository, "feature/safe")
+
+
+def test_add_worktree_uses_new_branch_and_exact_pinned_start(git_repo, tmp_path) -> None:
+    _, adapter, repository = git_repo
+    pinned = adapter.snapshot(repository).head_sha
+    assert pinned is not None
+    workspace = tmp_path / "external" / "workspace"
+
+    result = adapter.add_worktree(repository, workspace, "work/safe", pinned)
+
+    assert result.repository.root == workspace.resolve()
+    assert adapter.local_branch_exists(repository, "work/safe")
+    assert adapter.resolve_ref(repository, "refs/heads/work/safe") == pinned
+    assert adapter.snapshot(result.repository).branch == "work/safe"
+    assert adapter.snapshot(result.repository).head_sha == pinned
+    with pytest.raises(InvalidGitOperationError, match="already exists"):
+        adapter.add_worktree(repository, tmp_path / "other", "work/safe", pinned)
+
+
+def test_commit_tree_read_primitives_return_exact_local_objects(git_repo) -> None:
+    root, adapter, repository = git_repo
+    parent = adapter.snapshot(repository).head_sha
+    assert parent is not None
+    changed = root / "tracked.txt"
+    changed.write_text("committed bytes\n", encoding="utf-8")
+    adapter.stage_paths(repository, (changed,))
+    commit = adapter.commit(repository, "tree inspection", expected_paths=(changed,))
+
+    assert adapter.commit_parents(repository, commit.commit_sha) == (parent,)
+    assert adapter.diff_paths_between(repository, parent, commit.commit_sha) == (
+        Path("tracked.txt"),
+    )
+    entry = adapter.tree_entry(repository, commit.commit_sha, "tracked.txt")
+    assert entry is not None
+    assert entry.mode == "100644"
+    assert entry.object_type == "blob"
+    assert adapter.read_blob(repository, entry.object_id) == b"committed bytes\n"
+    assert adapter.tree_entry(repository, commit.commit_sha, "absent.txt") is None
 
 
 def test_stage_paths_handles_option_shaped_name_and_blocks_escape(git_repo, tmp_path) -> None:

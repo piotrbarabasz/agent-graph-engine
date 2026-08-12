@@ -80,6 +80,24 @@ class GitCommitResult:
 
 
 @dataclass(frozen=True, slots=True)
+class GitWorktreeResult:
+    """A newly-created local worktree plus the structural command receipt."""
+
+    repository: GitRepository
+    receipt: CommandReceipt
+
+
+@dataclass(frozen=True, slots=True)
+class GitTreeEntry:
+    """One exact entry read from a commit tree."""
+
+    mode: str
+    object_type: str
+    object_id: str
+    path: Path
+
+
+@dataclass(frozen=True, slots=True)
 class _StatusPaths:
     staged: tuple[Path, ...]
     unstaged: tuple[Path, ...]
@@ -232,6 +250,152 @@ class GitAdapter:
         result = self._run(repository, ("switch", name))
         self._require_success(result, "Git branch switch failed")
         return result.receipt
+
+    def local_branch_exists(self, repository: GitRepository, name: str) -> bool:
+        """Return whether an exact local branch ref exists, without remote lookup."""
+
+        self._validate_branch(repository, name)
+        result = self._run(repository, ("show-ref", "--verify", "--quiet", f"refs/heads/{name}"))
+        if result.receipt.status is ProcessStatus.SUCCEEDED:
+            return True
+        if result.receipt.status is ProcessStatus.FAILED and result.receipt.exit_code == 1:
+            return False
+        self._require_success(result, "Git local branch inspection failed")
+        raise AssertionError("unreachable")
+
+    def resolve_ref(self, repository: GitRepository, reference: str) -> str | None:
+        """Resolve an exact local commit-ish to a commit SHA, or return None."""
+
+        if (
+            not isinstance(reference, str)
+            or not reference
+            or reference.startswith("-")
+            or "\x00" in reference
+        ):
+            raise InvalidGitReferenceError("invalid Git reference")
+        result = self._run(
+            repository, ("rev-parse", "--verify", "--quiet", f"{reference}^{{commit}}")
+        )
+        if result.receipt.status is ProcessStatus.SUCCEEDED:
+            return self._single_text(result)
+        if result.receipt.status is ProcessStatus.FAILED:
+            return None
+        self._require_success(result, "Git reference resolution failed")
+        raise AssertionError("unreachable")
+
+    def commit_parents(self, repository: GitRepository, commit_sha: str) -> tuple[str, ...]:
+        """Return the ordered parent commit IDs of one exact local commit."""
+
+        self._validate_start_point(repository, commit_sha)
+        result = self._run(repository, ("rev-list", "--parents", "-n", "1", commit_sha))
+        self._require_success(result, "Git commit parent inspection failed")
+        fields = self._single_text(result).split(" ")
+        if (
+            not fields
+            or fields[0] != commit_sha
+            or any(not _is_object_id(value) for value in fields)
+        ):
+            raise GitOutputError("Git returned invalid commit parent output")
+        return tuple(fields[1:])
+
+    def diff_paths_between(
+        self, repository: GitRepository, old_sha: str, new_sha: str
+    ) -> tuple[Path, ...]:
+        """Return exact changed paths between two local commits."""
+
+        self._validate_start_point(repository, old_sha)
+        self._validate_start_point(repository, new_sha)
+        result = self._run(
+            repository,
+            (
+                "--no-pager",
+                "diff",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--no-renames",
+                "--name-only",
+                "-z",
+                old_sha,
+                new_sha,
+                "--",
+            ),
+        )
+        self._require_success(result, "Git committed path inspection failed")
+        return _parse_nul_paths(result.stdout)
+
+    def tree_entry(
+        self, repository: GitRepository, commit_sha: str, path: Path | str
+    ) -> GitTreeEntry | None:
+        """Read one literal repository-relative entry from a commit tree."""
+
+        self._validate_start_point(repository, commit_sha)
+        (relative,) = self._normalize_paths(repository, (path,))
+        result = self._run(
+            repository,
+            (
+                "--literal-pathspecs",
+                "ls-tree",
+                "-z",
+                commit_sha,
+                "--",
+                relative.as_posix(),
+            ),
+        )
+        self._require_success(result, "Git tree entry inspection failed")
+        if not result.stdout:
+            return None
+        if not result.stdout.endswith(b"\0") or result.stdout.count(b"\0") != 1:
+            raise GitOutputError("Git returned malformed tree entry output")
+        metadata, separator, raw_path = result.stdout[:-1].partition(b"\t")
+        fields = metadata.split(b" ")
+        if not separator or len(fields) != 3:
+            raise GitOutputError("Git returned malformed tree entry metadata")
+        try:
+            mode, object_type, object_id = (value.decode("ascii") for value in fields)
+        except UnicodeDecodeError as exc:
+            raise GitOutputError("Git returned non-ASCII tree metadata") from exc
+        parsed_path = Path(os.fsdecode(raw_path))
+        if (
+            parsed_path != relative
+            or mode not in {"100644", "100755", "120000", "160000"}
+            or object_type not in {"blob", "commit"}
+            or not _is_object_id(object_id)
+        ):
+            raise GitOutputError("Git returned an invalid tree entry")
+        return GitTreeEntry(mode, object_type, object_id, parsed_path)
+
+    def read_blob(self, repository: GitRepository, object_id: str) -> bytes:
+        """Read bounded raw bytes from one exact local blob object."""
+
+        if not _is_object_id(object_id):
+            raise InvalidGitReferenceError("invalid Git object ID")
+        result = self._run(repository, ("cat-file", "blob", object_id))
+        self._require_success(result, "Git blob read failed")
+        return result.stdout
+
+    def add_worktree(
+        self,
+        repository: GitRepository,
+        workspace: Path | str,
+        branch: str,
+        start_sha: str,
+    ) -> GitWorktreeResult:
+        """Create one new branch in a new local worktree from a pinned commit."""
+
+        self._validate_branch(repository, branch)
+        self._validate_start_point(repository, start_sha)
+        destination = Path(workspace).expanduser().resolve()
+        if destination.exists() or destination.is_symlink():
+            raise GitPathError("worktree destination already exists")
+        if self.local_branch_exists(repository, branch):
+            raise InvalidGitOperationError("local branch already exists")
+        result = self._run(
+            repository,
+            ("worktree", "add", "-b", branch, os.fspath(destination), start_sha),
+            timeout_seconds=self.commit_timeout_seconds,
+        )
+        self._require_success(result, "Git worktree creation failed")
+        return GitWorktreeResult(self.discover_repository(destination), result.receipt)
 
     def stage_paths(self, repository: GitRepository, paths: Iterable[Path | str]) -> CommandReceipt:
         relative_paths = self._normalize_paths(repository, paths)
@@ -466,3 +630,7 @@ def _parse_nul_paths(output: bytes) -> tuple[Path, ...]:
 
 def _sorted_paths(paths: Iterable[Path]) -> tuple[Path, ...]:
     return tuple(sorted(set(paths), key=lambda value: os.fsencode(value)))
+
+
+def _is_object_id(value: str) -> bool:
+    return len(value) in {40, 64} and all(character in "0123456789abcdef" for character in value)
