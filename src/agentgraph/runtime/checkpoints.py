@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import os
 import re
 import secrets
+import stat
 from collections.abc import Callable
 from dataclasses import dataclass, fields
 from datetime import datetime
@@ -159,10 +161,14 @@ class CheckpointStore:
         return nonce
 
     def request_path(self, checkpoint_id: str) -> Path:
-        return self._directory(checkpoint_id) / "request.json"
+        path = self._directory(checkpoint_id) / "request.json"
+        self._verify_regular_file_if_present(path)
+        return path
 
     def decision_path(self, checkpoint_id: str) -> Path:
-        return self._directory(checkpoint_id) / "decision.json"
+        path = self._directory(checkpoint_id) / "decision.json"
+        self._verify_regular_file_if_present(path)
+        return path
 
     def load_request(self, checkpoint_id: str) -> CheckpointRequestRecord | None:
         return self._load(self.request_path(checkpoint_id), CheckpointRequestRecord)
@@ -172,7 +178,11 @@ class CheckpointStore:
 
     def write_request_once(self, record: CheckpointRequestRecord) -> CheckpointRequestRecord:
         path = self.request_path(record.checkpoint_id)
-        with AdvisoryFileLock(path.with_suffix(".lock"), blocking=True):
+        lock_path = path.with_suffix(".lock")
+        self._verify_regular_file_if_present(lock_path)
+        with AdvisoryFileLock(lock_path, blocking=True):
+            path = self.request_path(record.checkpoint_id)
+            self._verify_regular_file_if_present(lock_path)
             existing = self._load(path, CheckpointRequestRecord)
             if existing is not None:
                 return existing
@@ -181,7 +191,11 @@ class CheckpointStore:
 
     def write_decision_once(self, decision: CheckpointDecision) -> None:
         path = self.decision_path(decision.checkpoint_id)
-        with AdvisoryFileLock(path.with_suffix(".lock"), blocking=True):
+        lock_path = path.with_suffix(".lock")
+        self._verify_regular_file_if_present(lock_path)
+        with AdvisoryFileLock(lock_path, blocking=True):
+            path = self.decision_path(decision.checkpoint_id)
+            self._verify_regular_file_if_present(lock_path)
             if path.exists():
                 raise CheckpointStoreError("checkpoint_already_decided")
             atomic_write_bytes(path, canonical_json_bytes(encode_value(decision)))
@@ -193,13 +207,51 @@ class CheckpointStore:
     def _directory(self, checkpoint_id: str) -> Path:
         if not isinstance(checkpoint_id, str) or not _CHECKPOINT_ID.fullmatch(checkpoint_id):
             raise CheckpointStoreError("invalid checkpoint ID")
-        root = (self.run_path / "checkpoints").resolve()
-        candidate = (root / checkpoint_id).resolve()
         try:
-            candidate.relative_to(root)
+            run_root = self.run_path.resolve(strict=True)
+        except OSError as exc:
+            raise CheckpointEvidenceError("checkpoint run storage is invalid") from exc
+        if not run_root.is_dir():
+            raise CheckpointEvidenceError("checkpoint run storage is invalid")
+        root = run_root / "checkpoints"
+        candidate = root / checkpoint_id
+        try:
+            root.relative_to(run_root)
+            candidate.relative_to(run_root)
         except ValueError as exc:
-            raise CheckpointStoreError("checkpoint path escapes run storage") from exc
+            raise CheckpointEvidenceError("checkpoint path escapes run storage") from exc
+        self._verify_directory_if_present(root)
+        self._verify_directory_if_present(candidate)
         return candidate
+
+    @staticmethod
+    def _verify_directory_if_present(path: Path) -> None:
+        metadata = CheckpointStore._lstat_if_present(path)
+        if metadata is None:
+            return
+        if _is_link_or_reparse(metadata):
+            raise CheckpointEvidenceError("checkpoint storage directory is a link")
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise CheckpointEvidenceError("checkpoint storage component is not a directory")
+
+    @staticmethod
+    def _verify_regular_file_if_present(path: Path) -> None:
+        metadata = CheckpointStore._lstat_if_present(path)
+        if metadata is None:
+            return
+        if _is_link_or_reparse(metadata):
+            raise CheckpointEvidenceError("checkpoint evidence file is a link")
+        if not stat.S_ISREG(metadata.st_mode):
+            raise CheckpointEvidenceError("checkpoint evidence path is not a regular file")
+
+    @staticmethod
+    def _lstat_if_present(path: Path) -> os.stat_result | None:
+        try:
+            return path.lstat()
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise CheckpointEvidenceError("checkpoint storage metadata is unreadable") from exc
 
     @staticmethod
     def _load(path: Path, kind: type[CheckpointRequestRecord] | type[CheckpointDecision]):
@@ -209,3 +261,10 @@ class CheckpointStore:
             return decode_value(parse_json_bytes(path.read_bytes()), kind)
         except (OSError, SerializationError, CheckpointEvidenceError, ValueError) as exc:
             raise CheckpointEvidenceError("checkpoint evidence is invalid") from exc
+
+
+def _is_link_or_reparse(metadata: os.stat_result) -> bool:
+    attributes = getattr(metadata, "st_file_attributes", 0)
+    return stat.S_ISLNK(metadata.st_mode) or bool(
+        attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    )

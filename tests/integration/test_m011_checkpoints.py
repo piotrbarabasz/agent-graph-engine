@@ -47,6 +47,38 @@ def _paused(tmp_path, *, risk="critical", requested=False, clock=None):
     return target, instance, change, report
 
 
+def _paused_before_request(tmp_path):
+    transitions = 0
+
+    def fault(stage):
+        nonlocal transitions
+        if stage == "after_transition_committed":
+            transitions += 1
+            if transitions == 7:
+                raise RuntimeError("crash before checkpoint request")
+
+    target = _target(tmp_path)
+    change = CapturingChangeProvider()
+    instance = runner(
+        target,
+        tmp_path / "runtime",
+        RecordingAgentProvider(risk="critical"),
+        change,
+        fault=fault,
+    )
+    with pytest.raises(RuntimeError, match="crash before checkpoint request"):
+        instance.run(WriteSliceRequest(scope_id="E001"))
+    run_path = tmp_path / "runtime" / "projects" / "prj_m008_fixture" / "runs" / "run_m008_fixture"
+    return target, instance, change, run_path
+
+
+def _symlink(link: Path, target: Path, *, directory: bool) -> None:
+    try:
+        link.symlink_to(target, target_is_directory=directory)
+    except OSError as exc:
+        pytest.skip(f"symlink creation unavailable to current user: {exc}")
+
+
 def test_critical_run_pauses_durably_before_checkpoint_node_or_write(tmp_path) -> None:
     target, _, changes, report = _paused(tmp_path)
 
@@ -269,6 +301,39 @@ def test_decision_before_expiry_remains_valid_after_expiry(tmp_path) -> None:
     assert len(changes.requests) == 1
 
 
+def test_backward_clock_rejects_decision_without_persisting_it(tmp_path) -> None:
+    clock = Clock()
+    _, instance, changes, paused = _paused(tmp_path, clock=clock)
+    decision_path = (
+        Path(paused.runtime_path)
+        / "checkpoints"
+        / paused.checkpoint.checkpoint_id
+        / "decision.json"
+    )
+    clock.advance(-60)
+
+    with pytest.raises(CheckpointError, match="checkpoint_time_invalid"):
+        instance.submit_checkpoint(
+            paused.run_id,
+            checkpoint_id=paused.checkpoint.checkpoint_id,
+            nonce=paused.checkpoint.nonce,
+            outcome=CheckpointOutcome.APPROVED,
+            actor="operator",
+        )
+    assert not decision_path.exists()
+    assert changes.requests == []
+
+    clock.advance(60)
+    decision = instance.submit_checkpoint(
+        paused.run_id,
+        checkpoint_id=paused.checkpoint.checkpoint_id,
+        nonce=paused.checkpoint.nonce,
+        outcome=CheckpointOutcome.REJECTED,
+        actor="operator",
+    )
+    assert decision.outcome is CheckpointOutcome.REJECTED
+
+
 def test_target_drift_after_request_prevents_decision_and_implementation(tmp_path) -> None:
     target, instance, changes, paused = _paused(tmp_path)
     (target / "drift.txt").write_text("drift\n", encoding="utf-8")
@@ -350,6 +415,116 @@ def test_checkpoint_evidence_tamper_fails_closed(tmp_path, evidence_name) -> Non
     resumed = instance.resume(paused.run_id)
     assert resumed.outcome is WriteSliceOutcome.RECOVERY_REQUIRED
     assert resumed.issues[0].code == "checkpoint_evidence_invalid"
+    assert changes.requests == []
+
+
+def test_historical_decision_before_request_time_fails_with_valid_self_digest(tmp_path) -> None:
+    _, instance, changes, paused = _paused(tmp_path)
+    instance.submit_checkpoint(
+        paused.run_id,
+        checkpoint_id=paused.checkpoint.checkpoint_id,
+        nonce=paused.checkpoint.nonce,
+        outcome=CheckpointOutcome.APPROVED,
+        actor="operator",
+    )
+    path = (
+        Path(paused.runtime_path)
+        / "checkpoints"
+        / paused.checkpoint.checkpoint_id
+        / "decision.json"
+    )
+    document = json.loads(path.read_text(encoding="utf-8"))
+    document["decided_at"] = "2029-12-31T23:59:00Z"
+    document["decision_digest"] = sha256_digest(
+        {key: value for key, value in document.items() if key != "decision_digest"}
+    )
+    path.write_text(json.dumps(document), encoding="utf-8")
+
+    resumed = instance.resume(paused.run_id)
+    assert resumed.outcome is WriteSliceOutcome.RECOVERY_REQUIRED
+    assert resumed.issues[0].code == "checkpoint_binding_mismatch"
+    assert changes.requests == []
+
+
+def test_checkpoint_root_symlink_never_redirects_request_write(tmp_path) -> None:
+    _, instance, changes, run_path = _paused_before_request(tmp_path)
+    external = tmp_path / "external-root"
+    external.mkdir()
+    sentinel = external / "sentinel.txt"
+    sentinel.write_text("unchanged", encoding="utf-8")
+    _symlink(run_path / "checkpoints", external, directory=True)
+
+    resumed = instance.resume("run_m008_fixture")
+
+    assert resumed.outcome is WriteSliceOutcome.RECOVERY_REQUIRED
+    assert resumed.issues[0].code == "checkpoint_evidence_invalid"
+    assert not (external / "checkpoint-7-implement" / "request.json").exists()
+    assert sentinel.read_text(encoding="utf-8") == "unchanged"
+    assert changes.requests == []
+
+
+def test_checkpoint_directory_symlink_never_redirects_request_write(tmp_path) -> None:
+    _, instance, changes, run_path = _paused_before_request(tmp_path)
+    checkpoint_root = run_path / "checkpoints"
+    checkpoint_root.mkdir()
+    external = tmp_path / "external-checkpoint"
+    external.mkdir()
+    sentinel = external / "sentinel.txt"
+    sentinel.write_text("unchanged", encoding="utf-8")
+    _symlink(checkpoint_root / "checkpoint-7-implement", external, directory=True)
+
+    resumed = instance.resume("run_m008_fixture")
+
+    assert resumed.outcome is WriteSliceOutcome.RECOVERY_REQUIRED
+    assert resumed.issues[0].code == "checkpoint_evidence_invalid"
+    assert not (external / "request.json").exists()
+    assert sentinel.read_text(encoding="utf-8") == "unchanged"
+    assert changes.requests == []
+
+
+def test_request_symlink_fails_closed_without_reading_redirect_target(tmp_path) -> None:
+    _, instance, changes, paused = _paused(tmp_path)
+    request_path = (
+        Path(paused.runtime_path) / "checkpoints" / paused.checkpoint.checkpoint_id / "request.json"
+    )
+    request_path.unlink()
+    external = tmp_path / "external-request.json"
+    external.write_text("unchanged", encoding="utf-8")
+    _symlink(request_path, external, directory=False)
+
+    resumed = instance.resume(paused.run_id)
+
+    assert resumed.outcome is WriteSliceOutcome.RECOVERY_REQUIRED
+    assert resumed.issues[0].code == "checkpoint_evidence_invalid"
+    assert external.read_text(encoding="utf-8") == "unchanged"
+    assert changes.requests == []
+
+
+def test_decision_symlink_blocks_submit_and_resume_without_redirect_write(tmp_path) -> None:
+    _, instance, changes, paused = _paused(tmp_path)
+    decision_path = (
+        Path(paused.runtime_path)
+        / "checkpoints"
+        / paused.checkpoint.checkpoint_id
+        / "decision.json"
+    )
+    external = tmp_path / "external-decision.json"
+    external.write_text("unchanged", encoding="utf-8")
+    _symlink(decision_path, external, directory=False)
+
+    with pytest.raises(CheckpointError, match="checkpoint_evidence_invalid"):
+        instance.submit_checkpoint(
+            paused.run_id,
+            checkpoint_id=paused.checkpoint.checkpoint_id,
+            nonce=paused.checkpoint.nonce,
+            outcome=CheckpointOutcome.APPROVED,
+            actor="operator",
+        )
+    resumed = instance.resume(paused.run_id)
+
+    assert resumed.outcome is WriteSliceOutcome.RECOVERY_REQUIRED
+    assert resumed.issues[0].code == "checkpoint_evidence_invalid"
+    assert external.read_text(encoding="utf-8") == "unchanged"
     assert changes.requests == []
 
 

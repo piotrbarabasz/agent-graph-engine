@@ -110,7 +110,11 @@ class WriteCheckpointController:
         if not isinstance(actor, str) or not actor.strip() or "\x00" in actor or len(actor) > 256:
             raise CheckpointError("checkpoint_actor_invalid")
         decided_at = self._now()
-        if decided_at > parse_timestamp(request.expires_at):
+        created_at = parse_timestamp(request.created_at)
+        expires_at = parse_timestamp(request.expires_at)
+        if decided_at < created_at:
+            raise CheckpointError("checkpoint_time_invalid")
+        if decided_at > expires_at:
             raise CheckpointError("checkpoint_expired")
         try:
             decision = CheckpointDecision.create(
@@ -144,6 +148,7 @@ class WriteCheckpointController:
             decision.checkpoint_id != request.checkpoint_id
             or decision.request_digest != request.request_digest
             or decision.nonce != request.nonce
+            or parse_timestamp(decision.decided_at) < parse_timestamp(request.created_at)
             or parse_timestamp(decision.decided_at) > parse_timestamp(request.expires_at)
         ):
             raise CheckpointBindingError("checkpoint_binding_mismatch")
