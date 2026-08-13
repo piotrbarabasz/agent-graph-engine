@@ -7,7 +7,7 @@ import json
 from dataclasses import dataclass
 from enum import StrEnum
 
-from agentgraph.core import FailureCategory, GraphState, RepairClassification
+from agentgraph.core import FailureCategory, GraphState, RepairClassification, RiskLevel
 from agentgraph.runtime.codec import sha256_digest
 from agentgraph.work import RepoPathSpec, ValidationCheck, WorkPackage
 
@@ -222,6 +222,38 @@ class RepairValidationDiagnostic:
 
 
 @dataclass(frozen=True, slots=True)
+class SemanticReviewContext:
+    cycle: int
+    item_id: str
+    scope_id: str
+    goal: str
+    current_manifest_digest: str
+    current_changed_paths: tuple[str, ...]
+    effective_requirements: tuple[str, ...]
+    effective_acceptance_criteria: tuple[str, ...]
+    architecture_invariants: tuple[str, ...]
+    derived_constraints: tuple[str, ...]
+    validation_diagnostics: tuple[RepairValidationDiagnostic, ...]
+    allowed_paths: tuple[RepoPathSpec, ...]
+    baseline_head: str
+    source_revision: str
+    risk_level: RiskLevel
+    relevant_files: tuple[str, ...]
+    digest: str
+
+    @classmethod
+    def create(cls, **values) -> SemanticReviewContext:
+        return cls(**values, digest=sha256_digest(values))
+
+    def __post_init__(self) -> None:
+        values = {
+            field: getattr(self, field) for field in self.__dataclass_fields__ if field != "digest"
+        }
+        if self.digest != sha256_digest(values):
+            raise ChangeSetError("semantic review context digest is invalid")
+
+
+@dataclass(frozen=True, slots=True)
 class WriteInputs:
     project_id: str
     package: WorkPackage
@@ -234,6 +266,7 @@ class WriteInputs:
     scope_required_checks: tuple[ValidationCheck, ...]
     capability_fingerprint: str
     max_repair_cycles: int = 0
+    semantic_review_enabled: bool = False
 
 
 class WriteSliceOutcome(StrEnum):

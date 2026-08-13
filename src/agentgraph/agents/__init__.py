@@ -6,9 +6,14 @@ from .analysis_models import (
     AgentTaskPackage,
     ExploreAnalysis,
     FailureClassificationAnalysis,
+    SemanticReviewAnalysis,
+    SemanticReviewFinding,
+    SemanticReviewFindingKind,
+    SemanticReviewVerdict,
     parse_explore_payload,
     parse_failure_classification_payload,
     parse_risk_payload,
+    parse_semantic_review_payload,
     parse_task_package_payload,
 )
 from .errors import (
@@ -35,6 +40,7 @@ from .schemas import (
     AGENT_TASK_PACKAGE_SCHEMA,
     EXPLORE_ANALYSIS_SCHEMA,
     FAILURE_CLASSIFICATION_SCHEMA,
+    SEMANTIC_REVIEW_SCHEMA,
 )
 
 __all__ = [
@@ -42,6 +48,7 @@ __all__ = [
     "AGENT_TASK_PACKAGE_SCHEMA",
     "EXPLORE_ANALYSIS_SCHEMA",
     "FAILURE_CLASSIFICATION_SCHEMA",
+    "SEMANTIC_REVIEW_SCHEMA",
     "AgentAnalysisDriftError",
     "AgentAnalysisStatus",
     "AgentContext",
@@ -61,10 +68,15 @@ __all__ = [
     "DeclaredWorkAgentProvider",
     "ExploreAnalysis",
     "FailureClassificationAnalysis",
+    "SemanticReviewAnalysis",
+    "SemanticReviewFinding",
+    "SemanticReviewFindingKind",
+    "SemanticReviewVerdict",
     "effective_risk",
     "parse_explore_payload",
     "parse_failure_classification_payload",
     "parse_risk_payload",
+    "parse_semantic_review_payload",
     "parse_task_package_payload",
     "reconcile_explore",
     "reconcile_task_package",

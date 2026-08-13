@@ -10,6 +10,7 @@ from agentgraph.agents import (
     AgentError,
     AgentEvidenceError,
     AgentMutationError,
+    AgentResponseContractError,
     AgentResponseError,
     stable_union,
 )
@@ -41,6 +42,7 @@ from agentgraph.write.errors import (
     ChangePathError,
     ChangeProviderBlockedError,
     PostCommitRecoveryRequired,
+    SemanticReviewBlockedError,
     StaleFileError,
     WriteBaselineDriftError,
     WriteSliceError,
@@ -457,16 +459,62 @@ class ReviewNode:
     node_id: str = "REVIEW"
 
     def run(self, state: GraphState, context: NodeContext) -> NodeResult:
+        cycle = state.repair.count
         try:
-            cycle = state.repair.count
-            passed, findings = self.execution.review(cycle)
-        except WriteSliceError as exc:
+            passed, findings, failure_code = self.execution.review(
+                state, cycle, context.node_attempt_id
+            )
+        except SemanticReviewBlockedError as exc:
+            self.execution.issue_code = exc.reason_code
+            return _blocked(
+                self.node_id,
+                context,
+                exc.reason_code,
+                exc.message,
+                (Evidence("review", _cycle_reference(cycle, "review.json")),),
+            )
+        except AgentAnalysisDriftError as exc:
+            return _agent_failure(self.node_id, context, exc, self.execution.analysis)
+        except AgentResponseContractError as exc:
+            self.execution.issue_code = exc.code
             return _failed(
                 self.node_id,
                 context,
-                _error_code(exc),
+                exc.code,
+                str(exc),
+                FailureCategory.CONTRACT,
+            )
+        except AgentMutationError as exc:
+            self.execution.issue_code = exc.code
+            return _failed(
+                self.node_id,
+                context,
+                "agent_provider_mutated_repository",
                 str(exc),
                 FailureCategory.INFRASTRUCTURE,
+            )
+        except AgentError as exc:
+            self.execution.issue_code = getattr(exc, "code", "agent_invocation_failed")
+            return _failed(
+                self.node_id,
+                context,
+                self.execution.issue_code,
+                str(exc),
+                FailureCategory.INFRASTRUCTURE,
+            )
+        except WriteSliceError as exc:
+            self.execution.issue_code = _error_code(exc)
+            category = (
+                FailureCategory.CONTRACT
+                if getattr(exc, "code", None) == "codex_response_invalid"
+                else FailureCategory.INFRASTRUCTURE
+            )
+            return _failed(
+                self.node_id,
+                context,
+                self.execution.issue_code,
+                str(exc),
+                category,
             )
         except Exception:
             return _failed(
@@ -487,7 +535,9 @@ class ReviewNode:
             operations.extend(
                 (
                     PatchOperation.set("failure.category", FailureCategory.VALIDATION),
-                    PatchOperation.set("failure.code", "deterministic_review_failed"),
+                    PatchOperation.set(
+                        "failure.code", failure_code or "deterministic_review_failed"
+                    ),
                 )
             )
         else:

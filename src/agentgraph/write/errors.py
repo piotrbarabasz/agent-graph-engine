@@ -82,3 +82,22 @@ class RepairWorkspaceLineageError(WorkspaceError):
 
 class WorkspaceManifestError(WorkspaceError):
     code = "workspace_manifest_invalid"
+
+
+class SemanticReviewContextError(WorkspaceError):
+    code = "semantic_review_context_mismatch"
+
+
+class SemanticReviewEvidenceError(WorkspaceError):
+    code = "semantic_review_evidence_mismatch"
+
+
+class SemanticReviewBlockedError(WriteSliceError):
+    def __init__(self, reason_code: str, message: str) -> None:
+        self.reason_code = reason_code
+        self.message = message
+        super().__init__(message)
+
+
+class ReviewProviderRequiredError(WritePreparationError):
+    code = "review_provider_required"
