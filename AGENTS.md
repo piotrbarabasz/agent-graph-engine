@@ -60,8 +60,8 @@
 - LLM read-only nodes analyze repository state but never own capabilities or transitions.
 - Source work declarations remain authoritative and cannot be weakened by agent output. Agent
   recommendations may narrow write scope but never expand it.
-- Effective risk is `max(source risk, agent risk)`; a critical result or checkpoint request blocks
-  because M008 does not implement human approval.
+- Effective risk is `max(source risk, agent risk)`; critical risk and explicit agent checkpoint
+  requests route through the canonical `HUMAN_CHECKPOINT` node.
 - Read-only agents reuse the M007 restricted Codex sandbox and are guarded by host-side target Git
   and WorkSource revision snapshots around every invocation.
 - Rich agent output remains immutable attempt-scoped evidence; GraphState receives only bounded,
@@ -94,3 +94,13 @@
   signals. Completed review evidence is cycle-aware and bound to the exact current manifest.
 - Reviewer mutation of the dirty worktree is detected by the content-hash manifest guard and is
   preserved for diagnosis without automatic cleanup.
+- Checkpoint transitions pause execution before `HUMAN_CHECKPOINT` until a durable human decision
+  exists. Decisions are immutable, nonce-bound, actor-attributed, expiring, single-use records
+  stored outside the target repository.
+- Checkpoint approval binds the exact GraphState, WriteInputs/package, source revision, baseline
+  commit/tree, capability fingerprint, and current operation state. It never weakens later live
+  rechecks, capability checks, validation, or review.
+- `HUMAN_CHECKPOINT` is safely rerunnable only because the external decision is persisted before
+  node invocation and the node itself only reads and verifies immutable evidence.
+- M011 does not implement `DELIVERY_REVIEW`, `CREATE_PR`, push, merge, remote approval, or M012
+  multi-item execution.

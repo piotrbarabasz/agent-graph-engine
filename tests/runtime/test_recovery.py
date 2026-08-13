@@ -68,6 +68,7 @@ def record_result(engine, journal, state, result):
     ("node_id", "expected"),
     [
         ("EXPLORE", RecoveryAction.RERUN_INTERRUPTED_NODE),
+        ("HUMAN_CHECKPOINT", RecoveryAction.RERUN_INTERRUPTED_NODE),
         ("IMPLEMENT", RecoveryAction.BLOCKED),
     ],
 )
@@ -82,6 +83,7 @@ def test_interrupted_node_recovery_depends_on_capability(tmp_path, node_id, expe
     assert CANONICAL_V1_GRAPH.node(node_id).node_type in {
         NodeType.LLM_READ_ONLY,
         NodeType.LLM_WRITE,
+        NodeType.HUMAN_CHECKPOINT,
     }
     assert assessment.action is expected
 

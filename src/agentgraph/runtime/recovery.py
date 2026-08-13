@@ -164,7 +164,11 @@ class RecoveryManager:
         if node_id != state.graph.current_node:
             return self._blocked("started_attempt_node_mismatch", state, records)
         node_type = self.engine.graph.node(node_id).node_type
-        if node_type in {NodeType.DETERMINISTIC, NodeType.LLM_READ_ONLY}:
+        if node_type in {
+            NodeType.DETERMINISTIC,
+            NodeType.LLM_READ_ONLY,
+            NodeType.HUMAN_CHECKPOINT,
+        }:
             return self._assessment(
                 RecoveryAction.RERUN_INTERRUPTED_NODE,
                 "safe_capability_rerun",

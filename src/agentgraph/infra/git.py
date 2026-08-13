@@ -298,6 +298,17 @@ class GitAdapter:
             raise GitOutputError("Git returned invalid commit parent output")
         return tuple(fields[1:])
 
+    def commit_tree_id(self, repository: GitRepository, commit_sha: str) -> str:
+        """Return the exact tree object ID for one local commit without mutation."""
+
+        self._validate_start_point(repository, commit_sha)
+        result = self._run(repository, ("rev-parse", "--verify", f"{commit_sha}^{{tree}}"))
+        self._require_success(result, "Git commit tree inspection failed")
+        tree_id = self._single_text(result)
+        if not _is_object_id(tree_id):
+            raise GitOutputError("Git returned an invalid commit tree ID")
+        return tree_id
+
     def diff_paths_between(
         self, repository: GitRepository, old_sha: str, new_sha: str
     ) -> tuple[Path, ...]:

@@ -101,3 +101,17 @@ class SemanticReviewBlockedError(WriteSliceError):
 
 class ReviewProviderRequiredError(WritePreparationError):
     code = "review_provider_required"
+
+
+class CheckpointError(WriteSliceError):
+    """A durable human checkpoint operation failed closed."""
+
+    code = "checkpoint_error"
+
+    def __init__(self, code: str, message: str | None = None) -> None:
+        self.code = code
+        super().__init__(message or code)
+
+
+class CheckpointBindingError(CheckpointError):
+    pass

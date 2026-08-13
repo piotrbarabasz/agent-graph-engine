@@ -164,7 +164,7 @@ def test_repository_root_mismatch_returns_typed_early_report(tmp_path) -> None:
     assert report.issues[0].code == "repository_root_mismatch"
 
 
-def test_active_scope_and_critical_item_are_blocked_without_worktree(tmp_path) -> None:
+def test_active_scope_blocks_without_worktree(tmp_path) -> None:
     active_root = tmp_path / "active"
     active_root.mkdir()
     active = active_root / "target"
@@ -174,6 +174,8 @@ def test_active_scope_and_critical_item_are_blocked_without_worktree(tmp_path) -
     assert active_report.run_id is None
     assert active_report.issues[0].code == "active_scope_write_not_supported_in_m006"
 
+
+def test_critical_pauses(tmp_path) -> None:
     critical_root = tmp_path / "critical"
     critical_root.mkdir()
     critical = _target(critical_root)
@@ -187,9 +189,10 @@ def test_active_scope_and_critical_item_are_blocked_without_worktree(tmp_path) -
     critical_report = _runner(critical, critical_root / "runtime").run(
         WriteSliceRequest(scope_id="E001")
     )
-    assert critical_report.outcome is WriteSliceOutcome.BLOCKED
-    assert critical_report.run_id is None
-    assert critical_report.issues[0].code == "critical_risk_not_supported_in_m006"
+    assert critical_report.outcome is WriteSliceOutcome.CHECKPOINT_REQUIRED
+    assert critical_report.run_id == "run_m006_fixture"
+    assert critical_report.checkpoint is not None
+    assert critical_report.workspace_path is None
 
 
 def test_out_of_scope_proposal_fails_without_commit(tmp_path) -> None:

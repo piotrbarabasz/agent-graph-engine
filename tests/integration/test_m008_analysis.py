@@ -107,7 +107,7 @@ class CapturingChangeProvider:
         return ChangeSet.create((FileChange("src/t001.py", None, "value = 8\n"),))
 
 
-def runner(target: Path, runtime: Path, agent, change=None, fault=None):
+def runner(target: Path, runtime: Path, agent, change=None, fault=None, **options):
     paths = RuntimePaths.resolve(runtime)
     adapter = GitAdapter(executable=shutil.which("git") or "git")
     return WriteSliceRunner(
@@ -120,6 +120,7 @@ def runner(target: Path, runtime: Path, agent, change=None, fault=None):
         commit_identity=GitCommitIdentity("M008 Test", "m008@example.test"),
         run_id_factory=lambda: "run_m008_fixture",
         fault=fault,
+        **options,
     )
 
 
@@ -178,7 +179,7 @@ def test_task_package_cannot_expand_scope_before_implement(tmp_path) -> None:
     ]
 
 
-def test_agent_risk_escalates_and_checkpoint_blocks_implement(tmp_path) -> None:
+def test_agent_risk_escalates_and_checkpoint_pauses_before_implement(tmp_path) -> None:
     target = _target(tmp_path)
     agent = RecordingAgentProvider(risk="critical")
     change = CapturingChangeProvider()
@@ -187,13 +188,14 @@ def test_agent_risk_escalates_and_checkpoint_blocks_implement(tmp_path) -> None:
         WriteSliceRequest(scope_id="E001")
     )
 
-    assert report.outcome is WriteSliceOutcome.BLOCKED
-    assert report.issues[0].code == "human_checkpoint_required_not_supported_in_m008"
+    assert report.outcome is WriteSliceOutcome.CHECKPOINT_REQUIRED
+    assert report.checkpoint is not None
+    assert report.graph_state.risk.level is RiskLevel.CRITICAL
     assert change.requests == []
     assert not (Path(report.runtime_path or "") / "workspace").exists()
 
 
-def test_agent_checkpoint_request_blocks_even_below_critical(tmp_path) -> None:
+def test_agent_checkpoint_request_escalates_even_below_critical(tmp_path) -> None:
     target = _target(tmp_path)
     change = CapturingChangeProvider()
 
@@ -204,8 +206,9 @@ def test_agent_checkpoint_request_blocks_even_below_critical(tmp_path) -> None:
         change,
     ).run(WriteSliceRequest(scope_id="E001"))
 
-    assert report.outcome is WriteSliceOutcome.BLOCKED
-    assert report.issues[0].code == "human_checkpoint_required_not_supported_in_m008"
+    assert report.outcome is WriteSliceOutcome.CHECKPOINT_REQUIRED
+    assert report.checkpoint is not None
+    assert report.graph_state.risk.level is RiskLevel.CRITICAL
     assert change.requests == []
 
 
