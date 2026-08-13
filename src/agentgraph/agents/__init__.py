@@ -5,7 +5,9 @@ from .analysis_models import (
     AgentRiskAssessment,
     AgentTaskPackage,
     ExploreAnalysis,
+    FailureClassificationAnalysis,
     parse_explore_payload,
+    parse_failure_classification_payload,
     parse_risk_payload,
     parse_task_package_payload,
 )
@@ -32,12 +34,14 @@ from .schemas import (
     AGENT_RISK_ASSESSMENT_SCHEMA,
     AGENT_TASK_PACKAGE_SCHEMA,
     EXPLORE_ANALYSIS_SCHEMA,
+    FAILURE_CLASSIFICATION_SCHEMA,
 )
 
 __all__ = [
     "AGENT_RISK_ASSESSMENT_SCHEMA",
     "AGENT_TASK_PACKAGE_SCHEMA",
     "EXPLORE_ANALYSIS_SCHEMA",
+    "FAILURE_CLASSIFICATION_SCHEMA",
     "AgentAnalysisDriftError",
     "AgentAnalysisStatus",
     "AgentContext",
@@ -56,8 +60,10 @@ __all__ = [
     "AgentTaskPackage",
     "DeclaredWorkAgentProvider",
     "ExploreAnalysis",
+    "FailureClassificationAnalysis",
     "effective_risk",
     "parse_explore_payload",
+    "parse_failure_classification_payload",
     "parse_risk_payload",
     "parse_task_package_payload",
     "reconcile_explore",

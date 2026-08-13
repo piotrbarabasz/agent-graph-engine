@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
 
-from agentgraph.core import RiskLevel
+from agentgraph.core import RepairClassification, RiskLevel
 from agentgraph.runtime.codec import canonical_json_bytes
 
 from .errors import AgentResponseContractError
@@ -64,6 +64,17 @@ class AgentRiskAssessment:
     sensitive_areas: tuple[str, ...]
     destructive_change_concerns: tuple[str, ...]
     requests_human_checkpoint: bool
+    reason_code: str | None
+    message: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class FailureClassificationAnalysis:
+    schema_version: int
+    status: AgentAnalysisStatus
+    classification: RepairClassification | None
+    rationale: str | None
+    signals: tuple[str, ...]
     reason_code: str | None
     message: str | None
 
@@ -177,6 +188,47 @@ def parse_risk_payload(value: Any) -> AgentRiskAssessment:
     _status_fields(status, result.reason_code, result.message)
     if status is AgentAnalysisStatus.SUCCESS and risk is None:
         raise AgentResponseContractError("successful risk assessment needs a risk level")
+    return result
+
+
+def parse_failure_classification_payload(value: Any) -> FailureClassificationAnalysis:
+    fields = {
+        "schema_version",
+        "status",
+        "classification",
+        "rationale",
+        "signals",
+        "reason_code",
+        "message",
+    }
+    document = _document(value, fields)
+    status = _status(document)
+    raw = document["classification"]
+    try:
+        classification = None if raw is None else RepairClassification(raw)
+    except (TypeError, ValueError) as exc:
+        raise AgentResponseContractError("failure classification is invalid") from exc
+    rationale = document["rationale"]
+    if rationale is not None:
+        _text(rationale, "rationale")
+    result = FailureClassificationAnalysis(
+        1,
+        status,
+        classification,
+        rationale,
+        _strings(document, "signals"),
+        document["reason_code"],
+        document["message"],
+    )
+    _status_fields(status, result.reason_code, result.message)
+    if status is AgentAnalysisStatus.SUCCESS and (classification is None or rationale is None):
+        raise AgentResponseContractError(
+            "successful failure classification requires route and rationale"
+        )
+    if status is AgentAnalysisStatus.BLOCKED and (
+        classification is not None or rationale is not None
+    ):
+        raise AgentResponseContractError("blocked failure classification cannot select a route")
     return result
 
 

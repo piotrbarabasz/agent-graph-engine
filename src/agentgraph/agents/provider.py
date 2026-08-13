@@ -59,6 +59,16 @@ class DeclaredWorkAgentProvider:
                 "reason_code": None,
                 "message": None,
             }
+        elif request.operation_id == "classify_failure":
+            payload = {
+                "schema_version": 1,
+                "status": "success",
+                "classification": "debugger",
+                "rationale": "Validation evidence indicates a bounded implementation defect.",
+                "signals": ["validation_failed"],
+                "reason_code": None,
+                "message": None,
+            }
         else:
             raise ValueError("unsupported declared-work agent operation")
         return AgentResponse(

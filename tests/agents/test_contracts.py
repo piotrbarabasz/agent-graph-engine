@@ -6,11 +6,14 @@ import pytest
 
 from agentgraph.agents import (
     EXPLORE_ANALYSIS_SCHEMA,
+    FAILURE_CLASSIFICATION_SCHEMA,
     AgentRequest,
     AgentResponse,
     AgentResponseContractError,
     parse_explore_payload,
+    parse_failure_classification_payload,
 )
+from agentgraph.core import RepairClassification
 from agentgraph.runtime.codec import sha256_digest
 
 
@@ -85,3 +88,40 @@ def test_agent_contract_module_has_no_codex_coupling() -> None:
     assert "providers.codex" not in "\n".join(
         path.read_text(encoding="utf-8") for path in root.glob("*.py")
     )
+
+
+def test_failure_classification_contract_is_strict_and_provider_neutral() -> None:
+    payload = {
+        "schema_version": 1,
+        "status": "success",
+        "classification": "debugger",
+        "rationale": "The validation receipt indicates a logic defect.",
+        "signals": ["validation_failed"],
+        "reason_code": None,
+        "message": None,
+    }
+
+    parsed = parse_failure_classification_payload(payload)
+
+    assert parsed.classification is RepairClassification.DEBUGGER
+    assert FAILURE_CLASSIFICATION_SCHEMA["additionalProperties"] is False
+    with pytest.raises(AgentResponseContractError):
+        parse_failure_classification_payload({**payload, "next_node": "DEBUGGER"})
+    with pytest.raises(AgentResponseContractError):
+        parse_failure_classification_payload({**payload, "classification": None})
+
+
+def test_blocked_failure_classification_cannot_select_a_route() -> None:
+    payload = {
+        "schema_version": 1,
+        "status": "blocked",
+        "classification": None,
+        "rationale": None,
+        "signals": [],
+        "reason_code": "insufficient_evidence",
+        "message": "A safe route cannot be selected.",
+    }
+
+    assert parse_failure_classification_payload(payload).classification is None
+    with pytest.raises(AgentResponseContractError):
+        parse_failure_classification_payload({**payload, "classification": "programmer"})

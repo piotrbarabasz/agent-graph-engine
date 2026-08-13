@@ -8,6 +8,7 @@ from agentgraph.agents import (
     AgentRequest,
     AgentResponse,
     parse_explore_payload,
+    parse_failure_classification_payload,
     parse_risk_payload,
     parse_task_package_payload,
 )
@@ -71,6 +72,7 @@ class CodexAgentProvider(AgentProvider):
             "agentgraph.explore.v1": parse_explore_payload,
             "agentgraph.task-package.v1": parse_task_package_payload,
             "agentgraph.risk.v1": parse_risk_payload,
+            "agentgraph.failure-classification.v1": parse_failure_classification_payload,
         }.get(request.output_schema_id)
         if parser is None:
             raise ValueError("unsupported Codex agent schema ID")

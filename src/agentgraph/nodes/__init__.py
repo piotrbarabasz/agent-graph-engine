@@ -15,6 +15,7 @@ from .write_slice import (
     ExploreNode,
     ImplementNode,
     MoreWorkNode,
+    RepairNode,
     ReviewNode,
     ValidateNode,
 )
@@ -30,6 +31,7 @@ __all__ = [
     "ImplementNode",
     "MoreWorkNode",
     "PreflightNode",
+    "RepairNode",
     "ReviewNode",
     "SelectWorkNode",
     "StartNode",

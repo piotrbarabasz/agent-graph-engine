@@ -14,6 +14,11 @@ class ChangeProviderContext:
     repository_root: Path
     runtime_directory: Path
     baseline_head: str
+    run_id: str | None = None
+    node_id: str | None = None
+    node_attempt_id: str | None = None
+    provider_invocation_id: str | None = None
+    repair_cycle: int = 0
 
 
 class ChangeProvider(Protocol):

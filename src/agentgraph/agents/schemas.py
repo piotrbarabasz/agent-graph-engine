@@ -72,3 +72,39 @@ AGENT_RISK_ASSESSMENT_SCHEMA = _root(
         "message": _MESSAGE,
     }
 )
+
+FAILURE_CLASSIFICATION_SCHEMA = _root(
+    {
+        "schema_version": {"const": 1},
+        "status": _STATUS,
+        "classification": {"enum": ["programmer", "debugger", None]},
+        "rationale": {"type": ["string", "null"], "maxLength": MAX_TEXT_LENGTH},
+        "signals": _strings(),
+        "reason_code": _REASON,
+        "message": _MESSAGE,
+    }
+)
+FAILURE_CLASSIFICATION_SCHEMA["allOf"] = [
+    {
+        "if": {"properties": {"status": {"const": "success"}}},
+        "then": {
+            "properties": {
+                "classification": {"enum": ["programmer", "debugger"]},
+                "rationale": {"type": "string", "minLength": 1, "maxLength": MAX_TEXT_LENGTH},
+                "reason_code": {"type": "null"},
+                "message": {"type": "null"},
+            }
+        },
+    },
+    {
+        "if": {"properties": {"status": {"const": "blocked"}}},
+        "then": {
+            "properties": {
+                "classification": {"type": "null"},
+                "rationale": {"type": "null"},
+                "reason_code": {"type": "string", "minLength": 1, "maxLength": 128},
+                "message": {"type": "string", "minLength": 1, "maxLength": MAX_TEXT_LENGTH},
+            }
+        },
+    },
+]

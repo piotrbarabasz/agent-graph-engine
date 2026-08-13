@@ -12,6 +12,7 @@ from agentgraph.agents import (
     AGENT_RISK_ASSESSMENT_SCHEMA,
     AGENT_TASK_PACKAGE_SCHEMA,
     EXPLORE_ANALYSIS_SCHEMA,
+    FAILURE_CLASSIFICATION_SCHEMA,
     AgentAnalysisDriftError,
     AgentAnalysisStatus,
     AgentContext,
@@ -25,8 +26,10 @@ from agentgraph.agents import (
     AgentRiskAssessment,
     AgentTaskPackage,
     ExploreAnalysis,
+    FailureClassificationAnalysis,
     effective_risk,
     parse_explore_payload,
+    parse_failure_classification_payload,
     parse_risk_payload,
     parse_task_package_payload,
     reconcile_explore,
@@ -46,7 +49,7 @@ from .models import WriteInputs
 @dataclass(frozen=True, slots=True)
 class AnalysisResult:
     response: AgentResponse
-    value: ExploreAnalysis | AgentTaskPackage | AgentRiskAssessment
+    value: ExploreAnalysis | AgentTaskPackage | AgentRiskAssessment | FailureClassificationAnalysis
     evidence_reference: str
 
 
@@ -117,6 +120,34 @@ class AgentExecution:
             return result, None
         return result, effective_risk(self.inputs.package.risk, result.value)
 
+    def classify_failure(
+        self,
+        node_attempt_id: str,
+        prompt: str,
+        *,
+        repository_root: Path,
+        expected_workspace_digest: str,
+        workspace_digest: Callable[[], str],
+    ) -> AnalysisResult:
+        request = AgentRequest.create(
+            "classify_failure",
+            prompt,
+            FAILURE_CLASSIFICATION_SCHEMA,
+            "agentgraph.failure-classification.v1",
+        )
+        result = self._invoke(
+            "CLASSIFY_FAILURE",
+            node_attempt_id,
+            request,
+            parse_failure_classification_payload,
+            lambda root, value: value,
+            repository_root=repository_root,
+            expected_workspace_digest=expected_workspace_digest,
+            workspace_digest=workspace_digest,
+        )
+        assert isinstance(result.value, FailureClassificationAnalysis)
+        return result
+
     def prepare_implementation(self, state: GraphState) -> None:
         """Bind IMPLEMENT context to the exact durable GraphState and Explore evidence."""
 
@@ -170,15 +201,24 @@ class AgentExecution:
         request: AgentRequest,
         parser: Callable[[Any], Any],
         reconciler: Callable[[Path, Any], Any],
+        *,
+        repository_root: Path | None = None,
+        expected_workspace_digest: str | None = None,
+        workspace_digest: Callable[[], str] | None = None,
     ) -> AnalysisResult:
         before = self._pinned_snapshot()
+        selected_root = self.target.root if repository_root is None else repository_root
+        if (expected_workspace_digest is None) is not (workspace_digest is None):
+            raise AgentContextError("workspace manifest guard is incomplete")
+        if workspace_digest is not None and workspace_digest() != expected_workspace_digest:
+            raise AgentMutationError("repair_workspace_lineage_mismatch")
         provider_invocation_id, attempt_dir = self._attempt_directory(node_id, node_attempt_id)
         context = AgentContext(
             self.inputs.project_id,
             self.run_id,
             node_id,
             node_attempt_id,
-            self.target.root,
+            selected_root,
             attempt_dir,
             self.inputs.baseline_head,
             self.inputs.source_revision,
@@ -194,6 +234,17 @@ class AgentExecution:
         if _repository_semantics(after) != _repository_semantics(before):
             self.issue_code = AgentMutationError.code
             raise AgentMutationError("agent_provider_mutated_repository") from provider_error
+        if workspace_digest is not None:
+            try:
+                workspace_unchanged = workspace_digest() == expected_workspace_digest
+            except Exception as exc:
+                self.issue_code = AgentMutationError.code
+                raise AgentMutationError("agent_provider_mutated_repository") from (
+                    provider_error or exc
+                )
+            if not workspace_unchanged:
+                self.issue_code = AgentMutationError.code
+                raise AgentMutationError("agent_provider_mutated_repository") from provider_error
         try:
             self._verify_source()
         except AgentAnalysisDriftError:
@@ -205,7 +256,7 @@ class AgentExecution:
             raise AgentResponseContractError("AgentProvider returned a non-AgentResponse value")
         if response.input_digest != request.input_digest:
             raise AgentResponseContractError("agent response input digest mismatch")
-        value = reconciler(self.target.root, parser(dict(response.payload)))
+        value = reconciler(selected_root, parser(dict(response.payload)))
         reference = self._persist_host_evidence(
             node_id,
             node_attempt_id,

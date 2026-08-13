@@ -7,7 +7,8 @@ import json
 from dataclasses import dataclass
 from enum import StrEnum
 
-from agentgraph.core import GraphState
+from agentgraph.core import FailureCategory, GraphState, RepairClassification
+from agentgraph.runtime.codec import sha256_digest
 from agentgraph.work import RepoPathSpec, ValidationCheck, WorkPackage
 
 from .errors import ChangeSetError
@@ -57,6 +58,18 @@ class ChangeSet:
         return cls(changes, changeset_digest(changes))
 
 
+class ChangeIntent(StrEnum):
+    IMPLEMENT = "implement"
+    PROGRAMMER_REPAIR = "programmer_repair"
+    DEBUGGER = "debugger"
+
+
+class RepairValidationDiagnosticKind(StrEnum):
+    DECLARED_VALIDATION = "declared_validation"
+    GIT_DIFF_CHECK_WORKTREE = "git_diff_check_worktree"
+    GIT_DIFF_CHECK_STAGED = "git_diff_check_staged"
+
+
 @dataclass(frozen=True, slots=True)
 class ChangeRequest:
     project_id: str
@@ -77,6 +90,21 @@ class ChangeRequest:
     relevant_files: tuple[str, ...] = ()
     effective_requirements: tuple[str, ...] = ()
     effective_acceptance_criteria: tuple[str, ...] = ()
+    intent: ChangeIntent = ChangeIntent.IMPLEMENT
+    repair_cycle: int = 0
+    failure_category: FailureCategory | None = None
+    failure_code: str | None = None
+    failure_source: str | None = None
+    validation_diagnostics: tuple[str, ...] = ()
+    review_findings: tuple[str, ...] = ()
+    current_changed_paths: tuple[str, ...] = ()
+    current_manifest_digest: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.intent, ChangeIntent):
+            raise ChangeSetError("change intent must be typed")
+        if type(self.repair_cycle) is not int or self.repair_cycle < 0:
+            raise ChangeSetError("repair cycle must be non-negative")
 
 
 @dataclass(frozen=True, slots=True)
@@ -106,6 +134,91 @@ class CommitWitness:
     commit_sha: str | None
     changeset_digest: str
     reviewed_paths: tuple[str, ...]
+    workspace_manifest_digest: str | None = None
+    repair_count: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class WorkspaceManifestEntry:
+    path: str
+    sha256: str
+    size_bytes: int
+    mode: int
+
+    def __post_init__(self) -> None:
+        if (
+            not self.path
+            or self.mode not in {0o644, 0o755}
+            or self.size_bytes < 0
+            or len(self.sha256) != 64
+        ):
+            raise ChangeSetError("workspace manifest entry is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class WorkspaceManifest:
+    cycle: int
+    baseline_head: str
+    files: tuple[WorkspaceManifestEntry, ...]
+    digest: str
+
+    @classmethod
+    def create(
+        cls,
+        cycle: int,
+        baseline_head: str,
+        files: tuple[WorkspaceManifestEntry, ...],
+    ) -> WorkspaceManifest:
+        payload = {
+            "cycle": cycle,
+            "baseline_head": baseline_head,
+            "files": files,
+        }
+        return cls(cycle, baseline_head, files, sha256_digest(payload))
+
+    def __post_init__(self) -> None:
+        if self.cycle < 0 or self.digest != sha256_digest(
+            {
+                "cycle": self.cycle,
+                "baseline_head": self.baseline_head,
+                "files": self.files,
+            }
+        ):
+            raise ChangeSetError("workspace manifest digest is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class RepairFailureContext:
+    cycle: int
+    failure_source_node: str
+    failure_category: FailureCategory
+    failure_code: str
+    current_manifest_digest: str
+    current_changed_paths: tuple[str, ...]
+    validation_diagnostics: tuple[RepairValidationDiagnostic, ...]
+    review_findings: tuple[str, ...]
+    effective_requirements: tuple[str, ...]
+    effective_acceptance_criteria: tuple[str, ...]
+    allowed_paths: tuple[RepoPathSpec, ...]
+    baseline_head: str
+    source_revision: str
+    classification: RepairClassification | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class RepairValidationDiagnostic:
+    kind: RepairValidationDiagnosticKind
+    command_id: str
+    status: str
+    exit_code: int | None
+    stdout_preview: str
+    stderr_preview: str
+    stdout_truncated: bool
+    stderr_truncated: bool
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.kind, RepairValidationDiagnosticKind):
+            raise ChangeSetError("repair validation diagnostic kind must be typed")
 
 
 @dataclass(frozen=True, slots=True)
@@ -120,6 +233,7 @@ class WriteInputs:
     item_validation_checks: tuple[ValidationCheck, ...]
     scope_required_checks: tuple[ValidationCheck, ...]
     capability_fingerprint: str
+    max_repair_cycles: int = 0
 
 
 class WriteSliceOutcome(StrEnum):

@@ -62,3 +62,23 @@ class CommitVerificationError(WriteSliceError):
 
 class PostCommitRecoveryRequired(WriteSliceError):
     """A commit exists or may exist, so normal node failure is unsafe."""
+
+
+class RepairPolicyError(WritePreparationError):
+    code = "repair_policy_invalid"
+
+
+class RepairFailureContextError(WriteSliceError):
+    code = "repair_failure_context_mismatch"
+
+
+class RepairLineageError(WorkspaceError):
+    code = "repair_lineage_mismatch"
+
+
+class RepairWorkspaceLineageError(WorkspaceError):
+    code = "repair_workspace_lineage_mismatch"
+
+
+class WorkspaceManifestError(WorkspaceError):
+    code = "workspace_manifest_invalid"
