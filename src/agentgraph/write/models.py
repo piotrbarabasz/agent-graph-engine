@@ -267,6 +267,14 @@ class WriteInputs:
     capability_fingerprint: str
     max_repair_cycles: int = 0
     semantic_review_enabled: bool = False
+    checkpoint_ttl_seconds: int = 3600
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.checkpoint_ttl_seconds) is not int
+            or not 60 <= self.checkpoint_ttl_seconds <= 86400
+        ):
+            raise ValueError("checkpoint TTL must be between 60 and 86400 seconds")
 
 
 class WriteSliceOutcome(StrEnum):
@@ -275,6 +283,18 @@ class WriteSliceOutcome(StrEnum):
     FAILED = "failed"
     INVALID_SOURCE = "invalid_source"
     RECOVERY_REQUIRED = "recovery_required"
+    CHECKPOINT_REQUIRED = "checkpoint_required"
+
+
+@dataclass(frozen=True, slots=True)
+class CheckpointView:
+    checkpoint_id: str
+    code: str
+    message: str
+    nonce: str
+    created_at: str
+    expires_at: str
+    pending_resume_node: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -314,6 +334,7 @@ class WriteSliceReport:
     issues: tuple[WriteSliceIssue, ...] = ()
     changeset_digest: str | None = None
     changed_paths: tuple[str, ...] = ()
+    checkpoint: CheckpointView | None = None
 
     @property
     def final_graph_state(self) -> GraphState | None:

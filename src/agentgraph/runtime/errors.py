@@ -84,3 +84,11 @@ class TruncatedJournalError(JournalError):
 
 class RecoveryError(AgentGraphRuntimeError):
     """A recovery operation cannot be completed safely."""
+
+
+class CheckpointStoreError(AgentGraphRuntimeError):
+    """Durable checkpoint evidence could not be safely read or written."""
+
+
+class CheckpointEvidenceError(CheckpointStoreError):
+    """Checkpoint evidence is malformed, corrupt, or internally inconsistent."""

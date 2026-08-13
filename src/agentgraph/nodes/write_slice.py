@@ -21,6 +21,7 @@ from agentgraph.agents.prompts import (
     build_task_package_prompt,
 )
 from agentgraph.core import (
+    CheckpointRequest,
     Evidence,
     ExternalEffect,
     FailureCategory,
@@ -38,6 +39,7 @@ from agentgraph.core import (
 from agentgraph.core.state import GraphState, RepairRecord
 from agentgraph.work import WorkRisk
 from agentgraph.write.analysis import AgentExecution
+from agentgraph.write.checkpoints import WriteCheckpointController
 from agentgraph.write.errors import (
     ChangePathError,
     ChangeProviderBlockedError,
@@ -302,15 +304,8 @@ class AssessRiskNode:
                     (Evidence("agent_risk", result.evidence_reference),),
                 )
             assert level is not None
-            if level is RiskLevel.CRITICAL or value.requests_human_checkpoint:
-                self.analysis.issue_code = "human_checkpoint_required_not_supported_in_m008"
-                return _blocked(
-                    self.node_id,
-                    context,
-                    "human_checkpoint_required_not_supported_in_m008",
-                    "M008 does not implement human checkpoint approval",
-                    (Evidence("agent_risk", result.evidence_reference),),
-                )
+            if value.requests_human_checkpoint:
+                level = RiskLevel.CRITICAL
             success = _success(
                 self.node_id, context, state, PatchOperation.set("risk.level", level)
             )
@@ -321,19 +316,55 @@ class AssessRiskNode:
                 state_patch=success.state_patch,
                 evidence=(Evidence("agent_risk", result.evidence_reference),),
             )
-        if self.inputs.package.risk is WorkRisk.CRITICAL:
-            return _blocked(
-                self.node_id,
-                context,
-                "critical_risk_not_supported_in_m006",
-                "M006 does not execute critical-risk work",
-            )
         level = {
             WorkRisk.LOW: RiskLevel.LOW,
             WorkRisk.MEDIUM: RiskLevel.MEDIUM,
             WorkRisk.HIGH: RiskLevel.HIGH,
+            WorkRisk.CRITICAL: RiskLevel.CRITICAL,
         }[self.inputs.package.risk]
         return _success(self.node_id, context, state, PatchOperation.set("risk.level", level))
+
+
+@dataclass(frozen=True, slots=True)
+class HumanCheckpointNode:
+    checkpoints: WriteCheckpointController
+    node_id: str = "HUMAN_CHECKPOINT"
+
+    def run(self, state: GraphState, context: NodeContext) -> NodeResult:
+        try:
+            request, decision = self.checkpoints.decision(state)
+        except WriteSliceError as exc:
+            self.checkpoints.execution.issue_code = getattr(
+                exc, "code", "checkpoint_evidence_invalid"
+            )
+            return _blocked(
+                self.node_id,
+                context,
+                getattr(exc, "code", "checkpoint_evidence_invalid"),
+                str(exc),
+            )
+        if decision is None:
+            if self.checkpoints.expired(request):
+                self.checkpoints.execution.issue_code = "checkpoint_expired"
+                return _blocked(
+                    self.node_id,
+                    context,
+                    "checkpoint_expired",
+                    "The durable checkpoint expired before a decision was submitted.",
+                )
+            return NodeResult(
+                self.node_id,
+                context.node_attempt_id,
+                NodeStatus.CHECKPOINT_REQUIRED,
+                checkpoint_request=CheckpointRequest(request.code, request.message),
+            )
+        return NodeResult(
+            self.node_id,
+            context.node_attempt_id,
+            NodeStatus.SUCCEEDED,
+            checkpoint_outcome=decision.outcome,
+            evidence=(Evidence("human_checkpoint", self.checkpoints.decision_reference(request)),),
+        )
 
 
 @dataclass(frozen=True, slots=True)

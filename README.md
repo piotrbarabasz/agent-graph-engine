@@ -32,6 +32,11 @@ a fresh read-only `AgentProvider` evaluates the current external worktree agains
 requirements and acceptance criteria. Semantic failures use the existing M009 classification and
 repair graph; reviewer contract, infrastructure, or mutation failures are fatal and never consume
 repair capacity.
+M011 adds a durable local human checkpoint for critical-risk work and explicit agent checkpoint
+requests. Execution pauses before any implementation write and returns a nonce-bearing request with
+an expiry. A separately submitted `APPROVED`, `REJECTED`, or `CANCELLED` decision is bound to the
+exact pinned run state; approved runs continue through the unchanged implementation, validation,
+and review pipeline.
 
 Agent Graph Engine—not Codex—computes stale-file hashes, applies changes, runs validation, reviews
 the actual diff, stages files, and verifies the local commit. The provider receives a neutral read
@@ -102,6 +107,15 @@ architecture invariants, baseline, source revision, and original write capabilit
 is strict bounded JSON. Finding paths are diagnostic references only and cannot expand repair write
 authority. The reviewer receives neither implementation proposals nor author session/reasoning, and
 each repair cycle is assessed by a fresh invocation without previous review prose.
+
+M011 stores immutable checkpoint evidence under `<run>/checkpoints/<checkpoint-id>/`, outside the
+target repository. Requests bind GraphState and operation digests, the package and write inputs,
+source revision, baseline commit/tree, and write capability. The caller submits one actor-attributed
+decision with the request's local capability nonce, then explicitly calls `resume(run_id)`; submit
+never starts implementation. Undecided requests expire and fail closed without renewal. Decisions
+created before expiry remain valid on a later resume. Approval does not bypass live drift checks,
+validation, mechanical review, or optional semantic review. Remote approval, delivery review,
+push, pull-request creation, and multi-item execution remain outside M011.
 
 `agentgraph.providers.codex.CodexChangeProvider` probes the installed CLI before use, requires
 non-interactive execution with an explicit Codex working root and a runtime-only permission profile.

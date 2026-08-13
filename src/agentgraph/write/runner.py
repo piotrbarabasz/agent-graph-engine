@@ -5,10 +5,12 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Callable
+from datetime import datetime
 from pathlib import Path
 
 from agentgraph.agents import AgentProvider, DeclaredWorkAgentProvider
 from agentgraph.core import (
+    CheckpointOutcome,
     CommitMode,
     GraphEngine,
     PolicySnapshot,
@@ -37,6 +39,7 @@ from agentgraph.nodes import (
     DiscoverProjectNode,
     ExploreNode,
     FinalizeNode,
+    HumanCheckpointNode,
     ImplementNode,
     MoreWorkNode,
     PreflightNode,
@@ -47,19 +50,23 @@ from agentgraph.nodes import (
     ValidateNode,
 )
 from agentgraph.runtime import (
+    CheckpointDecision,
     DurableGraphCoordinator,
     ProjectRegistry,
     RecoveryAction,
     RecoveryAssessment,
     RuntimePaths,
+    StateStore,
 )
-from agentgraph.runtime.codec import decode_value
+from agentgraph.runtime.codec import decode_value, utc_now
 from agentgraph.runtime.ids import generate_run_id
-from agentgraph.work import InvalidWorkSourceError, WorkRisk, WorkScopeStatus, WorkSource
+from agentgraph.work import InvalidWorkSourceError, WorkScopeStatus, WorkSource
 
 from .analysis import AgentExecution
 from .capability import capability_fingerprint, reconcile_write_capability
+from .checkpoints import WriteCheckpointController
 from .errors import (
+    CheckpointError,
     RepairPolicyError,
     ReviewProviderRequiredError,
     WorkCapabilityMismatchError,
@@ -68,6 +75,7 @@ from .errors import (
 )
 from .evidence import read_evidence, write_evidence
 from .models import (
+    CheckpointView,
     WriteInputs,
     WriteSliceIssue,
     WriteSliceOutcome,
@@ -99,17 +107,21 @@ class WriteSliceRunner:
         validation_timeout_seconds: float = 120.0,
         max_steps: int = 30,
         max_repair_cycles: int = 0,
+        checkpoint_ttl_seconds: int = 3600,
+        clock: Callable[[], datetime] = utc_now,
+        checkpoint_nonce_factory: Callable[[], str] | None = None,
     ) -> None:
         if validation_timeout_seconds <= 0 or max_steps < 1:
             raise ValueError("write runner bounds must be positive")
         if type(max_repair_cycles) is not int or max_repair_cycles not in {0, 1, 2}:
             raise RepairPolicyError("M009 supports max_repair_cycles values 0, 1, or 2")
+        if type(checkpoint_ttl_seconds) is not int or not 60 <= checkpoint_ttl_seconds <= 86400:
+            raise ValueError("checkpoint TTL must be between 60 and 86400 seconds")
         self.repository_root = Path(repository_root)
         self.work_source = work_source
         self.change_provider = change_provider
         self.agent_provider = agent_provider or DeclaredWorkAgentProvider()
         self.review_agent_provider = review_agent_provider
-        self._m008_agents_enabled = agent_provider is not None
         self.git = git_adapter
         self.registry = project_registry
         self.paths = runtime_paths or project_registry.paths
@@ -122,6 +134,9 @@ class WriteSliceRunner:
         self.validation_timeout_seconds = validation_timeout_seconds
         self.max_steps = max_steps
         self.max_repair_cycles = max_repair_cycles
+        self.checkpoint_ttl_seconds = checkpoint_ttl_seconds
+        self.clock = clock
+        self.checkpoint_nonce_factory = checkpoint_nonce_factory
         self._coordinator: DurableGraphCoordinator | None = None
         self._last_run_id: str | None = None
 
@@ -173,14 +188,6 @@ class WriteSliceRunner:
                 inspection=inspection,
                 selection=selection,
             )
-        if package.risk is WorkRisk.CRITICAL and not self._m008_agents_enabled:
-            return self._early(
-                WriteSliceOutcome.BLOCKED,
-                "critical_risk_not_supported_in_m006",
-                "M006 does not execute critical-risk work",
-                inspection=inspection,
-                selection=selection,
-            )
         if not scope.branch_hint or not scope.base_branch_hint:
             return self._early(
                 WriteSliceOutcome.INVALID_SOURCE,
@@ -225,22 +232,23 @@ class WriteSliceRunner:
         shadow = ShadowInputs(inspection, preflight, selection, package, fingerprint)
         assert inspection.git_snapshot.head_sha is not None
         inputs = WriteInputs(
-            inspection.project_id,
-            package,
-            allowed,
-            inspection.work_snapshot.revision.fingerprint,
-            inspection.git_snapshot.head_sha,
-            scope.base_branch_hint,
-            scope.branch_hint,
-            package.item_validation_checks,
-            package.scope_required_checks,
-            capability_fingerprint(allowed),
-            self.max_repair_cycles,
-            self.review_agent_provider is not None,
+            project_id=inspection.project_id,
+            package=package,
+            expected_allowed_paths=allowed,
+            source_revision=inspection.work_snapshot.revision.fingerprint,
+            baseline_head=inspection.git_snapshot.head_sha,
+            base_branch=scope.base_branch_hint,
+            scope_branch=scope.branch_hint,
+            item_validation_checks=package.item_validation_checks,
+            scope_required_checks=package.scope_required_checks,
+            capability_fingerprint=capability_fingerprint(allowed),
+            max_repair_cycles=self.max_repair_cycles,
+            semantic_review_enabled=self.review_agent_provider is not None,
+            checkpoint_ttl_seconds=self.checkpoint_ttl_seconds,
         )
         run_id = self.run_id_factory()
         self._last_run_id = run_id
-        execution, coordinator = self._build_runtime(
+        execution, coordinator, checkpoints = self._build_runtime(
             inspection, shadow, inputs, run_id, rehydrating=False
         )
         self._coordinator = coordinator
@@ -260,6 +268,7 @@ class WriteSliceRunner:
             ),
         )
         executed: list[str] = []
+        checkpoint: CheckpointView | None = None
         with coordinator.open_session(run_id) as session:
             state = session.store.load()
             for _ in range(self.max_steps):
@@ -267,16 +276,32 @@ class WriteSliceRunner:
                     break
                 executed.append(state.graph.current_node)
                 state = session.step()
+                if state.graph.current_node == "HUMAN_CHECKPOINT":
+                    try:
+                        checkpoint = checkpoints.view(checkpoints.ensure_request(state))
+                    except CheckpointError as exc:
+                        return self._checkpoint_recovery(state, execution, exc)
+                    if self.fault is not None:
+                        self.fault("CHECKPOINT_REQUEST_PERSISTED")
+                    break
             else:
                 raise WritePreparationError("write graph exceeded its bounded step count")
-        return self._report(state, execution, tuple(executed))
+        return self._report(state, execution, tuple(executed), checkpoint=checkpoint)
 
     def resume(self, run_id: str) -> WriteSliceReport:
         """Reconstruct a durable run from immutable inputs and continue only when safe."""
 
         try:
-            execution, coordinator = self._existing_runtime(run_id)
-        except (WritePreparationError, WorkspaceError, RepositoryRootMismatchError) as exc:
+            execution, coordinator, checkpoints = self._existing_runtime(run_id)
+        except (
+            WritePreparationError,
+            WorkspaceError,
+            RepositoryRootMismatchError,
+            WorkSourceRepositoryMismatchError,
+        ) as exc:
+            pending = self._pending_checkpoint_report(run_id, "checkpoint_binding_mismatch")
+            if pending is not None:
+                return pending
             return self._early(
                 WriteSliceOutcome.RECOVERY_REQUIRED,
                 getattr(exc, "code", None) or "write_resume_inputs_invalid",
@@ -318,11 +343,35 @@ class WriteSliceRunner:
                 RecoveryAction.RERUN_INTERRUPTED_NODE,
             }:
                 return self._recovery_required(state, execution, assessment)
+            if state.graph.current_node == "HUMAN_CHECKPOINT":
+                try:
+                    request, decision = checkpoints.decision(state)
+                except CheckpointError as exc:
+                    return self._checkpoint_recovery(state, execution, exc)
+                if decision is None and not checkpoints.expired(request):
+                    return self._report(
+                        state,
+                        execution,
+                        (),
+                        checkpoint=checkpoints.view(request),
+                    )
             for _ in range(self.max_steps):
                 if state.graph.current_node == "END":
                     break
                 executed.append(state.graph.current_node)
                 state = session.step()
+                if state.graph.current_node == "HUMAN_CHECKPOINT":
+                    try:
+                        request, decision = checkpoints.decision(state)
+                    except CheckpointError as exc:
+                        return self._checkpoint_recovery(state, execution, exc)
+                    if decision is None and not checkpoints.expired(request):
+                        return self._report(
+                            state,
+                            execution,
+                            tuple(executed),
+                            checkpoint=checkpoints.view(request),
+                        )
             else:
                 raise WritePreparationError("resumed write graph exceeded its step bound")
         return self._report(state, execution, tuple(executed))
@@ -331,11 +380,55 @@ class WriteSliceRunner:
         selected = run_id or self._last_run_id
         if selected is None:
             raise WritePreparationError("a durable run ID is required")
-        _, coordinator = self._existing_runtime(selected)
+        _, coordinator, _ = self._existing_runtime(selected)
         with coordinator.open_session(selected, recovery=True) as session:
             return session.assess_recovery()
 
-    def _existing_runtime(self, run_id: str) -> tuple[WriteExecution, DurableGraphCoordinator]:
+    def submit_checkpoint(
+        self,
+        run_id: str,
+        *,
+        checkpoint_id: str,
+        nonce: str,
+        outcome: CheckpointOutcome,
+        actor: str,
+    ) -> CheckpointDecision:
+        """Persist one immutable decision; execution resumes only via resume()."""
+
+        try:
+            _, coordinator, checkpoints = self._existing_runtime(run_id)
+        except (
+            WritePreparationError,
+            WorkspaceError,
+            RepositoryRootMismatchError,
+            WorkSourceRepositoryMismatchError,
+        ) as exc:
+            if self._pending_checkpoint_report(run_id, "checkpoint_binding_mismatch") is not None:
+                raise CheckpointError("checkpoint_binding_mismatch") from exc
+            raise
+        with coordinator.open_session(run_id, recovery=True) as session:
+            assessment = session.assess_recovery()
+            if assessment.action in {
+                RecoveryAction.REAPPLY_RECORDED_RESULT,
+                RecoveryAction.COMPLETE_TRANSITION_MARKER,
+            }:
+                assessment = session.recover()
+            if assessment.action not in {
+                RecoveryAction.CLEAN_RESUME,
+                RecoveryAction.RERUN_INTERRUPTED_NODE,
+            }:
+                raise CheckpointError("checkpoint_not_pending")
+            return checkpoints.submit(
+                session.store.load(),
+                checkpoint_id=checkpoint_id,
+                nonce=nonce,
+                outcome=outcome,
+                actor=actor,
+            )
+
+    def _existing_runtime(
+        self, run_id: str
+    ) -> tuple[WriteExecution, DurableGraphCoordinator, WriteCheckpointController]:
         configured = self.repository_root.expanduser().resolve()
         repository = self.git.discover_repository(configured)
         if repository.root != configured:
@@ -367,18 +460,19 @@ class WriteSliceRunner:
             raise WritePreparationError("persisted selection is no longer reconstructable")
         allowed = reconcile_write_capability(inspection.work_snapshot, selection, package)
         reconstructed = WriteInputs(
-            inspection.project_id,
-            package,
-            allowed,
-            inspection.work_snapshot.revision.fingerprint,
-            inputs.baseline_head,
-            inputs.base_branch,
-            inputs.scope_branch,
-            package.item_validation_checks,
-            package.scope_required_checks,
-            capability_fingerprint(allowed),
-            inputs.max_repair_cycles,
-            inputs.semantic_review_enabled,
+            project_id=inspection.project_id,
+            package=package,
+            expected_allowed_paths=allowed,
+            source_revision=inspection.work_snapshot.revision.fingerprint,
+            baseline_head=inputs.baseline_head,
+            base_branch=inputs.base_branch,
+            scope_branch=inputs.scope_branch,
+            item_validation_checks=package.item_validation_checks,
+            scope_required_checks=package.scope_required_checks,
+            capability_fingerprint=capability_fingerprint(allowed),
+            max_repair_cycles=inputs.max_repair_cycles,
+            semantic_review_enabled=inputs.semantic_review_enabled,
+            checkpoint_ttl_seconds=inputs.checkpoint_ttl_seconds,
         )
         if reconstructed != inputs:
             raise WritePreparationError("live source differs from persisted write inputs")
@@ -402,7 +496,7 @@ class WriteSliceRunner:
         run_id: str,
         *,
         rehydrating: bool,
-    ) -> tuple[WriteExecution, DurableGraphCoordinator]:
+    ) -> tuple[WriteExecution, DurableGraphCoordinator, WriteCheckpointController]:
         run_path = self.paths.run(inspection.project_id, run_id)
         execution = WriteExecution(
             shadow,
@@ -429,6 +523,11 @@ class WriteSliceRunner:
             rehydrating,
             self.fault or (lambda stage: None),
         )
+        checkpoints = WriteCheckpointController(
+            execution,
+            clock=self.clock,
+            nonce_factory=self.checkpoint_nonce_factory,
+        )
         nodes = {
             "START": StartNode(),
             "DISCOVER_PROJECT": DiscoverProjectNode(shadow, shadow=False),
@@ -437,6 +536,7 @@ class WriteSliceRunner:
             "EXPLORE": ExploreNode(inputs, execution.analysis),
             "BUILD_TASK_PACKAGE": BuildTaskPackageNode(inputs, execution.analysis),
             "ASSESS_RISK": AssessRiskNode(inputs, execution.analysis),
+            "HUMAN_CHECKPOINT": HumanCheckpointNode(checkpoints),
             "IMPLEMENT": ImplementNode(execution),
             "VALIDATE": ValidateNode(execution),
             "REVIEW": ReviewNode(execution),
@@ -462,20 +562,30 @@ class WriteSliceRunner:
             run_id_factory=lambda: run_id,
             fault=self.fault,
         )
-        return execution, coordinator
+        return execution, coordinator, checkpoints
 
     def _report(
-        self, state, execution: WriteExecution, executed: tuple[str, ...]
+        self,
+        state,
+        execution: WriteExecution,
+        executed: tuple[str, ...],
+        *,
+        checkpoint: CheckpointView | None = None,
     ) -> WriteSliceReport:
         outcome = (
-            WriteSliceOutcome.LOCAL_COMMIT_CREATED
+            WriteSliceOutcome.CHECKPOINT_REQUIRED
+            if checkpoint is not None
+            else WriteSliceOutcome.LOCAL_COMMIT_CREATED
             if execution.commit_sha is not None and state.run.status is RunStatus.PAUSED
             else WriteSliceOutcome.BLOCKED
             if state.run.status is RunStatus.BLOCKED
             else WriteSliceOutcome.FAILED
         )
         issues = ()
-        if outcome is not WriteSliceOutcome.LOCAL_COMMIT_CREATED:
+        if outcome not in {
+            WriteSliceOutcome.LOCAL_COMMIT_CREATED,
+            WriteSliceOutcome.CHECKPOINT_REQUIRED,
+        }:
             issues = (
                 WriteSliceIssue(
                     execution.issue_code
@@ -505,7 +615,66 @@ class WriteSliceRunner:
             ()
             if execution.manifest is None
             else tuple(item.path for item in execution.manifest.files),
+            checkpoint,
         )
+
+    def _checkpoint_recovery(
+        self, state, execution: WriteExecution, error: CheckpointError
+    ) -> WriteSliceReport:
+        report = self._report(state, execution, ())
+        return WriteSliceReport(
+            outcome=WriteSliceOutcome.RECOVERY_REQUIRED,
+            project_id=report.project_id,
+            run_id=report.run_id,
+            graph_state=report.graph_state,
+            selected_item_id=report.selected_item_id,
+            selected_scope_id=report.selected_scope_id,
+            source_revision=report.source_revision,
+            baseline_head=report.baseline_head,
+            scope_branch=report.scope_branch,
+            commit_sha=report.commit_sha,
+            runtime_path=report.runtime_path,
+            workspace_path=report.workspace_path,
+            issues=(WriteSliceIssue(error.code, str(error)),),
+            changeset_digest=report.changeset_digest,
+            changed_paths=report.changed_paths,
+        )
+
+    def _pending_checkpoint_report(self, run_id: str, code: str) -> WriteSliceReport | None:
+        """Report fail-closed drift even when live inputs cannot be reconstructed."""
+
+        try:
+            configured = self.repository_root.expanduser().resolve()
+            repository = self.git.discover_repository(configured)
+            project = self.registry.find_by_root(repository.root)
+            if project is None:
+                return None
+            run_path = self.paths.run(project.project_id, run_id)
+            document = read_evidence(run_path / "write-inputs.json")
+            inputs = decode_value(document.get("payload"), WriteInputs)
+            state = StateStore(run_path / "state.json").load()
+            if (
+                state.run.status is not RunStatus.RUNNING
+                or state.graph.current_node != "HUMAN_CHECKPOINT"
+            ):
+                return None
+            return WriteSliceReport(
+                outcome=WriteSliceOutcome.RECOVERY_REQUIRED,
+                project_id=inputs.project_id,
+                run_id=run_id,
+                graph_state=state,
+                selected_item_id=inputs.package.item_id,
+                selected_scope_id=inputs.package.scope_id,
+                source_revision=inputs.source_revision,
+                baseline_head=inputs.baseline_head,
+                scope_branch=inputs.scope_branch,
+                commit_sha=None,
+                runtime_path=str(run_path),
+                workspace_path=None,
+                issues=(WriteSliceIssue(code, "checkpoint binding no longer matches"),),
+            )
+        except Exception:
+            return None
 
     def _recovery_required(
         self, state, execution: WriteExecution, assessment: RecoveryAssessment
