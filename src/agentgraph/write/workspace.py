@@ -51,6 +51,7 @@ from .models import (
     CommitWitness,
     RepairFailureContext,
     RepairValidationDiagnostic,
+    RepairValidationDiagnosticKind,
     WorkspaceManifest,
     WorkspaceManifestEntry,
     WriteInputs,
@@ -350,6 +351,7 @@ class WriteExecution:
         source_node = state.graph.previous_node
         if source_node not in {"VALIDATE", "REVIEW"}:
             raise RepairFailureContextError("repair_failure_context_mismatch")
+        self.live_recheck("write_baseline_drift_before_failure_classification")
         manifest = self._require_manifest()
         self.verify_current_manifest()
         cycle = state.repair.count
@@ -386,17 +388,24 @@ class WriteExecution:
                 raise RepairFailureContextError("repair_failure_context_mismatch")
             receipts = self.validation_receipts
             review_findings = self.review_findings
-        diagnostics = tuple(
-            RepairValidationDiagnostic(
-                item.command_id,
-                item.status.value,
-                item.exit_code,
-                item.stdout_preview,
-                item.stderr_preview,
-                item.stdout_truncated,
-                item.stderr_truncated,
-            )
-            for item in receipts
+        diff_check = self.diff_check
+        if diff_check is None:
+            raise RepairFailureContextError("repair_failure_context_mismatch")
+        diagnostics = (
+            *(
+                self._validation_diagnostic(
+                    RepairValidationDiagnosticKind.DECLARED_VALIDATION, item
+                )
+                for item in receipts
+            ),
+            self._validation_diagnostic(
+                RepairValidationDiagnosticKind.GIT_DIFF_CHECK_WORKTREE,
+                diff_check.receipts[0],
+            ),
+            self._validation_diagnostic(
+                RepairValidationDiagnosticKind.GIT_DIFF_CHECK_STAGED,
+                diff_check.receipts[1],
+            ),
         )
         requirements, acceptance = self.analysis.implementation_requirements()
         context = RepairFailureContext(
@@ -452,6 +461,7 @@ class WriteExecution:
             classification,
         }:
             raise RepairFailureContextError("repair_failure_context_mismatch")
+        self.live_recheck("write_baseline_drift_before_repair_provider")
         before = self._require_manifest()
         self.verify_current_manifest()
         request = self.change_request(
@@ -497,14 +507,14 @@ class WriteExecution:
         repair_dir = self.operations / "repairs" / f"{cycle:03d}"
         write_evidence(
             repair_dir / "proposal.json",
-            context=self.evidence_context(),
+            context=self.evidence_context(changeset_digest=proposed.digest, repair_cycle=cycle),
             payload={"request": request, "changeset": proposed},
         )
         applied = apply_changeset(self.workspace, proposed, self.inputs.expected_allowed_paths)
         manifest = self.capture_manifest(cycle)
         write_evidence(
             repair_dir / "applied.json",
-            context=self.evidence_context(),
+            context=self.evidence_context(changeset_digest=proposed.digest, repair_cycle=cycle),
             payload={
                 "applied": applied,
                 "workspace_snapshot": _snapshot_evidence(
@@ -514,7 +524,7 @@ class WriteExecution:
         )
         write_evidence(
             repair_dir / "workspace-manifest.json",
-            context=self.evidence_context(),
+            context=self.evidence_context(changeset_digest=proposed.digest, repair_cycle=cycle),
             payload={"manifest": manifest},
         )
         self.changeset = proposed
@@ -699,6 +709,8 @@ class WriteExecution:
             "FINALIZE",
         } or bool(state.changes.identifiers)
         if after_implement:
+            if len(state.repair.history) != state.repair.count:
+                raise RepairLineageError("repair_lineage_mismatch")
             self.analysis.prepare_implementation(state)
             proposal = self._payload("implement-proposal.json")
             applied_payload = self._payload("implement-applied.json")
@@ -731,9 +743,17 @@ class WriteExecution:
             for cycle in range(1, max(successful_cycles, default=0) + 1):
                 repair_dir = self.operations / "repairs" / f"{cycle:03d}"
                 try:
-                    proposal_payload = self._payload_path(repair_dir / "proposal.json")
-                    applied_payload = self._payload_path(repair_dir / "applied.json")
-                    manifest_payload = self._payload_path(repair_dir / "workspace-manifest.json")
+                    record = state.repair.history[cycle - 1]
+                    if record.id != f"repair-{cycle:03d}":
+                        raise RepairLineageError("repair_lineage_mismatch")
+                    proposal_document = self._evidence_document_path(repair_dir / "proposal.json")
+                    applied_document = self._evidence_document_path(repair_dir / "applied.json")
+                    manifest_document = self._evidence_document_path(
+                        repair_dir / "workspace-manifest.json"
+                    )
+                    proposal_payload = self._evidence_payload(proposal_document)
+                    applied_payload = self._evidence_payload(applied_document)
+                    manifest_payload = self._evidence_payload(manifest_document)
                     changeset = decode_value(proposal_payload["changeset"], ChangeSet)
                     applied = decode_value(applied_payload["applied"], AppliedChangeSet)
                     manifest = decode_value(manifest_payload["manifest"], WorkspaceManifest)
@@ -742,6 +762,21 @@ class WriteExecution:
                 if (
                     applied.changeset_digest != changeset.digest
                     or manifest.cycle != cycle
+                    or any(
+                        document.get("changeset_digest") != changeset.digest
+                        or document.get("repair_cycle") != cycle
+                        for document in (
+                            proposal_document,
+                            applied_document,
+                            manifest_document,
+                        )
+                    )
+                    or decode_value(proposal_payload["request"], ChangeRequest).intent
+                    is not (
+                        ChangeIntent.PROGRAMMER_REPAIR
+                        if record.classification is RepairClassification.PROGRAMMER
+                        else ChangeIntent.DEBUGGER
+                    )
                     or f"repair_changeset:{cycle}:{changeset.digest}" not in identifiers
                     or f"workspace_manifest:{cycle}:{manifest.digest}" not in identifiers
                 ):
@@ -862,6 +897,9 @@ class WriteExecution:
         return self._payload_path(self.operations / name)
 
     def _payload_path(self, path: Path) -> dict[str, object]:
+        return self._evidence_payload(self._evidence_document_path(path))
+
+    def _evidence_document_path(self, path: Path) -> dict[str, object]:
         document = read_evidence(path)
         if (
             document.get("run_id") != self.run_id
@@ -870,6 +908,10 @@ class WriteExecution:
             or document.get("scope_id") != self.inputs.package.scope_id
         ):
             raise WorkspaceError("operation evidence identity differs from write inputs")
+        return document
+
+    @staticmethod
+    def _evidence_payload(document: dict[str, object]) -> dict[str, object]:
         payload = document.get("payload")
         if not isinstance(payload, dict):
             raise WorkspaceError("operation evidence payload is invalid")
@@ -952,7 +994,8 @@ class WriteExecution:
             ()
             if failure_context is None
             else tuple(
-                f"{item.command_id} status={item.status} exit={item.exit_code} "
+                f"kind={item.kind.value} {item.command_id} "
+                f"status={item.status} exit={item.exit_code} "
                 f"stdout={item.stdout_preview!r} stderr={item.stderr_preview!r} "
                 f"stdout_truncated={item.stdout_truncated} stderr_truncated={item.stderr_truncated}"
                 for item in failure_context.validation_diagnostics
@@ -967,16 +1010,45 @@ class WriteExecution:
 
         self.analysis.prepare_implementation(state)
 
-    def evidence_context(self) -> dict[str, object]:
-        return {
+    def evidence_context(
+        self,
+        *,
+        changeset_digest: str | None = None,
+        repair_cycle: int | None = None,
+    ) -> dict[str, object]:
+        result: dict[str, object] = {
             "run_id": self.run_id,
             "project_id": self.inputs.project_id,
             "item_id": self.inputs.package.item_id,
             "scope_id": self.inputs.package.scope_id,
             "pinned_head": self.inputs.baseline_head,
             "source_revision": self.inputs.source_revision,
-            "changeset_digest": None if self.changeset is None else self.changeset.digest,
+            "changeset_digest": (
+                changeset_digest
+                if changeset_digest is not None
+                else None
+                if self.changeset is None
+                else self.changeset.digest
+            ),
         }
+        if repair_cycle is not None:
+            result["repair_cycle"] = repair_cycle
+        return result
+
+    @staticmethod
+    def _validation_diagnostic(
+        kind: RepairValidationDiagnosticKind, receipt: CommandReceipt
+    ) -> RepairValidationDiagnostic:
+        return RepairValidationDiagnostic(
+            kind,
+            receipt.command_id,
+            receipt.status.value,
+            receipt.exit_code,
+            receipt.stdout_preview,
+            receipt.stderr_preview,
+            receipt.stdout_truncated,
+            receipt.stderr_truncated,
+        )
 
     def _require_workspace(self) -> GitRepository:
         if self.workspace_repository is None:

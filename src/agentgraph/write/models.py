@@ -64,6 +64,12 @@ class ChangeIntent(StrEnum):
     DEBUGGER = "debugger"
 
 
+class RepairValidationDiagnosticKind(StrEnum):
+    DECLARED_VALIDATION = "declared_validation"
+    GIT_DIFF_CHECK_WORKTREE = "git_diff_check_worktree"
+    GIT_DIFF_CHECK_STAGED = "git_diff_check_staged"
+
+
 @dataclass(frozen=True, slots=True)
 class ChangeRequest:
     project_id: str
@@ -201,6 +207,7 @@ class RepairFailureContext:
 
 @dataclass(frozen=True, slots=True)
 class RepairValidationDiagnostic:
+    kind: RepairValidationDiagnosticKind
     command_id: str
     status: str
     exit_code: int | None
@@ -208,6 +215,10 @@ class RepairValidationDiagnostic:
     stderr_preview: str
     stdout_truncated: bool
     stderr_truncated: bool
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.kind, RepairValidationDiagnosticKind):
+            raise ChangeSetError("repair validation diagnostic kind must be typed")
 
 
 @dataclass(frozen=True, slots=True)

@@ -10,17 +10,19 @@ from agentgraph.adapters.speckit import SpecKitAdapter, SpecKitLayout
 from agentgraph.agents import AgentResponse
 from agentgraph.core import RepairClassification, RunStatus
 from agentgraph.infra import GitAdapter, GitCommitIdentity
-from agentgraph.runtime import ProjectRegistry, RuntimePaths
+from agentgraph.runtime import ProjectRegistry, RecoveryAction, RuntimePaths
 from agentgraph.runtime.codec import sha256_digest
 from agentgraph.write import (
     ChangeIntent,
     ChangeSet,
     FileChange,
     RepairPolicyError,
+    RepairValidationDiagnosticKind,
     WriteSliceOutcome,
     WriteSliceRequest,
     WriteSliceRunner,
 )
+from agentgraph.write.evidence import read_evidence
 from tests.integration.conftest import git, semantic_git_state, working_tree_bytes
 from tests.integration.test_m006_vertical_slice import _target
 
@@ -33,10 +35,12 @@ class RepairAgent:
         self.mutate_classifier = mutate_classifier
         self.blocked_classifier = blocked_classifier
         self.calls: list[str] = []
+        self.requests = []
         self.classifier_contexts = []
 
     def invoke(self, request, context):
         self.calls.append(request.operation_id)
+        self.requests.append(request)
         if request.operation_id == "explore":
             payload = {
                 "schema_version": 1,
@@ -119,6 +123,7 @@ class SequentialChangeProvider:
         self.mutate_on_repair = mutate_on_repair
         self.requests = []
         self.contexts = []
+        self.changesets = []
 
     def propose(self, request, context):
         self.requests.append(request)
@@ -128,7 +133,9 @@ class SequentialChangeProvider:
             candidate.write_text("value = 99\n", encoding="utf-8")
         before = hashlib.sha256(candidate.read_bytes()).hexdigest() if candidate.exists() else None
         value = next(self.values)
-        return ChangeSet.create((FileChange("src/t001.py", before, f"value = {value}\n"),))
+        result = ChangeSet.create((FileChange("src/t001.py", before, f"value = {value}\n"),))
+        self.changesets.append(result)
+        return result
 
 
 class ShrinkingChangeProvider:
@@ -154,6 +161,18 @@ class ShrinkingChangeProvider:
                 FileChange("tests/t001.py", test_hash, "baseline = True\n"),
             )
         )
+
+
+class WhitespaceRepairProvider:
+    def __init__(self):
+        self.requests = []
+
+    def propose(self, request, context):
+        self.requests.append(request)
+        candidate = context.repository_root / "src" / "t001.py"
+        before = hashlib.sha256(candidate.read_bytes()).hexdigest() if candidate.exists() else None
+        content = "value = 0  \n" if request.intent is ChangeIntent.IMPLEMENT else "value = 2\n"
+        return ChangeSet.create((FileChange("src/t001.py", before, content),))
 
 
 class StageFault:
@@ -276,6 +295,57 @@ def test_two_repair_cycles_are_distinct_and_bounded(tmp_path) -> None:
     operations = Path(report.runtime_path or "") / "operations" / "repairs"
     assert (operations / "001" / "validation.json").is_file()
     assert (operations / "002" / "validation.json").is_file()
+    for cycle, changeset in enumerate(changes.changesets[1:], start=1):
+        directory = operations / f"{cycle:03d}"
+        for name in ("proposal.json", "applied.json", "workspace-manifest.json"):
+            evidence = read_evidence(directory / name)
+            assert evidence["changeset_digest"] == changeset.digest
+            assert evidence["repair_cycle"] == cycle
+            assert evidence["changeset_digest"] != changes.changesets[cycle - 1].digest
+
+
+def test_git_diff_check_failure_is_exposed_to_classifier_and_repair(tmp_path) -> None:
+    target = _target(tmp_path, "python -c \"print('declared pass')\"")
+    (target / "src").mkdir()
+    (target / "src" / "t001.py").write_text("value = -1\n", encoding="utf-8")
+    git(target, "add", "src/t001.py")
+    git(target, "commit", "--quiet", "-m", "tracked diff-check fixture")
+    agent = RepairAgent()
+    changes = WhitespaceRepairProvider()
+
+    report = _runner(target, tmp_path / "runtime", agent, changes, max_repair_cycles=1).run(
+        WriteSliceRequest(scope_id="E001")
+    )
+
+    assert report.outcome is WriteSliceOutcome.LOCAL_COMMIT_CREATED
+    assert report.executed_nodes.count("VALIDATE") == 2
+    assert agent.calls.count("classify_failure") == 1
+    classifier_request = next(
+        request for request in agent.requests if request.operation_id == "classify_failure"
+    )
+    assert "git_diff_check_worktree" in classifier_request.prompt
+    repair_request = changes.requests[1]
+    assert any(
+        "kind=git_diff_check_worktree" in diagnostic and "status=FAILED" in diagnostic
+        for diagnostic in repair_request.validation_diagnostics
+    )
+    context_payload = read_evidence(
+        Path(report.runtime_path or "") / "operations" / "repairs" / "001" / "context.json"
+    )["payload"]
+    kinds = [item["kind"] for item in context_payload["validation_diagnostics"]]
+    assert kinds == [
+        RepairValidationDiagnosticKind.DECLARED_VALIDATION.value,
+        RepairValidationDiagnosticKind.DECLARED_VALIDATION.value,
+        RepairValidationDiagnosticKind.GIT_DIFF_CHECK_WORKTREE.value,
+        RepairValidationDiagnosticKind.GIT_DIFF_CHECK_STAGED.value,
+    ]
+    failed = [
+        item
+        for item in context_payload["validation_diagnostics"]
+        if item["kind"] == RepairValidationDiagnosticKind.GIT_DIFF_CHECK_WORKTREE.value
+    ]
+    assert failed[0]["status"] == "FAILED"
+    assert failed[0]["stderr_preview"] or failed[0]["stdout_preview"]
 
 
 def test_limit_exhaustion_skips_classifier_and_repair_provider(tmp_path) -> None:
@@ -294,6 +364,22 @@ def test_limit_exhaustion_skips_classifier_and_repair_provider(tmp_path) -> None
     assert agent.calls.count("classify_failure") == 1
     assert len(changes.requests) == 2
     assert report.executed_nodes[-2:] == ("CLASSIFY_FAILURE", "FINALIZE")
+
+
+def test_zero_repair_policy_preserves_pre_m009_failure_path(tmp_path) -> None:
+    target = _repair_target(tmp_path)
+    agent = RepairAgent()
+    changes = SequentialChangeProvider((0,))
+
+    report = _runner(target, tmp_path / "runtime", agent, changes, max_repair_cycles=0).run(
+        WriteSliceRequest(scope_id="E001")
+    )
+
+    assert report.outcome is WriteSliceOutcome.FAILED
+    assert report.executed_nodes[-2:] == ("CLASSIFY_FAILURE", "FINALIZE")
+    assert agent.calls.count("classify_failure") == 0
+    assert len(changes.requests) == 1
+    assert changes.requests[0].intent is ChangeIntent.IMPLEMENT
 
 
 def test_repair_provider_same_dirty_path_mutation_is_detected(tmp_path) -> None:
@@ -449,6 +535,68 @@ def test_clean_restart_after_repair_resumes_at_validate(tmp_path) -> None:
     assert report.executed_nodes[0] == "VALIDATE"
     assert len(changes.requests) == 2
     assert agent.calls.count("classify_failure") == 1
+
+
+def test_target_drift_before_repair_prevents_provider_invocation(tmp_path) -> None:
+    target = _repair_target(tmp_path)
+    runtime = tmp_path / "runtime"
+    agent = RepairAgent()
+    changes = SequentialChangeProvider()
+    first = _runner(
+        target,
+        runtime,
+        agent,
+        changes,
+        max_repair_cycles=1,
+        fault=StageFault("after_transition_committed", 10),
+    )
+    with pytest.raises(RuntimeError, match="M009 interruption"):
+        first.run(WriteSliceRequest(scope_id="E001"))
+    assert len(changes.requests) == 1
+    (target / "tracked.txt").write_text("target drift\n", encoding="utf-8")
+    git(target, "add", "tracked.txt")
+    git(target, "commit", "--quiet", "-m", "external target drift")
+
+    report = _runner(target, runtime, agent, changes, max_repair_cycles=1).resume(
+        "run_m009_fixture"
+    )
+
+    assert report.outcome in {WriteSliceOutcome.BLOCKED, WriteSliceOutcome.FAILED}
+    assert len(changes.requests) == 1
+    assert report.graph_state is not None
+    assert report.graph_state.graph.previous_node in {"DEBUGGER", "FINALIZE"}
+    assert not (
+        Path(report.runtime_path or "") / "operations" / "repairs" / "001" / "proposal.json"
+    ).exists()
+
+
+def test_interrupted_repair_node_is_blocked_and_never_reinvoked(tmp_path) -> None:
+    target = _repair_target(tmp_path)
+    runtime = tmp_path / "runtime"
+    agent = RepairAgent()
+    changes = SequentialChangeProvider()
+    first = _runner(
+        target,
+        runtime,
+        agent,
+        changes,
+        max_repair_cycles=1,
+        fault=StageFault("after_node_started", 11),
+    )
+    with pytest.raises(RuntimeError, match="M009 interruption"):
+        first.run(WriteSliceRequest(scope_id="E001"))
+    assert len(changes.requests) == 1
+
+    assessment = first.assess_recovery("run_m009_fixture")
+    assert assessment.action is RecoveryAction.BLOCKED
+    assert assessment.reason_code == "unreconciled_side_effect_capability"
+    report = _runner(target, runtime, agent, changes, max_repair_cycles=1).resume(
+        "run_m009_fixture"
+    )
+
+    assert report.outcome is WriteSliceOutcome.RECOVERY_REQUIRED
+    assert report.issues[0].code == "unreconciled_side_effect_capability"
+    assert len(changes.requests) == 1
 
 
 def test_interrupted_classifier_reruns_with_distinct_attempt_evidence(tmp_path) -> None:
