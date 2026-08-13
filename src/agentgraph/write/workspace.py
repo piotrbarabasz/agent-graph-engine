@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import hashlib
 import stat
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from agentgraph.agents import AgentAnalysisStatus, SemanticReviewVerdict
-from agentgraph.agents.prompts import build_semantic_review_prompt
 from agentgraph.core import (
     FailureCategory,
     GraphState,
@@ -86,6 +86,7 @@ class WriteExecution:
     commit_identity: GitCommitIdentity
     validation_timeout_seconds: float = 120.0
     rehydrating: bool = False
+    fault: Callable[[str], None] = field(default=lambda stage: None, repr=False)
     workspace: Path = field(init=False)
     operations: Path = field(init=False)
     workspace_repository: GitRepository | None = field(default=None, init=False)
@@ -293,7 +294,7 @@ class WriteExecution:
             "findings": mechanical_findings,
         }
         if mechanical_path.exists():
-            if self._payload_path(mechanical_path) != mechanical_payload:
+            if self._payload_path(mechanical_path) != encode_value(mechanical_payload):
                 raise SemanticReviewEvidenceError("semantic_review_evidence_mismatch")
         else:
             write_evidence(
@@ -309,11 +310,12 @@ class WriteExecution:
             review_context = self.prepare_semantic_review_context(state, cycle)
             result = self.analysis.semantic_review(
                 node_attempt_id,
-                build_semantic_review_prompt(review_context),
+                review_context,
                 repository_root=self.workspace,
                 expected_workspace_digest=manifest.digest,
                 workspace_digest=self.verify_current_manifest,
             )
+            self.fault("after_semantic_review_evidence")
             value = result.value
             semantic_payload = {
                 "status": value.status.value,
@@ -366,7 +368,7 @@ class WriteExecution:
         return self.review_passed, self.review_findings, self.review_failure_code
 
     def prepare_semantic_review_context(
-        self, state: GraphState, cycle: int
+        self, state: GraphState, cycle: int, *, verify_workspace: bool = True
     ) -> SemanticReviewContext:
         manifest = self._require_manifest()
         if (
@@ -377,7 +379,8 @@ class WriteExecution:
         ):
             raise SemanticReviewContextError("semantic_review_context_mismatch")
         self.live_recheck("review_baseline_drift")
-        self.verify_current_manifest()
+        if verify_workspace:
+            self.verify_current_manifest()
         self._restore_validation_evidence(cycle)
         if not self.validation_passed or self.diff_check is None or not self.diff_check.ok:
             raise SemanticReviewContextError("semantic_review_context_mismatch")
@@ -953,20 +956,23 @@ class WriteExecution:
                 raise WorkspaceError("GraphState and validation evidence disagree")
 
         review_path = self._cycle_evidence_path(current_cycle, "review.json", create=False)
-        after_review = (
-            review_path.exists()
-            and state.review.verdict is not ReviewVerdict.UNKNOWN
-            and cursor not in {"PROGRAMMER_REPAIR", "DEBUGGER", "VALIDATE", "REVIEW"}
-        )
-        if after_review:
-            self._restore_review_evidence(current_cycle, state)
-            expected = ReviewVerdict.PASS if self.review_passed else ReviewVerdict.FAIL
-            if (
-                state.review.verdict is not expected
-                or state.review.safe_to_close is not self.review_passed
-                or state.review.findings != self.review_findings
-            ):
-                raise WorkspaceError("GraphState and review evidence disagree")
+        review_is_current = cursor not in {"PROGRAMMER_REPAIR", "DEBUGGER", "VALIDATE"}
+        if review_path.exists() and review_is_current:
+            self._restore_review_evidence(
+                current_cycle,
+                state,
+                verify_workspace=not (self.operations / "commit-witness.json").exists(),
+            )
+            if cursor == "REVIEW" and state.review.verdict is ReviewVerdict.UNKNOWN:
+                pass
+            else:
+                expected = ReviewVerdict.PASS if self.review_passed else ReviewVerdict.FAIL
+                if (
+                    state.review.verdict is not expected
+                    or state.review.safe_to_close is not self.review_passed
+                    or state.review.findings != self.review_findings
+                ):
+                    raise WorkspaceError("GraphState and review evidence disagree")
 
         witness_path = self.operations / "commit-witness.json"
         if witness_path.exists():
@@ -1028,7 +1034,9 @@ class WriteExecution:
         self.diff_check = decode_value(validation["diff_check"], DiffCheckResult)
         self.validation_passed = bool(validation["passed"])
 
-    def _restore_review_evidence(self, cycle: int, state: GraphState) -> None:
+    def _restore_review_evidence(
+        self, cycle: int, state: GraphState, *, verify_workspace: bool = True
+    ) -> None:
         review = self._payload_path(self._cycle_evidence_path(cycle, "review.json", create=False))
         manifest = self._require_manifest()
         if (
@@ -1081,14 +1089,21 @@ class WriteExecution:
                 "context_digest",
             }:
                 raise SemanticReviewEvidenceError("semantic_review_evidence_mismatch")
-            context = self.prepare_semantic_review_context(state, cycle)
+            context = self.prepare_semantic_review_context(
+                state, cycle, verify_workspace=verify_workspace
+            )
             if semantic.get("context_digest") != context.digest:
                 raise SemanticReviewContextError("semantic_review_context_mismatch")
+            from agentgraph.write.analysis import semantic_review_request
+
+            expected_request = semantic_review_request(context)
+            if semantic.get("input_digest") != expected_request.input_digest:
+                raise SemanticReviewEvidenceError("semantic_review_evidence_mismatch")
             try:
                 value = self.analysis.restore_semantic_review(
                     semantic.get("evidence_reference"),
                     semantic.get("output_digest"),
-                    semantic.get("input_digest"),
+                    expected_request.input_digest,
                 )
             except Exception as exc:
                 raise SemanticReviewEvidenceError("semantic_review_evidence_mismatch") from exc

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import shutil
 from pathlib import Path
 
@@ -10,7 +11,8 @@ from agentgraph.agents import AgentResponse
 from agentgraph.core import FailureCategory, RepairClassification, RunStatus
 from agentgraph.infra import GitAdapter, GitCommitIdentity
 from agentgraph.runtime import ProjectRegistry, RuntimePaths
-from agentgraph.runtime.codec import sha256_digest
+from agentgraph.runtime.atomic import atomic_write_bytes
+from agentgraph.runtime.codec import canonical_json_bytes, parse_json_bytes, sha256_digest
 from agentgraph.write import WriteSliceOutcome, WriteSliceRequest, WriteSliceRunner
 from agentgraph.write.evidence import read_evidence
 from tests.integration.test_m009_repair_loop import (
@@ -106,6 +108,20 @@ class MutateAfterValidation:
             workspace_file.write_text("value = 777\n", encoding="utf-8")
 
 
+class ReviewBoundaryCrash(BaseException):
+    pass
+
+
+class CrashAfterSemanticEvidence:
+    def __init__(self):
+        self.triggered = False
+
+    def __call__(self, stage):
+        if stage == "after_semantic_review_evidence" and not self.triggered:
+            self.triggered = True
+            raise ReviewBoundaryCrash("crash before combined review evidence")
+
+
 def runner(target, runtime, analysis, changes, review=None, *, repairs=0, fault=None):
     paths = RuntimePaths.resolve(runtime)
     adapter = GitAdapter(executable=shutil.which("git") or "git")
@@ -122,6 +138,32 @@ def runner(target, runtime, analysis, changes, review=None, *, repairs=0, fault=
         max_repair_cycles=repairs,
         fault=fault,
     )
+
+
+def rewrite_evidence(path: Path, mutate) -> None:
+    document = parse_json_bytes(path.read_bytes())
+    mutate(document)
+    body = {key: value for key, value in document.items() if key != "content_digest"}
+    document["content_digest"] = "sha256:" + hashlib.sha256(canonical_json_bytes(body)).hexdigest()
+    atomic_write_bytes(path, canonical_json_bytes(document))
+
+
+def crash_after_completed_review(tmp_path, reviewer, *, changes=None, repairs=0, invocation=10):
+    target = _repair_target(tmp_path)
+    runtime = tmp_path / "runtime"
+    selected_changes = changes or SequentialChangeProvider((2,))
+    first = runner(
+        target,
+        runtime,
+        RepairAgent(("debugger", "programmer")),
+        selected_changes,
+        reviewer,
+        repairs=repairs,
+        fault=NodeInvocationFault(invocation),
+    )
+    with pytest.raises(RuntimeError, match="M010 interruption"):
+        first.run(WriteSliceRequest(scope_id="E001"))
+    return target, runtime, first
 
 
 def test_semantic_pass_runs_inside_canonical_review_and_commits_once(tmp_path) -> None:
@@ -327,6 +369,207 @@ def test_completed_review_evidence_is_reused_after_interruption(tmp_path) -> Non
 
     assert report.outcome is WriteSliceOutcome.LOCAL_COMMIT_CREATED
     assert len(reviewer.calls) == 1
+
+
+def test_finalized_semantic_review_rehydrates_without_reviewer_reinvoke(tmp_path) -> None:
+    target = _repair_target(tmp_path)
+    runtime = tmp_path / "runtime"
+    reviewer = SemanticReviewer()
+    changes = SequentialChangeProvider((2,))
+    first = runner(target, runtime, RepairAgent(), changes, reviewer)
+    initial = first.run(WriteSliceRequest(scope_id="E001"))
+    assert initial.outcome is WriteSliceOutcome.LOCAL_COMMIT_CREATED
+
+    resumed = runner(target, runtime, RepairAgent(), changes, reviewer).resume("run_m010_fixture")
+
+    assert resumed.outcome is WriteSliceOutcome.LOCAL_COMMIT_CREATED
+    assert len(reviewer.calls) == 1
+
+
+def test_completed_fail_is_reused_then_routes_to_classifier_without_same_cycle_reinvoke(
+    tmp_path,
+) -> None:
+    reviewer = SemanticReviewer(("fail", "pass"))
+    changes = SequentialChangeProvider((2, 2))
+    target, runtime, first = crash_after_completed_review(
+        tmp_path, reviewer, changes=changes, repairs=1
+    )
+    first_digest = reviewer.calls[0].input_digest
+
+    report = runner(
+        target,
+        runtime,
+        RepairAgent(("debugger",)),
+        first.change_provider,
+        reviewer,
+        repairs=1,
+    ).resume("run_m010_fixture")
+
+    assert report.outcome is WriteSliceOutcome.LOCAL_COMMIT_CREATED
+    assert report.executed_nodes[:2] == ("REVIEW", "CLASSIFY_FAILURE")
+    assert len(reviewer.calls) == 2
+    assert sum(call.input_digest == first_digest for call in reviewer.calls) == 1
+
+
+def test_completed_blocked_review_is_reused_without_reviewer_reinvoke(tmp_path) -> None:
+    reviewer = SemanticReviewer(blocked=True)
+    target, runtime, first = crash_after_completed_review(tmp_path, reviewer)
+
+    report = runner(
+        target,
+        runtime,
+        RepairAgent(),
+        first.change_provider,
+        reviewer,
+    ).resume("run_m010_fixture")
+
+    assert report.outcome is WriteSliceOutcome.BLOCKED
+    assert report.issues[0].code == "review_evidence_unavailable"
+    assert len(reviewer.calls) == 1
+
+
+def tamper_semantic_host(runtime: Path) -> None:
+    path = next(runtime.rglob("provider/m010-reviewer/agents/REVIEW/*/analysis.json"))
+    rewrite_evidence(
+        path,
+        lambda document: document["payload"]["response"].__setitem__("summary", "tampered summary"),
+    )
+
+
+def tamper_review_context(runtime: Path) -> None:
+    path = next(runtime.rglob("operations/review-context.json"))
+    rewrite_evidence(
+        path,
+        lambda document: document["payload"]["context"].__setitem__("goal", "tampered goal"),
+    )
+
+
+def tamper_final_review(runtime: Path) -> None:
+    path = next(runtime.rglob("operations/review.json"))
+    rewrite_evidence(
+        path,
+        lambda document: document["payload"].__setitem__("passed", False),
+    )
+
+
+def substitute_semantic_reference(runtime: Path) -> None:
+    path = next(runtime.rglob("operations/review.json"))
+    rewrite_evidence(
+        path,
+        lambda document: document["payload"]["semantic"].__setitem__(
+            "evidence_reference", "provider/m010-reviewer/agents/REVIEW/missing/analysis.json"
+        ),
+    )
+
+
+def substitute_semantic_input_digest(runtime: Path) -> None:
+    path = next(runtime.rglob("operations/review.json"))
+    rewrite_evidence(
+        path,
+        lambda document: document["payload"]["semantic"].__setitem__(
+            "input_digest", "sha256:" + "0" * 64
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    ("tamper", "expected_code"),
+    [
+        (tamper_semantic_host, "semantic_review_evidence_mismatch"),
+        (tamper_review_context, "semantic_review_context_mismatch"),
+        (tamper_final_review, "semantic_review_evidence_mismatch"),
+        (substitute_semantic_reference, "semantic_review_evidence_mismatch"),
+        (substitute_semantic_input_digest, "semantic_review_evidence_mismatch"),
+    ],
+)
+def test_completed_review_tamper_is_recovery_corruption_without_reviewer_call(
+    tmp_path, tamper, expected_code
+) -> None:
+    reviewer = SemanticReviewer()
+    target, runtime, first = crash_after_completed_review(tmp_path, reviewer)
+    tamper(runtime)
+
+    report = runner(
+        target,
+        runtime,
+        RepairAgent(),
+        first.change_provider,
+        reviewer,
+    ).resume("run_m010_fixture")
+
+    assert report.outcome is WriteSliceOutcome.RECOVERY_REQUIRED
+    assert report.issues[0].code == expected_code
+    assert len(reviewer.calls) == 1
+
+
+def test_previous_cycle_semantic_evidence_cannot_authorize_current_cycle(tmp_path) -> None:
+    reviewer = SemanticReviewer(("fail", "pass"))
+    changes = SequentialChangeProvider((2, 2))
+    target, runtime, first = crash_after_completed_review(
+        tmp_path,
+        reviewer,
+        changes=changes,
+        repairs=1,
+        invocation=14,
+    )
+    cycle_zero = read_evidence(next(runtime.rglob("operations/review.json")))["payload"]
+    cycle_one_path = next(runtime.rglob("operations/repairs/001/review.json"))
+
+    def substitute(document):
+        current = document["payload"]["semantic"]
+        old = cycle_zero["semantic"]
+        current["evidence_reference"] = old["evidence_reference"]
+        current["input_digest"] = old["input_digest"]
+
+    rewrite_evidence(cycle_one_path, substitute)
+
+    report = runner(
+        target,
+        runtime,
+        RepairAgent(),
+        first.change_provider,
+        reviewer,
+        repairs=1,
+    ).resume("run_m010_fixture")
+
+    assert report.outcome is WriteSliceOutcome.RECOVERY_REQUIRED
+    assert report.issues[0].code == "semantic_review_evidence_mismatch"
+    assert len(reviewer.calls) == 2
+
+
+def test_partial_semantic_evidence_is_not_completion_authority(tmp_path) -> None:
+    target = _repair_target(tmp_path)
+    runtime = tmp_path / "runtime"
+    reviewer = SemanticReviewer(("pass", "pass"))
+    crash = CrashAfterSemanticEvidence()
+    first = runner(
+        target,
+        runtime,
+        RepairAgent(),
+        SequentialChangeProvider((2,)),
+        reviewer,
+        fault=crash,
+    )
+
+    with pytest.raises(ReviewBoundaryCrash):
+        first.run(WriteSliceRequest(scope_id="E001"))
+    assert not tuple(runtime.rglob("operations/review.json"))
+    assert len(tuple(runtime.rglob("provider/m010-reviewer/agents/REVIEW/*/analysis.json"))) == 1
+
+    report = runner(
+        target,
+        runtime,
+        RepairAgent(),
+        first.change_provider,
+        reviewer,
+    ).resume("run_m010_fixture")
+
+    assert report.outcome is WriteSliceOutcome.LOCAL_COMMIT_CREATED
+    assert len(reviewer.calls) == 2
+    assert reviewer.contexts[0].node_attempt_id == reviewer.contexts[1].node_attempt_id
+    assert (
+        reviewer.contexts[0].provider_invocation_id != reviewer.contexts[1].provider_invocation_id
+    )
 
 
 def test_enabled_resume_requires_review_provider(tmp_path) -> None:

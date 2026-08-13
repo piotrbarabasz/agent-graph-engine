@@ -39,6 +39,7 @@ from agentgraph.agents import (
     reconcile_task_package,
     stable_union,
 )
+from agentgraph.agents.prompts import build_semantic_review_prompt
 from agentgraph.core import GraphState, RiskLevel
 from agentgraph.infra import GitAdapter, GitRepository
 from agentgraph.integration import verify_work_source_revision
@@ -46,7 +47,18 @@ from agentgraph.runtime.codec import encode_value, sha256_digest
 from agentgraph.work import WorkSource
 
 from .evidence import read_evidence, write_evidence
-from .models import WriteInputs
+from .models import SemanticReviewContext, WriteInputs
+
+
+def semantic_review_request(context: SemanticReviewContext) -> AgentRequest:
+    """Build the one canonical request bound to an engine-owned review context."""
+
+    return AgentRequest.create(
+        "semantic_review",
+        build_semantic_review_prompt(context),
+        SEMANTIC_REVIEW_SCHEMA,
+        "agentgraph.semantic-review.v1",
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -161,7 +173,7 @@ class AgentExecution:
     def semantic_review(
         self,
         node_attempt_id: str,
-        prompt: str,
+        context: SemanticReviewContext,
         *,
         repository_root: Path,
         expected_workspace_digest: str,
@@ -169,12 +181,7 @@ class AgentExecution:
     ) -> AnalysisResult:
         if self.review_provider is None:
             raise AgentContextError("review_provider_required")
-        request = AgentRequest.create(
-            "semantic_review",
-            prompt,
-            SEMANTIC_REVIEW_SCHEMA,
-            "agentgraph.semantic-review.v1",
-        )
+        request = semantic_review_request(context)
         result = self._invoke(
             "REVIEW",
             node_attempt_id,

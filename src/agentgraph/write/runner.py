@@ -427,6 +427,7 @@ class WriteSliceRunner:
             self.identity,
             self.validation_timeout_seconds,
             rehydrating,
+            self.fault or (lambda stage: None),
         )
         nodes = {
             "START": StartNode(),
