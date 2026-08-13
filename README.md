@@ -26,6 +26,12 @@ M009 enables up to two explicit graph repair cycles. Validation or deterministic
 route through `CLASSIFY_FAILURE`, then `PROGRAMMER_REPAIR` or `DEBUGGER`, before returning to the
 canonical `VALIDATE` and `REVIEW` nodes. Repairs remain uncommitted until one final verified local
 commit.
+M010 adds an optional independent semantic review layer inside the existing canonical `REVIEW`
+node. Mechanical integrity review remains authoritative and runs first. When explicitly configured,
+a fresh read-only `AgentProvider` evaluates the current external worktree against effective
+requirements and acceptance criteria. Semantic failures use the existing M009 classification and
+repair graph; reviewer contract, infrastructure, or mutation failures are fatal and never consume
+repair capacity.
 
 Agent Graph Engine—not Codex—computes stale-file hashes, applies changes, runs validation, reviews
 the actual diff, stages files, and verifies the local commit. The provider receives a neutral read
@@ -86,6 +92,16 @@ file. Validation and deterministic review evidence are stored per cycle. The fai
 reads the current dirty external worktree under a content-hash mutation guard; repair providers
 remain proposal-only. Final review, staging, tree verification, and the single commit are all bound
 to the latest manifest.
+
+M010 persists whether semantic review is enabled in the immutable write inputs. A run that enabled
+it cannot resume without an explicit review provider, while adding a provider to a legacy run does
+not change that run's review policy. Mechanical, semantic-context, and combined final review
+evidence are stored separately and per repair cycle. The semantic context binds the exact current
+manifest, current-cycle validation receipts, effective requirements and acceptance criteria,
+architecture invariants, baseline, source revision, and original write capability. Reviewer output
+is strict bounded JSON. Finding paths are diagnostic references only and cannot expand repair write
+authority. The reviewer receives neither implementation proposals nor author session/reasoning, and
+each repair cycle is assessed by a fresh invocation without previous review prose.
 
 `agentgraph.providers.codex.CodexChangeProvider` probes the installed CLI before use, requires
 non-interactive execution with an explicit Codex working root and a runtime-only permission profile.

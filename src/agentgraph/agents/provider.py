@@ -69,6 +69,16 @@ class DeclaredWorkAgentProvider:
                 "reason_code": None,
                 "message": None,
             }
+        elif request.operation_id == "semantic_review":
+            payload = {
+                "schema_version": 1,
+                "status": "success",
+                "verdict": "pass",
+                "summary": "No material semantic defect was identified.",
+                "findings": [],
+                "reason_code": None,
+                "message": None,
+            }
         else:
             raise ValueError("unsupported declared-work agent operation")
         return AgentResponse(

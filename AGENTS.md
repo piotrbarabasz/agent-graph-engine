@@ -82,3 +82,15 @@
 - Final staging and commit use the final `WorkspaceManifest`, not the latest repair proposal or a
   union of touched files.
 - Interrupted repair nodes remain fail-closed under M002.
+- `REVIEW` remains the canonical `LLM_READ_ONLY` node; M010 adds no graph node or Core state.
+- Deterministic mechanical review always runs before semantic review and cannot be overridden by an
+  LLM. Final `safe_to_close` requires every enabled review layer to pass.
+- Semantic review is a fresh read-only invocation over the current external worktree. It receives
+  engine-bound requirements, validation evidence, and `WorkspaceManifest`, never author reasoning,
+  proposals, session state, or previous semantic-review prose.
+- Semantic findings may block close but never expand write capability, choose a repair transition,
+  or increment repair capacity. Semantic FAIL uses the existing M009 review-failure path.
+- Semantic provider contract and infrastructure failures are fatal review failures, not code-repair
+  signals. Completed review evidence is cycle-aware and bound to the exact current manifest.
+- Reviewer mutation of the dirty worktree is detected by the content-hash manifest guard and is
+  preserved for diagnosis without automatic cleanup.

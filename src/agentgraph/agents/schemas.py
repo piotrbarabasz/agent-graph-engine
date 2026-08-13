@@ -2,7 +2,15 @@
 
 from __future__ import annotations
 
-from .analysis_models import MAX_LIST_ITEMS, MAX_PATHS, MAX_PLAN_STEPS, MAX_TEXT_LENGTH
+from .analysis_models import (
+    MAX_LIST_ITEMS,
+    MAX_PATHS,
+    MAX_PLAN_STEPS,
+    MAX_REQUIREMENT_REFS,
+    MAX_SEMANTIC_FINDINGS,
+    MAX_SUMMARY_LENGTH,
+    MAX_TEXT_LENGTH,
+)
 
 
 def _strings(max_items: int = MAX_LIST_ITEMS) -> dict[str, object]:
@@ -104,6 +112,81 @@ FAILURE_CLASSIFICATION_SCHEMA["allOf"] = [
                 "rationale": {"type": "null"},
                 "reason_code": {"type": "string", "minLength": 1, "maxLength": 128},
                 "message": {"type": "string", "minLength": 1, "maxLength": MAX_TEXT_LENGTH},
+            }
+        },
+    },
+]
+
+SEMANTIC_REVIEW_SCHEMA = _root(
+    {
+        "schema_version": {"const": 1},
+        "status": _STATUS,
+        "verdict": {"enum": ["pass", "fail", None]},
+        "summary": {"type": ["string", "null"], "maxLength": MAX_SUMMARY_LENGTH},
+        "findings": {
+            "type": "array",
+            "maxItems": MAX_SEMANTIC_FINDINGS,
+            "uniqueItems": True,
+            "items": _root(
+                {
+                    "kind": {
+                        "enum": [
+                            "requirement_gap",
+                            "acceptance_criterion_failure",
+                            "architecture_violation",
+                            "logic_defect",
+                            "regression_risk",
+                            "test_quality_issue",
+                            "scope_violation",
+                            "security_concern",
+                            "maintainability_blocker",
+                        ]
+                    },
+                    "path": {"type": ["string", "null"], "maxLength": MAX_TEXT_LENGTH},
+                    "message": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": MAX_TEXT_LENGTH,
+                    },
+                    "requirement_refs": _strings(MAX_REQUIREMENT_REFS),
+                }
+            ),
+        },
+        "reason_code": _REASON,
+        "message": _MESSAGE,
+    }
+)
+SEMANTIC_REVIEW_SCHEMA["allOf"] = [
+    {
+        "if": {"properties": {"status": {"const": "blocked"}}},
+        "then": {
+            "properties": {
+                "verdict": {"type": "null"},
+                "summary": {"type": "null"},
+                "findings": {"maxItems": 0},
+                "reason_code": {"type": "string", "minLength": 1, "maxLength": 128},
+                "message": {"type": "string", "minLength": 1, "maxLength": MAX_TEXT_LENGTH},
+            }
+        },
+    },
+    {
+        "if": {"properties": {"status": {"const": "success"}, "verdict": {"const": "pass"}}},
+        "then": {
+            "properties": {
+                "findings": {"maxItems": 0},
+                "reason_code": {"type": "null"},
+                "message": {"type": "null"},
+            }
+        },
+    },
+    {
+        "if": {"properties": {"status": {"const": "success"}, "verdict": {"const": "fail"}}},
+        "then": {
+            "properties": {
+                "summary": {"type": "string", "minLength": 1, "maxLength": MAX_SUMMARY_LENGTH},
+                "findings": {"minItems": 1},
+                "reason_code": {"type": "null"},
+                "message": {"type": "null"},
             }
         },
     },

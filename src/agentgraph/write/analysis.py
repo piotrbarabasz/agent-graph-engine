@@ -13,6 +13,7 @@ from agentgraph.agents import (
     AGENT_TASK_PACKAGE_SCHEMA,
     EXPLORE_ANALYSIS_SCHEMA,
     FAILURE_CLASSIFICATION_SCHEMA,
+    SEMANTIC_REVIEW_SCHEMA,
     AgentAnalysisDriftError,
     AgentAnalysisStatus,
     AgentContext,
@@ -27,10 +28,12 @@ from agentgraph.agents import (
     AgentTaskPackage,
     ExploreAnalysis,
     FailureClassificationAnalysis,
+    SemanticReviewAnalysis,
     effective_risk,
     parse_explore_payload,
     parse_failure_classification_payload,
     parse_risk_payload,
+    parse_semantic_review_payload,
     parse_task_package_payload,
     reconcile_explore,
     reconcile_task_package,
@@ -49,7 +52,13 @@ from .models import WriteInputs
 @dataclass(frozen=True, slots=True)
 class AnalysisResult:
     response: AgentResponse
-    value: ExploreAnalysis | AgentTaskPackage | AgentRiskAssessment | FailureClassificationAnalysis
+    value: (
+        ExploreAnalysis
+        | AgentTaskPackage
+        | AgentRiskAssessment
+        | FailureClassificationAnalysis
+        | SemanticReviewAnalysis
+    )
     evidence_reference: str
 
 
@@ -58,6 +67,7 @@ class AgentExecution:
     inputs: WriteInputs
     source: WorkSource
     provider: AgentProvider
+    review_provider: AgentProvider | None
     git: GitAdapter
     target: GitRepository
     run_id: str
@@ -148,6 +158,54 @@ class AgentExecution:
         assert isinstance(result.value, FailureClassificationAnalysis)
         return result
 
+    def semantic_review(
+        self,
+        node_attempt_id: str,
+        prompt: str,
+        *,
+        repository_root: Path,
+        expected_workspace_digest: str,
+        workspace_digest: Callable[[], str],
+    ) -> AnalysisResult:
+        if self.review_provider is None:
+            raise AgentContextError("review_provider_required")
+        request = AgentRequest.create(
+            "semantic_review",
+            prompt,
+            SEMANTIC_REVIEW_SCHEMA,
+            "agentgraph.semantic-review.v1",
+        )
+        result = self._invoke(
+            "REVIEW",
+            node_attempt_id,
+            request,
+            parse_semantic_review_payload,
+            _reconcile_semantic_review,
+            provider=self.review_provider,
+            repository_root=repository_root,
+            expected_workspace_digest=expected_workspace_digest,
+            workspace_digest=workspace_digest,
+        )
+        assert isinstance(result.value, SemanticReviewAnalysis)
+        return result
+
+    def restore_semantic_review(
+        self,
+        reference: Any,
+        output_digest: Any,
+        input_digest: Any,
+    ) -> SemanticReviewAnalysis:
+        result = self._restore(
+            reference,
+            output_digest,
+            parse_semantic_review_payload,
+            expected_node="REVIEW",
+            expected_input_digest=input_digest,
+            error_code="semantic_review_evidence_mismatch",
+        )
+        assert isinstance(result, SemanticReviewAnalysis)
+        return result
+
     def prepare_implementation(self, state: GraphState) -> None:
         """Bind IMPLEMENT context to the exact durable GraphState and Explore evidence."""
 
@@ -205,14 +263,18 @@ class AgentExecution:
         repository_root: Path | None = None,
         expected_workspace_digest: str | None = None,
         workspace_digest: Callable[[], str] | None = None,
+        provider: AgentProvider | None = None,
     ) -> AnalysisResult:
+        selected_provider = provider or self.provider
         before = self._pinned_snapshot()
         selected_root = self.target.root if repository_root is None else repository_root
         if (expected_workspace_digest is None) is not (workspace_digest is None):
             raise AgentContextError("workspace manifest guard is incomplete")
         if workspace_digest is not None and workspace_digest() != expected_workspace_digest:
             raise AgentMutationError("repair_workspace_lineage_mismatch")
-        provider_invocation_id, attempt_dir = self._attempt_directory(node_id, node_attempt_id)
+        provider_invocation_id, attempt_dir = self._attempt_directory(
+            selected_provider, node_id, node_attempt_id
+        )
         context = AgentContext(
             self.inputs.project_id,
             self.run_id,
@@ -227,7 +289,7 @@ class AgentExecution:
         provider_error: BaseException | None = None
         response: AgentResponse | None = None
         try:
-            response = self.provider.invoke(request, context)
+            response = selected_provider.invoke(request, context)
         except BaseException as exc:
             provider_error = exc
         after = self.git.snapshot(self.target)
@@ -304,39 +366,55 @@ class AgentExecution:
         )
         return path.relative_to(self.run_path).as_posix()
 
-    def _restore(self, reference: Any, digest: Any, parser: Callable[[Any], Any]) -> Any:
+    def _restore(
+        self,
+        reference: Any,
+        digest: Any,
+        parser: Callable[[Any], Any],
+        *,
+        expected_node: str | None = None,
+        expected_input_digest: Any = None,
+        error_code: str = "agent_analysis_evidence_mismatch",
+    ) -> Any:
         if not isinstance(reference, str) or not isinstance(digest, str):
-            raise AgentEvidenceError("agent_analysis_evidence_mismatch")
+            raise AgentEvidenceError(error_code)
         candidate = self.run_path.joinpath(*reference.split("/"))
         try:
             candidate.resolve(strict=True).relative_to(self.run_path.resolve(strict=True))
         except (OSError, ValueError) as exc:
-            raise AgentEvidenceError("agent_analysis_evidence_mismatch") from exc
+            raise AgentEvidenceError(error_code) from exc
         try:
             document = read_evidence(candidate)
         except Exception as exc:
-            raise AgentEvidenceError("agent_analysis_evidence_mismatch") from exc
+            raise AgentEvidenceError(error_code) from exc
         if (
             document.get("project_id") != self.inputs.project_id
             or document.get("run_id") != self.run_id
             or document.get("source_revision") != self.inputs.source_revision
             or document.get("baseline_head") != self.inputs.baseline_head
             or document.get("output_digest") != digest
+            or (expected_node is not None and document.get("node_id") != expected_node)
+            or (
+                expected_input_digest is not None
+                and document.get("input_digest") != expected_input_digest
+            )
         ):
-            raise AgentEvidenceError("agent_analysis_evidence_mismatch")
+            raise AgentEvidenceError(error_code)
         payload = document.get("payload")
         if not isinstance(payload, dict) or "response" not in payload:
-            raise AgentEvidenceError("agent_analysis_evidence_mismatch")
+            raise AgentEvidenceError(error_code)
         try:
             result = parser(payload["response"])
         except AgentResponseContractError as exc:
-            raise AgentEvidenceError("agent_analysis_evidence_mismatch") from exc
+            raise AgentEvidenceError(error_code) from exc
         if sha256_digest(encode_value(result)) != digest:
-            raise AgentEvidenceError("agent_analysis_evidence_mismatch")
+            raise AgentEvidenceError(error_code)
         return result
 
-    def _attempt_directory(self, node_id: str, attempt_id: str) -> tuple[str, Path]:
-        namespace = getattr(self.provider, "evidence_namespace", "neutral")
+    def _attempt_directory(
+        self, provider: AgentProvider, node_id: str, attempt_id: str
+    ) -> tuple[str, Path]:
+        namespace = getattr(provider, "evidence_namespace", "neutral")
         if (
             not isinstance(namespace, str)
             or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", namespace) is None
@@ -397,3 +475,19 @@ def _repository_semantics(snapshot: Any) -> tuple[object, ...]:
         snapshot.conflicted_paths,
         snapshot.dirty,
     )
+
+
+def _reconcile_semantic_review(root: Path, value: SemanticReviewAnalysis) -> SemanticReviewAnalysis:
+    resolved_root = root.resolve(strict=True)
+    for finding in value.findings:
+        if finding.path is None:
+            continue
+        try:
+            resolved_root.joinpath(*finding.path.split("/")).resolve(strict=False).relative_to(
+                resolved_root
+            )
+        except ValueError as exc:
+            raise AgentResponseContractError(
+                "semantic review finding path escapes the repository"
+            ) from exc
+    return value

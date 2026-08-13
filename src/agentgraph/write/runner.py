@@ -61,6 +61,7 @@ from .analysis import AgentExecution
 from .capability import capability_fingerprint, reconcile_write_capability
 from .errors import (
     RepairPolicyError,
+    ReviewProviderRequiredError,
     WorkCapabilityMismatchError,
     WorkspaceError,
     WritePreparationError,
@@ -87,6 +88,7 @@ class WriteSliceRunner:
         change_provider: ChangeProvider,
         *,
         agent_provider: AgentProvider | None = None,
+        review_agent_provider: AgentProvider | None = None,
         git_adapter: GitAdapter,
         project_registry: ProjectRegistry,
         process_runner: ProcessRunner | None = None,
@@ -106,6 +108,7 @@ class WriteSliceRunner:
         self.work_source = work_source
         self.change_provider = change_provider
         self.agent_provider = agent_provider or DeclaredWorkAgentProvider()
+        self.review_agent_provider = review_agent_provider
         self._m008_agents_enabled = agent_provider is not None
         self.git = git_adapter
         self.registry = project_registry
@@ -233,6 +236,7 @@ class WriteSliceRunner:
             package.scope_required_checks,
             capability_fingerprint(allowed),
             self.max_repair_cycles,
+            self.review_agent_provider is not None,
         )
         run_id = self.run_id_factory()
         self._last_run_id = run_id
@@ -344,6 +348,10 @@ class WriteSliceRunner:
         if document.get("project_id") != project.project_id or document.get("run_id") != run_id:
             raise WritePreparationError("write-inputs identity differs from requested run")
         inputs = decode_value(document.get("payload"), WriteInputs)
+        if inputs.semantic_review_enabled and self.review_agent_provider is None:
+            raise ReviewProviderRequiredError(
+                "semantic review is enabled for this run but no review provider was supplied"
+            )
         inspection = inspect_project(
             repository.root,
             git_adapter=self.git,
@@ -370,6 +378,7 @@ class WriteSliceRunner:
             package.scope_required_checks,
             capability_fingerprint(allowed),
             inputs.max_repair_cycles,
+            inputs.semantic_review_enabled,
         )
         if reconstructed != inputs:
             raise WritePreparationError("live source differs from persisted write inputs")
@@ -409,6 +418,7 @@ class WriteSliceRunner:
                 inputs,
                 self.work_source,
                 self.agent_provider,
+                self.review_agent_provider if inputs.semantic_review_enabled else None,
                 self.git,
                 inspection.repository,
                 run_id,

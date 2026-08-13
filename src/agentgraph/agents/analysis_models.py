@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
+from pathlib import PurePosixPath
 from typing import Any
 
 from agentgraph.core import RepairClassification, RiskLevel
@@ -17,12 +19,51 @@ MAX_LIST_ITEMS = 100
 MAX_TEXT_LENGTH = 2000
 MAX_PLAN_STEPS = 50
 MAX_RESPONSE_BYTES = 256 * 1024
+MAX_SEMANTIC_FINDINGS = 20
+MAX_REQUIREMENT_REFS = 20
+MAX_SUMMARY_LENGTH = 4000
 _REASON = re.compile(r"[a-z][a-z0-9_]{0,127}\Z", re.ASCII)
 
 
 class AgentAnalysisStatus(StrEnum):
     SUCCESS = "success"
     BLOCKED = "blocked"
+
+
+class SemanticReviewVerdict(StrEnum):
+    PASS = "pass"
+    FAIL = "fail"
+
+
+class SemanticReviewFindingKind(StrEnum):
+    REQUIREMENT_GAP = "requirement_gap"
+    ACCEPTANCE_CRITERION_FAILURE = "acceptance_criterion_failure"
+    ARCHITECTURE_VIOLATION = "architecture_violation"
+    LOGIC_DEFECT = "logic_defect"
+    REGRESSION_RISK = "regression_risk"
+    TEST_QUALITY_ISSUE = "test_quality_issue"
+    SCOPE_VIOLATION = "scope_violation"
+    SECURITY_CONCERN = "security_concern"
+    MAINTAINABILITY_BLOCKER = "maintainability_blocker"
+
+
+@dataclass(frozen=True, slots=True)
+class SemanticReviewFinding:
+    kind: SemanticReviewFindingKind
+    path: str | None
+    message: str
+    requirement_refs: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class SemanticReviewAnalysis:
+    schema_version: int
+    status: AgentAnalysisStatus
+    verdict: SemanticReviewVerdict | None
+    summary: str | None
+    findings: tuple[SemanticReviewFinding, ...]
+    reason_code: str | None
+    message: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -232,6 +273,91 @@ def parse_failure_classification_payload(value: Any) -> FailureClassificationAna
     return result
 
 
+def parse_semantic_review_payload(value: Any) -> SemanticReviewAnalysis:
+    document = _document(
+        value,
+        {
+            "schema_version",
+            "status",
+            "verdict",
+            "summary",
+            "findings",
+            "reason_code",
+            "message",
+        },
+    )
+    status = _status(document)
+    raw_verdict = document["verdict"]
+    try:
+        verdict = None if raw_verdict is None else SemanticReviewVerdict(raw_verdict)
+    except (TypeError, ValueError) as exc:
+        raise AgentResponseContractError("semantic review verdict is invalid") from exc
+    summary = document["summary"]
+    if summary is not None:
+        _text(summary, "summary", MAX_SUMMARY_LENGTH)
+    raw_findings = document["findings"]
+    if not isinstance(raw_findings, (list, tuple)) or len(raw_findings) > MAX_SEMANTIC_FINDINGS:
+        raise AgentResponseContractError("semantic review findings must be a bounded array")
+    findings: list[SemanticReviewFinding] = []
+    for raw in raw_findings:
+        finding = _semantic_finding(raw)
+        if finding in findings:
+            raise AgentResponseContractError("semantic review contains duplicate findings")
+        findings.append(finding)
+    result = SemanticReviewAnalysis(
+        1,
+        status,
+        verdict,
+        summary,
+        tuple(findings),
+        document["reason_code"],
+        document["message"],
+    )
+    _status_fields(status, result.reason_code, result.message)
+    if status is AgentAnalysisStatus.SUCCESS:
+        if verdict is SemanticReviewVerdict.PASS and result.findings:
+            raise AgentResponseContractError("passing semantic review cannot contain findings")
+        if verdict is SemanticReviewVerdict.FAIL and (not result.findings or not summary):
+            raise AgentResponseContractError("failed semantic review requires summary and findings")
+        if verdict is None:
+            raise AgentResponseContractError("successful semantic review requires a verdict")
+    elif verdict is not None or summary is not None or result.findings:
+        raise AgentResponseContractError("blocked semantic review cannot contain a decision")
+    return result
+
+
+def _semantic_finding(value: Any) -> SemanticReviewFinding:
+    expected = {"kind", "path", "message", "requirement_refs"}
+    if not isinstance(value, Mapping) or set(value) != expected:
+        raise AgentResponseContractError("semantic review finding has unknown or missing fields")
+    try:
+        kind = SemanticReviewFindingKind(value["kind"])
+    except (TypeError, ValueError) as exc:
+        raise AgentResponseContractError("semantic review finding kind is invalid") from exc
+    path = value["path"]
+    if path is not None:
+        if (
+            not isinstance(path, str)
+            or not path
+            or len(path) > MAX_TEXT_LENGTH
+            or "\x00" in path
+            or "\\" in path
+        ):
+            raise AgentResponseContractError("semantic review finding path is invalid")
+        pure = PurePosixPath(path)
+        if (
+            pure.is_absolute()
+            or "." in pure.parts
+            or ".." in pure.parts
+            or any(":" in part for part in pure.parts)
+            or path.startswith("//")
+            or pure.as_posix() != path
+        ):
+            raise AgentResponseContractError("semantic review finding path is invalid")
+    refs = _strings(value, "requirement_refs", MAX_REQUIREMENT_REFS)
+    return SemanticReviewFinding(kind, path, _text(value["message"], "finding message"), refs)
+
+
 def _document(value: Any, expected: set[str]) -> dict[str, Any]:
     if not isinstance(value, dict) or set(value) != expected:
         raise AgentResponseContractError("agent response has unknown or missing fields")
@@ -263,8 +389,8 @@ def _strings(document: dict[str, Any], field: str, limit: int = MAX_LIST_ITEMS) 
     return result
 
 
-def _text(value: Any, field: str) -> str:
-    if not isinstance(value, str) or not value or "\x00" in value or len(value) > MAX_TEXT_LENGTH:
+def _text(value: Any, field: str, limit: int = MAX_TEXT_LENGTH) -> str:
+    if not isinstance(value, str) or not value or "\x00" in value or len(value) > limit:
         raise AgentResponseContractError(f"{field} contains invalid text")
     return value
 

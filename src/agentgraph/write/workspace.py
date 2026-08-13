@@ -8,6 +8,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from agentgraph.agents import AgentAnalysisStatus, SemanticReviewVerdict
+from agentgraph.agents.prompts import build_semantic_review_prompt
 from agentgraph.core import (
     FailureCategory,
     GraphState,
@@ -25,7 +27,7 @@ from agentgraph.infra import (
     ProcessRunner,
     ProcessStatus,
 )
-from agentgraph.runtime.codec import decode_value
+from agentgraph.runtime.codec import decode_value, encode_value
 from agentgraph.work import WorkSource
 
 from .apply import apply_changeset
@@ -37,6 +39,9 @@ from .errors import (
     RepairFailureContextError,
     RepairLineageError,
     RepairWorkspaceLineageError,
+    SemanticReviewBlockedError,
+    SemanticReviewContextError,
+    SemanticReviewEvidenceError,
     ValidationExecutionError,
     WorkspaceError,
     WorkspaceManifestError,
@@ -52,6 +57,7 @@ from .models import (
     RepairFailureContext,
     RepairValidationDiagnostic,
     RepairValidationDiagnosticKind,
+    SemanticReviewContext,
     WorkspaceManifest,
     WorkspaceManifestEntry,
     WriteInputs,
@@ -91,6 +97,8 @@ class WriteExecution:
     validation_passed: bool = field(default=False, init=False)
     review_passed: bool = field(default=False, init=False)
     review_findings: tuple[str, ...] = field(default=(), init=False)
+    review_failure_code: str | None = field(default=None, init=False)
+    semantic_blocked: tuple[str, str] | None = field(default=None, init=False)
     commit_sha: str | None = field(default=None, init=False)
     issue_code: str | None = field(default=None, init=False)
 
@@ -226,13 +234,18 @@ class WriteExecution:
         )
         return self.validation_passed
 
-    def review(self, cycle: int) -> tuple[bool, tuple[str, ...]]:
+    def review(
+        self, state: GraphState, cycle: int, node_attempt_id: str
+    ) -> tuple[bool, tuple[str, ...], str | None]:
         repository = self._require_workspace()
         manifest = self._require_manifest()
         path = self._cycle_evidence_path(cycle, "review.json")
         if path.exists():
-            self._restore_review_evidence(cycle)
-            return self.review_passed, self.review_findings
+            self._restore_review_evidence(cycle, state)
+            if self.semantic_blocked is not None:
+                raise SemanticReviewBlockedError(*self.semantic_blocked)
+            return self.review_passed, self.review_findings, self.review_failure_code
+        mechanical_path = self._cycle_evidence_path(cycle, "mechanical-review.json")
         snapshot = self.git.snapshot(repository)
         findings: list[str] = []
         expected = {item.path for item in manifest.files}
@@ -271,19 +284,152 @@ class WriteExecution:
             self.live_recheck("review_baseline_drift")
         except WriteBaselineDriftError:
             findings.append("review_baseline_drift")
-        self.review_findings = tuple(dict.fromkeys(findings))
-        self.review_passed = not self.review_findings
+        mechanical_findings = tuple(dict.fromkeys(findings))
+        mechanical_passed = not mechanical_findings
+        mechanical_payload = {
+            "cycle": cycle,
+            "workspace_manifest_digest": manifest.digest,
+            "passed": mechanical_passed,
+            "findings": mechanical_findings,
+        }
+        if mechanical_path.exists():
+            if self._payload_path(mechanical_path) != mechanical_payload:
+                raise SemanticReviewEvidenceError("semantic_review_evidence_mismatch")
+        else:
+            write_evidence(
+                mechanical_path,
+                context=self.evidence_context(repair_cycle=cycle),
+                payload=mechanical_payload,
+            )
+
+        semantic_payload = None
+        final_findings = mechanical_findings
+        failure_code = None if mechanical_passed else "deterministic_review_failed"
+        if mechanical_passed and self.inputs.semantic_review_enabled:
+            review_context = self.prepare_semantic_review_context(state, cycle)
+            result = self.analysis.semantic_review(
+                node_attempt_id,
+                build_semantic_review_prompt(review_context),
+                repository_root=self.workspace,
+                expected_workspace_digest=manifest.digest,
+                workspace_digest=self.verify_current_manifest,
+            )
+            value = result.value
+            semantic_payload = {
+                "status": value.status.value,
+                "verdict": None if value.verdict is None else value.verdict.value,
+                "summary": value.summary,
+                "findings": encode_value(value.findings),
+                "reason_code": value.reason_code,
+                "message": value.message,
+                "input_digest": result.response.input_digest,
+                "output_digest": result.response.output_digest,
+                "evidence_reference": result.evidence_reference,
+                "context_digest": review_context.digest,
+            }
+            if value.status is AgentAnalysisStatus.BLOCKED:
+                assert value.reason_code is not None and value.message is not None
+                self.semantic_blocked = (value.reason_code, value.message)
+            elif value.verdict is SemanticReviewVerdict.FAIL:
+                final_findings = tuple(_project_semantic_finding(item) for item in value.findings)
+                failure_code = "semantic_review_failed"
+
+        self.review_findings = final_findings
+        self.review_passed = mechanical_passed and (
+            not self.inputs.semantic_review_enabled
+            or (
+                semantic_payload is not None
+                and semantic_payload["status"] == "success"
+                and semantic_payload["verdict"] == "pass"
+            )
+        )
+        self.review_failure_code = failure_code
         write_evidence(
             path,
-            context=self.evidence_context(),
+            context=self.evidence_context(repair_cycle=cycle),
             payload={
                 "cycle": cycle,
                 "workspace_manifest_digest": manifest.digest,
+                "mechanical": {
+                    "passed": mechanical_passed,
+                    "findings": mechanical_findings,
+                },
+                "semantic_review_enabled": self.inputs.semantic_review_enabled,
+                "semantic": semantic_payload,
                 "passed": self.review_passed,
                 "findings": self.review_findings,
+                "failure_code": self.review_failure_code,
             },
         )
-        return self.review_passed, self.review_findings
+        if self.semantic_blocked is not None:
+            raise SemanticReviewBlockedError(*self.semantic_blocked)
+        return self.review_passed, self.review_findings, self.review_failure_code
+
+    def prepare_semantic_review_context(
+        self, state: GraphState, cycle: int
+    ) -> SemanticReviewContext:
+        manifest = self._require_manifest()
+        if (
+            state.validation.verdict is not ValidationVerdict.PASS
+            or state.repair.count != cycle
+            or manifest.cycle != cycle
+            or state.changes.agent_reported_files != tuple(item.path for item in manifest.files)
+        ):
+            raise SemanticReviewContextError("semantic_review_context_mismatch")
+        self.live_recheck("review_baseline_drift")
+        self.verify_current_manifest()
+        self._restore_validation_evidence(cycle)
+        if not self.validation_passed or self.diff_check is None or not self.diff_check.ok:
+            raise SemanticReviewContextError("semantic_review_context_mismatch")
+        if state.validation.checks != tuple(
+            receipt.command_id for receipt in self.validation_receipts
+        ):
+            raise SemanticReviewContextError("semantic_review_context_mismatch")
+        diagnostics = self._current_validation_diagnostics()
+        if any(item.status != ProcessStatus.SUCCEEDED.value for item in diagnostics):
+            raise SemanticReviewContextError("semantic_review_context_mismatch")
+        requirements, acceptance = self.analysis.implementation_requirements()
+        if (
+            requirements != state.requirements.items
+            or acceptance != state.acceptance_criteria.items
+        ):
+            raise SemanticReviewContextError("semantic_review_context_mismatch")
+        explore = self.analysis.explore_analysis
+        context = SemanticReviewContext.create(
+            cycle=cycle,
+            item_id=self.inputs.package.item_id,
+            scope_id=self.inputs.package.scope_id,
+            goal=self.inputs.package.goal,
+            current_manifest_digest=manifest.digest,
+            current_changed_paths=tuple(item.path for item in manifest.files),
+            effective_requirements=requirements,
+            effective_acceptance_criteria=acceptance,
+            architecture_invariants=state.architecture_invariants.items,
+            derived_constraints=() if explore is None else explore.derived_constraints,
+            validation_diagnostics=diagnostics,
+            allowed_paths=self.inputs.expected_allowed_paths,
+            baseline_head=self.inputs.baseline_head,
+            source_revision=self.inputs.source_revision,
+            risk_level=state.risk.level,
+            relevant_files=() if explore is None else explore.relevant_files,
+        )
+        context_path = self._cycle_evidence_path(cycle, "review-context.json")
+        if context_path.exists():
+            try:
+                restored = decode_value(
+                    self._payload_path(context_path)["context"], SemanticReviewContext
+                )
+            except Exception as exc:
+                raise SemanticReviewContextError("semantic_review_context_mismatch") from exc
+            if restored != context:
+                raise SemanticReviewContextError("semantic_review_context_mismatch")
+        else:
+            write_evidence(
+                context_path,
+                context=self.evidence_context(repair_cycle=cycle),
+                payload={"context": context, "context_digest": context.digest},
+            )
+        return context
 
     def capture_manifest(self, cycle: int) -> WorkspaceManifest:
         """Capture the exact current effective diff against the pinned baseline."""
@@ -379,7 +525,7 @@ class WriteExecution:
             ):
                 raise RepairFailureContextError("repair_failure_context_mismatch")
             self._restore_validation_evidence(cycle)
-            self._restore_review_evidence(cycle)
+            self._restore_review_evidence(cycle, state)
             if (
                 not self.validation_passed
                 or self.review_passed
@@ -813,7 +959,7 @@ class WriteExecution:
             and cursor not in {"PROGRAMMER_REPAIR", "DEBUGGER", "VALIDATE", "REVIEW"}
         )
         if after_review:
-            self._restore_review_evidence(current_cycle)
+            self._restore_review_evidence(current_cycle, state)
             expected = ReviewVerdict.PASS if self.review_passed else ReviewVerdict.FAIL
             if (
                 state.review.verdict is not expected
@@ -882,16 +1028,104 @@ class WriteExecution:
         self.diff_check = decode_value(validation["diff_check"], DiffCheckResult)
         self.validation_passed = bool(validation["passed"])
 
-    def _restore_review_evidence(self, cycle: int) -> None:
+    def _restore_review_evidence(self, cycle: int, state: GraphState) -> None:
         review = self._payload_path(self._cycle_evidence_path(cycle, "review.json", create=False))
         manifest = self._require_manifest()
         if (
-            review.get("cycle") != cycle
+            set(review)
+            != {
+                "cycle",
+                "workspace_manifest_digest",
+                "mechanical",
+                "semantic_review_enabled",
+                "semantic",
+                "passed",
+                "findings",
+                "failure_code",
+            }
+            or review.get("cycle") != cycle
             or review.get("workspace_manifest_digest") != manifest.digest
+            or review.get("semantic_review_enabled") is not self.inputs.semantic_review_enabled
         ):
-            raise RepairFailureContextError("repair_failure_context_mismatch")
+            raise SemanticReviewEvidenceError("semantic_review_evidence_mismatch")
+        mechanical = review.get("mechanical")
+        mechanical_path = self._cycle_evidence_path(cycle, "mechanical-review.json", create=False)
+        try:
+            mechanical_evidence = self._payload_path(mechanical_path)
+        except Exception as exc:
+            raise SemanticReviewEvidenceError("semantic_review_evidence_mismatch") from exc
+        if (
+            not isinstance(mechanical, dict)
+            or mechanical
+            != {
+                "passed": mechanical_evidence.get("passed"),
+                "findings": mechanical_evidence.get("findings"),
+            }
+            or mechanical_evidence.get("cycle") != cycle
+            or mechanical_evidence.get("workspace_manifest_digest") != manifest.digest
+        ):
+            raise SemanticReviewEvidenceError("semantic_review_evidence_mismatch")
+        semantic = review.get("semantic")
+        self.semantic_blocked = None
+        if self.inputs.semantic_review_enabled and mechanical.get("passed") is True:
+            if not isinstance(semantic, dict) or set(semantic) != {
+                "status",
+                "verdict",
+                "summary",
+                "findings",
+                "reason_code",
+                "message",
+                "input_digest",
+                "output_digest",
+                "evidence_reference",
+                "context_digest",
+            }:
+                raise SemanticReviewEvidenceError("semantic_review_evidence_mismatch")
+            context = self.prepare_semantic_review_context(state, cycle)
+            if semantic.get("context_digest") != context.digest:
+                raise SemanticReviewContextError("semantic_review_context_mismatch")
+            try:
+                value = self.analysis.restore_semantic_review(
+                    semantic.get("evidence_reference"),
+                    semantic.get("output_digest"),
+                    semantic.get("input_digest"),
+                )
+            except Exception as exc:
+                raise SemanticReviewEvidenceError("semantic_review_evidence_mismatch") from exc
+            if (
+                semantic.get("status") != value.status.value
+                or semantic.get("verdict")
+                != (None if value.verdict is None else value.verdict.value)
+                or semantic.get("summary") != value.summary
+                or semantic.get("findings") != encode_value(value.findings)
+                or semantic.get("reason_code") != value.reason_code
+                or semantic.get("message") != value.message
+            ):
+                raise SemanticReviewEvidenceError("semantic_review_evidence_mismatch")
+            if value.status is AgentAnalysisStatus.BLOCKED:
+                assert value.reason_code is not None and value.message is not None
+                self.semantic_blocked = (value.reason_code, value.message)
+            projected = tuple(_project_semantic_finding(item) for item in value.findings)
+            expected_pass = value.verdict is SemanticReviewVerdict.PASS
+            expected_code = (
+                "semantic_review_failed" if value.verdict is SemanticReviewVerdict.FAIL else None
+            )
+            expected_findings = projected
+        elif semantic is not None:
+            raise SemanticReviewEvidenceError("semantic_review_evidence_mismatch")
+        else:
+            expected_pass = bool(mechanical.get("passed"))
+            expected_code = None if expected_pass else "deterministic_review_failed"
+            expected_findings = tuple(mechanical.get("findings", ()))
+        if (
+            review.get("passed") is not expected_pass
+            or tuple(review.get("findings", ())) != expected_findings
+            or review.get("failure_code") != expected_code
+        ):
+            raise SemanticReviewEvidenceError("semantic_review_evidence_mismatch")
         self.review_passed = bool(review["passed"])
         self.review_findings = tuple(review["findings"])
+        self.review_failure_code = review["failure_code"]
 
     def _payload(self, name: str) -> dict[str, object]:
         return self._payload_path(self.operations / name)
@@ -1050,6 +1284,26 @@ class WriteExecution:
             receipt.stderr_truncated,
         )
 
+    def _current_validation_diagnostics(self) -> tuple[RepairValidationDiagnostic, ...]:
+        if self.diff_check is None:
+            raise SemanticReviewContextError("semantic_review_context_mismatch")
+        return (
+            *(
+                self._validation_diagnostic(
+                    RepairValidationDiagnosticKind.DECLARED_VALIDATION, receipt
+                )
+                for receipt in self.validation_receipts
+            ),
+            self._validation_diagnostic(
+                RepairValidationDiagnosticKind.GIT_DIFF_CHECK_WORKTREE,
+                self.diff_check.receipts[0],
+            ),
+            self._validation_diagnostic(
+                RepairValidationDiagnosticKind.GIT_DIFF_CHECK_STAGED,
+                self.diff_check.receipts[1],
+            ),
+        )
+
     def _require_workspace(self) -> GitRepository:
         if self.workspace_repository is None:
             raise WorkspaceError("external workspace has not been created")
@@ -1078,6 +1332,14 @@ class WriteExecution:
 
 def _sha256(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
+
+
+def _project_semantic_finding(finding) -> str:
+    path = finding.path or "none"
+    refs = ""
+    if finding.requirement_refs:
+        refs = f" [requirements: {', '.join(finding.requirement_refs)}]"
+    return f"semantic:{finding.kind.value}:{path}:{finding.message}{refs}"
 
 
 def _file_mode(path: Path) -> int:

@@ -10,6 +10,7 @@ from agentgraph.agents import (
     parse_explore_payload,
     parse_failure_classification_payload,
     parse_risk_payload,
+    parse_semantic_review_payload,
     parse_task_package_payload,
 )
 from agentgraph.infra import CancellationToken, ProcessRunner
@@ -73,6 +74,7 @@ class CodexAgentProvider(AgentProvider):
             "agentgraph.task-package.v1": parse_task_package_payload,
             "agentgraph.risk.v1": parse_risk_payload,
             "agentgraph.failure-classification.v1": parse_failure_classification_payload,
+            "agentgraph.semantic-review.v1": parse_semantic_review_payload,
         }.get(request.output_schema_id)
         if parser is None:
             raise ValueError("unsupported Codex agent schema ID")
