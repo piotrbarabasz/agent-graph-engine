@@ -84,6 +84,8 @@ class AgentExecution:
     target: GitRepository
     run_id: str
     run_path: Path
+    source_root: Path | None = None
+    guard_target: GitRepository | None = None
     explore_analysis: ExploreAnalysis | None = field(default=None, init=False)
     task_package: AgentTaskPackage | None = field(default=None, init=False)
     risk_assessment: AgentRiskAssessment | None = field(default=None, init=False)
@@ -303,6 +305,11 @@ class AgentExecution:
         if _repository_semantics(after) != _repository_semantics(before):
             self.issue_code = AgentMutationError.code
             raise AgentMutationError("agent_provider_mutated_repository") from provider_error
+        if self.guard_target is not None:
+            guarded = self.git.snapshot(self.guard_target)
+            if not self._target_is_pinned(guarded):
+                self.issue_code = AgentMutationError.code
+                raise AgentMutationError("agent_provider_mutated_repository") from provider_error
         if workspace_digest is not None:
             try:
                 workspace_unchanged = workspace_digest() == expected_workspace_digest
@@ -439,7 +446,7 @@ class AgentExecution:
             current /= part
             if current.is_symlink():
                 raise AgentContextError("agent evidence directory cannot traverse a symlink")
-        safe = re.sub(r"[^A-Za-z0-9_.-]", "_", attempt_id)
+        safe = sha256_digest(attempt_id).removeprefix("sha256:")[:16]
         selected = safe
         index = 1
         while (root / selected).exists() or (root / selected).is_symlink():
@@ -458,13 +465,27 @@ class AgentExecution:
         ):
             self.issue_code = AgentAnalysisDriftError.code
             raise AgentAnalysisDriftError("agent_analysis_baseline_drift")
+        if self.guard_target is not None:
+            target = self.git.snapshot(self.guard_target)
+            if not self._target_is_pinned(target):
+                self.issue_code = AgentAnalysisDriftError.code
+                raise AgentAnalysisDriftError("agent_analysis_baseline_drift")
         self._verify_source()
         return snapshot
+
+    def _target_is_pinned(self, snapshot) -> bool:
+        return (
+            snapshot.head_sha == self.inputs.pinned_target_head
+            and snapshot.branch == self.inputs.pinned_target_branch
+            and not snapshot.detached_head
+            and not snapshot.dirty
+            and not snapshot.conflicted_paths
+        )
 
     def _verify_source(self) -> None:
         try:
             snapshot = self.source.snapshot()
-            verify_work_source_revision(self.target.root, snapshot.revision)
+            verify_work_source_revision(self.source_root or self.target.root, snapshot.revision)
         except Exception as exc:
             raise AgentAnalysisDriftError("agent_analysis_baseline_drift") from exc
         if snapshot.revision.fingerprint != self.inputs.source_revision:

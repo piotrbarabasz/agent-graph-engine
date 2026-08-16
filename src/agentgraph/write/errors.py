@@ -9,6 +9,14 @@ class WritePreparationError(WriteSliceError):
     pass
 
 
+class WorkItemPolicyError(WritePreparationError):
+    code = "work_item_policy_mismatch"
+
+
+class WorkPlanMismatchError(WritePreparationError):
+    code = "work_plan_mismatch"
+
+
 class WorkCapabilityMismatchError(WritePreparationError):
     pass
 

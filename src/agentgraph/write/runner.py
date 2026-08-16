@@ -1,10 +1,12 @@
-"""Durable orchestration for the first controlled local write slice."""
+"""Durable sequential execution of a frozen, single-scope work plan."""
 
 from __future__ import annotations
 
 import hashlib
 import json
 from collections.abc import Callable
+from contextlib import suppress
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 
@@ -45,7 +47,6 @@ from agentgraph.nodes import (
     PreflightNode,
     RepairNode,
     ReviewNode,
-    SelectWorkNode,
     StartNode,
     ValidateNode,
 )
@@ -58,36 +59,43 @@ from agentgraph.runtime import (
     RuntimePaths,
     StateStore,
 )
-from agentgraph.runtime.codec import decode_value, utc_now
+from agentgraph.runtime.codec import decode_value, sha256_digest, utc_now
 from agentgraph.runtime.ids import generate_run_id
 from agentgraph.work import InvalidWorkSourceError, WorkScopeStatus, WorkSource
 
-from .analysis import AgentExecution
-from .capability import capability_fingerprint, reconcile_write_capability
-from .checkpoints import WriteCheckpointController
 from .errors import (
     CheckpointError,
     RepairPolicyError,
     ReviewProviderRequiredError,
     WorkCapabilityMismatchError,
+    WorkItemPolicyError,
+    WorkPlanMismatchError,
     WorkspaceError,
     WritePreparationError,
 )
 from .evidence import read_evidence, write_evidence
 from .models import (
     CheckpointView,
+    WorkPlan,
+    WorkPlanItem,
     WriteInputs,
+    WriteRunInputs,
     WriteSliceIssue,
     WriteSliceOutcome,
     WriteSliceReport,
     WriteSliceRequest,
 )
+from .multi_item import (
+    DynamicItemNode,
+    MultiItemExecution,
+    MultiItemSelectWorkNode,
+    build_work_plan,
+)
 from .provider import ChangeProvider
-from .workspace import WriteExecution
 
 
 class WriteSliceRunner:
-    """Prepare pinned inputs, then execute one item with bounded graph repairs."""
+    """Execute dependency-ready items sequentially within one immutable scope plan."""
 
     def __init__(
         self,
@@ -107,6 +115,7 @@ class WriteSliceRunner:
         validation_timeout_seconds: float = 120.0,
         max_steps: int = 30,
         max_repair_cycles: int = 0,
+        max_work_items_per_run: int = 1,
         checkpoint_ttl_seconds: int = 3600,
         clock: Callable[[], datetime] = utc_now,
         checkpoint_nonce_factory: Callable[[], str] | None = None,
@@ -115,6 +124,8 @@ class WriteSliceRunner:
             raise ValueError("write runner bounds must be positive")
         if type(max_repair_cycles) is not int or max_repair_cycles not in {0, 1, 2}:
             raise RepairPolicyError("M009 supports max_repair_cycles values 0, 1, or 2")
+        if type(max_work_items_per_run) is not int or not 1 <= max_work_items_per_run <= 20:
+            raise WorkItemPolicyError("max_work_items_per_run must be between 1 and 20")
         if type(checkpoint_ttl_seconds) is not int or not 60 <= checkpoint_ttl_seconds <= 86400:
             raise ValueError("checkpoint TTL must be between 60 and 86400 seconds")
         self.repository_root = Path(repository_root)
@@ -134,6 +145,7 @@ class WriteSliceRunner:
         self.validation_timeout_seconds = validation_timeout_seconds
         self.max_steps = max_steps
         self.max_repair_cycles = max_repair_cycles
+        self.max_work_items_per_run = max_work_items_per_run
         self.checkpoint_ttl_seconds = checkpoint_ttl_seconds
         self.clock = clock
         self.checkpoint_nonce_factory = checkpoint_nonce_factory
@@ -175,16 +187,12 @@ class WriteSliceRunner:
                 "one explicit READY work item is required",
                 inspection=inspection,
             )
-        scope = next(
-            value
-            for value in inspection.work_snapshot.scopes
-            if value.scope_id == selection.scope_id
-        )
+        scope = self.work_source.get_scope(inspection.work_snapshot, selection.scope_id)
         if scope.status is not WorkScopeStatus.PLANNED:
             return self._early(
                 WriteSliceOutcome.BLOCKED,
                 "active_scope_write_not_supported_in_m006",
-                "M006 accepts PLANNED scopes only",
+                "write execution accepts PLANNED scopes only",
                 inspection=inspection,
                 selection=selection,
             )
@@ -209,16 +217,6 @@ class WriteSliceRunner:
                 inspection=inspection,
                 selection=selection,
             )
-        try:
-            allowed = reconcile_write_capability(inspection.work_snapshot, selection, package)
-        except WorkCapabilityMismatchError as exc:
-            return self._early(
-                WriteSliceOutcome.INVALID_SOURCE,
-                "work_package_capability_mismatch",
-                str(exc),
-                inspection=inspection,
-                selection=selection,
-            )
         if self.git.local_branch_exists(inspection.repository, scope.branch_hint):
             return self._early(
                 WriteSliceOutcome.BLOCKED,
@@ -227,77 +225,84 @@ class WriteSliceRunner:
                 inspection=inspection,
                 selection=selection,
             )
+        try:
+            plan = build_work_plan(self.work_source, inspection.work_snapshot, scope.scope_id)
+            selected_plan_item = _plan_item(plan, selection.item_id)
+            if selected_plan_item.package != package:
+                raise WorkPlanMismatchError("initial selection differs from frozen work plan")
+        except Exception as exc:
+            code = (
+                "work_package_capability_mismatch"
+                if isinstance(exc, WorkCapabilityMismatchError)
+                else getattr(exc, "code", None) or "work_plan_mismatch"
+            )
+            return self._early(
+                WriteSliceOutcome.INVALID_SOURCE,
+                code,
+                str(exc),
+                inspection=inspection,
+                selection=selection,
+            )
 
-        fingerprint = _input_fingerprint(inspection, request)
-        shadow = ShadowInputs(inspection, preflight, selection, package, fingerprint)
         assert inspection.git_snapshot.head_sha is not None
-        inputs = WriteInputs(
-            project_id=inspection.project_id,
-            package=package,
-            expected_allowed_paths=allowed,
-            source_revision=inspection.work_snapshot.revision.fingerprint,
-            baseline_head=inspection.git_snapshot.head_sha,
-            base_branch=scope.base_branch_hint,
-            scope_branch=scope.branch_hint,
-            item_validation_checks=package.item_validation_checks,
-            scope_required_checks=package.scope_required_checks,
-            capability_fingerprint=capability_fingerprint(allowed),
-            max_repair_cycles=self.max_repair_cycles,
-            semantic_review_enabled=self.review_agent_provider is not None,
-            checkpoint_ttl_seconds=self.checkpoint_ttl_seconds,
+        run_inputs = WriteRunInputs(
+            1,
+            inspection.project_id,
+            scope.scope_id,
+            scope.parent_scope_id,
+            inspection.work_snapshot.revision.fingerprint,
+            inspection.git_snapshot.head_sha,
+            scope.base_branch_hint,
+            scope.branch_hint,
+            plan.digest,
+            self.max_work_items_per_run,
+            self.max_repair_cycles,
+            self.review_agent_provider is not None,
+            self.checkpoint_ttl_seconds,
+        )
+        initial_inputs = _item_inputs(
+            run_inputs, plan, selected_plan_item, run_inputs.target_baseline_head
+        )
+        shadow = ShadowInputs(
+            inspection, preflight, selection, package, _input_fingerprint(inspection, request)
         )
         run_id = self.run_id_factory()
         self._last_run_id = run_id
-        execution, coordinator, checkpoints = self._build_runtime(
-            inspection, shadow, inputs, run_id, rehydrating=False
-        )
+        controller, coordinator = self._build_runtime(inspection, shadow, run_inputs, plan, run_id)
         self._coordinator = coordinator
-        coordinator.start_run(
-            run_id,
-            initialize_artifacts=lambda staging: write_evidence(
+
+        def initialize(staging: Path) -> None:
+            common = {"project_id": run_inputs.project_id, "run_id": run_id}
+            write_evidence(staging / "run-inputs.json", context=common, payload=run_inputs)
+            write_evidence(staging / "work-plan.json", context=common, payload=plan)
+            write_evidence(
                 staging / "write-inputs.json",
                 context={
-                    "project_id": inputs.project_id,
-                    "run_id": run_id,
-                    "item_id": inputs.package.item_id,
-                    "scope_id": inputs.package.scope_id,
-                    "pinned_head": inputs.baseline_head,
-                    "source_revision": inputs.source_revision,
+                    **common,
+                    "item_id": initial_inputs.package.item_id,
+                    "scope_id": initial_inputs.package.scope_id,
+                    "pinned_head": initial_inputs.baseline_head,
+                    "source_revision": initial_inputs.source_revision,
                 },
-                payload=inputs,
-            ),
-        )
-        executed: list[str] = []
-        checkpoint: CheckpointView | None = None
+                payload=initial_inputs,
+            )
+
+        coordinator.start_run(run_id, initialize_artifacts=initialize)
         with coordinator.open_session(run_id) as session:
             state = session.store.load()
-            for _ in range(self.max_steps):
-                if state.graph.current_node == "END":
-                    break
-                executed.append(state.graph.current_node)
-                state = session.step()
-                if state.graph.current_node == "HUMAN_CHECKPOINT":
-                    try:
-                        checkpoint = checkpoints.view(checkpoints.ensure_request(state))
-                    except CheckpointError as exc:
-                        return self._checkpoint_recovery(state, execution, exc)
-                    if self.fault is not None:
-                        self.fault("CHECKPOINT_REQUEST_PERSISTED")
-                    break
-            else:
-                raise WritePreparationError("write graph exceeded its bounded step count")
-        return self._report(state, execution, tuple(executed), checkpoint=checkpoint)
+            return self._continue(session, state, controller, ())
 
     def resume(self, run_id: str) -> WriteSliceReport:
-        """Reconstruct a durable run from immutable inputs and continue only when safe."""
+        """Reconstruct frozen authority and continue only from a safe durable boundary."""
 
         try:
-            execution, coordinator, checkpoints = self._existing_runtime(run_id)
+            controller, coordinator = self._existing_runtime(run_id)
         except (
             WritePreparationError,
             WorkspaceError,
             RepositoryRootMismatchError,
             WorkSourceRepositoryMismatchError,
+            ValueError,
         ) as exc:
             pending = self._pending_checkpoint_report(run_id, "checkpoint_binding_mismatch")
             if pending is not None:
@@ -309,78 +314,50 @@ class WriteSliceRunner:
             )
         self._coordinator = coordinator
         self._last_run_id = run_id
-        executed: list[str] = []
         with coordinator.open_session(run_id, recovery=True) as session:
             assessment = session.assess_recovery()
-            if assessment.action is RecoveryAction.BLOCKED:
-                state = session.store.load()
-                try:
-                    execution.rehydrate(state)
-                except WorkspaceError as exc:
-                    return self._rehydration_required(state, execution, exc)
-                return self._recovery_required(state, execution, assessment)
             if assessment.action in {
                 RecoveryAction.REAPPLY_RECORDED_RESULT,
                 RecoveryAction.COMPLETE_TRANSITION_MARKER,
             }:
                 assessment = session.recover()
-                if assessment.action is RecoveryAction.BLOCKED:
-                    state = session.store.load()
-                    try:
-                        execution.rehydrate(state)
-                    except WorkspaceError as exc:
-                        return self._rehydration_required(state, execution, exc)
-                    return self._recovery_required(state, execution, assessment)
             state = session.store.load()
-            try:
-                execution.rehydrate(state)
-            except WorkspaceError as exc:
-                return self._rehydration_required(state, execution, exc)
+            if assessment.action is RecoveryAction.BLOCKED:
+                with suppress(WorkspaceError):
+                    self._rehydrate_current(controller, state)
+                return self._recovery_required(state, controller, assessment)
             if assessment.action is RecoveryAction.COMPLETED:
-                return self._report(state, execution, ())
+                return self._report(state, controller, ())
             if assessment.action not in {
                 RecoveryAction.CLEAN_RESUME,
                 RecoveryAction.RERUN_INTERRUPTED_NODE,
             }:
-                return self._recovery_required(state, execution, assessment)
+                return self._recovery_required(state, controller, assessment)
+            try:
+                self._rehydrate_current(controller, state)
+            except WorkspaceError as exc:
+                return self._rehydration_required(state, controller, exc)
+            if state.graph.current_node == "DELIVERY_REVIEW":
+                try:
+                    controller.verify_run_boundary(state)
+                except WorkspaceError as exc:
+                    return self._rehydration_required(state, controller, exc)
+                return self._report(state, controller, ())
             if state.graph.current_node == "HUMAN_CHECKPOINT":
                 try:
+                    checkpoints = controller.checkpoints(state)
                     request, decision = checkpoints.decision(state)
                 except CheckpointError as exc:
-                    return self._checkpoint_recovery(state, execution, exc)
+                    return self._checkpoint_recovery(state, controller, exc)
                 if decision is None and not checkpoints.expired(request):
-                    return self._report(
-                        state,
-                        execution,
-                        (),
-                        checkpoint=checkpoints.view(request),
-                    )
-            for _ in range(self.max_steps):
-                if state.graph.current_node == "END":
-                    break
-                executed.append(state.graph.current_node)
-                state = session.step()
-                if state.graph.current_node == "HUMAN_CHECKPOINT":
-                    try:
-                        request, decision = checkpoints.decision(state)
-                    except CheckpointError as exc:
-                        return self._checkpoint_recovery(state, execution, exc)
-                    if decision is None and not checkpoints.expired(request):
-                        return self._report(
-                            state,
-                            execution,
-                            tuple(executed),
-                            checkpoint=checkpoints.view(request),
-                        )
-            else:
-                raise WritePreparationError("resumed write graph exceeded its step bound")
-        return self._report(state, execution, tuple(executed))
+                    return self._report(state, controller, (), checkpoint=checkpoints.view(request))
+            return self._continue(session, state, controller, ())
 
     def assess_recovery(self, run_id: str | None = None) -> RecoveryAssessment:
         selected = run_id or self._last_run_id
         if selected is None:
             raise WritePreparationError("a durable run ID is required")
-        _, coordinator, _ = self._existing_runtime(selected)
+        _, coordinator = self._existing_runtime(selected)
         with coordinator.open_session(selected, recovery=True) as session:
             return session.assess_recovery()
 
@@ -393,15 +370,14 @@ class WriteSliceRunner:
         outcome: CheckpointOutcome,
         actor: str,
     ) -> CheckpointDecision:
-        """Persist one immutable decision; execution resumes only via resume()."""
-
         try:
-            _, coordinator, checkpoints = self._existing_runtime(run_id)
+            controller, coordinator = self._existing_runtime(run_id)
         except (
             WritePreparationError,
             WorkspaceError,
             RepositoryRootMismatchError,
             WorkSourceRepositoryMismatchError,
+            ValueError,
         ) as exc:
             if self._pending_checkpoint_report(run_id, "checkpoint_binding_mismatch") is not None:
                 raise CheckpointError("checkpoint_binding_mismatch") from exc
@@ -418,17 +394,17 @@ class WriteSliceRunner:
                 RecoveryAction.RERUN_INTERRUPTED_NODE,
             }:
                 raise CheckpointError("checkpoint_not_pending")
-            return checkpoints.submit(
-                session.store.load(),
+            state = session.store.load()
+            self._rehydrate_current(controller, state)
+            return controller.checkpoints(state).submit(
+                state,
                 checkpoint_id=checkpoint_id,
                 nonce=nonce,
                 outcome=outcome,
                 actor=actor,
             )
 
-    def _existing_runtime(
-        self, run_id: str
-    ) -> tuple[WriteExecution, DurableGraphCoordinator, WriteCheckpointController]:
+    def _existing_runtime(self, run_id: str) -> tuple[MultiItemExecution, DurableGraphCoordinator]:
         configured = self.repository_root.expanduser().resolve()
         repository = self.git.discover_repository(configured)
         if repository.root != configured:
@@ -437,11 +413,20 @@ class WriteSliceRunner:
         if project is None:
             raise WritePreparationError("target repository is absent from the runtime registry")
         run_path = self.paths.run(project.project_id, run_id)
-        document = read_evidence(run_path / "write-inputs.json")
-        if document.get("project_id") != project.project_id or document.get("run_id") != run_id:
-            raise WritePreparationError("write-inputs identity differs from requested run")
-        inputs = decode_value(document.get("payload"), WriteInputs)
-        if inputs.semantic_review_enabled and self.review_agent_provider is None:
+        run_document = read_evidence(run_path / "run-inputs.json")
+        plan_document = read_evidence(run_path / "work-plan.json")
+        if any(
+            document.get("project_id") != project.project_id or document.get("run_id") != run_id
+            for document in (run_document, plan_document)
+        ):
+            raise WorkPlanMismatchError("run authority identity mismatch")
+        run_inputs = decode_value(run_document.get("payload"), WriteRunInputs)
+        plan = decode_value(plan_document.get("payload"), WorkPlan)
+        if run_inputs.max_work_items_per_run != self.max_work_items_per_run:
+            raise WorkItemPolicyError("resume work-item policy differs from persisted inputs")
+        if run_inputs.max_repair_cycles != self.max_repair_cycles:
+            raise RepairPolicyError("resume repair policy differs from persisted inputs")
+        if run_inputs.semantic_review_enabled and self.review_agent_provider is None:
             raise ReviewProviderRequiredError(
                 "semantic review is enabled for this run but no review provider was supplied"
             )
@@ -454,129 +439,177 @@ class WriteSliceRunner:
         selection, package = prepare_selection(
             self.work_source,
             inspection.work_snapshot,
-            ShadowRequest(scope_id=inputs.package.scope_id),
+            ShadowRequest(scope_id=run_inputs.scope_id),
         )
-        if package is None:
-            raise WritePreparationError("persisted selection is no longer reconstructable")
-        allowed = reconcile_write_capability(inspection.work_snapshot, selection, package)
-        reconstructed = WriteInputs(
+        reconstructed = build_work_plan(
+            self.work_source, inspection.work_snapshot, run_inputs.scope_id
+        )
+        if reconstructed != plan or plan.digest != run_inputs.work_plan_digest:
+            raise WorkPlanMismatchError("work_plan_mismatch")
+        scope = self.work_source.get_scope(inspection.work_snapshot, run_inputs.scope_id)
+        expected_run_inputs = replace(
+            run_inputs,
             project_id=inspection.project_id,
-            package=package,
-            expected_allowed_paths=allowed,
+            parent_scope_id=scope.parent_scope_id,
             source_revision=inspection.work_snapshot.revision.fingerprint,
-            baseline_head=inputs.baseline_head,
-            base_branch=inputs.base_branch,
-            scope_branch=inputs.scope_branch,
-            item_validation_checks=package.item_validation_checks,
-            scope_required_checks=package.scope_required_checks,
-            capability_fingerprint=capability_fingerprint(allowed),
-            max_repair_cycles=inputs.max_repair_cycles,
-            semantic_review_enabled=inputs.semantic_review_enabled,
-            checkpoint_ttl_seconds=inputs.checkpoint_ttl_seconds,
+            base_branch=scope.base_branch_hint or "",
+            scope_branch=scope.branch_hint or "",
         )
-        if reconstructed != inputs:
-            raise WritePreparationError("live source differs from persisted write inputs")
-        if inputs.max_repair_cycles != self.max_repair_cycles:
-            raise RepairPolicyError("resume repair policy differs from persisted write inputs")
+        if expected_run_inputs != run_inputs:
+            raise WorkPlanMismatchError("live source differs from persisted run inputs")
+        if selection.item_id is None:
+            raise WorkPlanMismatchError("initial plan selection is no longer ready")
+        first = _plan_item(plan, selection.item_id)
+        initial_inputs = _item_inputs(run_inputs, plan, first, run_inputs.target_baseline_head)
+        root_document = read_evidence(run_path / "write-inputs.json")
+        if decode_value(root_document.get("payload"), WriteInputs) != initial_inputs:
+            raise WorkPlanMismatchError("root write inputs differ from frozen plan")
         preflight = assess_preflight(inspection, selection)
         shadow = ShadowInputs(
             inspection,
             preflight,
             selection,
             package,
-            _input_fingerprint(inspection, WriteSliceRequest(scope_id=package.scope_id)),
+            _input_fingerprint(inspection, WriteSliceRequest(scope_id=run_inputs.scope_id)),
         )
-        return self._build_runtime(inspection, shadow, inputs, run_id, rehydrating=True)
+        return self._build_runtime(inspection, shadow, run_inputs, plan, run_id)
 
     def _build_runtime(
         self,
         inspection,
         shadow: ShadowInputs,
-        inputs: WriteInputs,
+        run_inputs: WriteRunInputs,
+        plan: WorkPlan,
         run_id: str,
-        *,
-        rehydrating: bool,
-    ) -> tuple[WriteExecution, DurableGraphCoordinator, WriteCheckpointController]:
+    ) -> tuple[MultiItemExecution, DurableGraphCoordinator]:
         run_path = self.paths.run(inspection.project_id, run_id)
-        execution = WriteExecution(
+        controller = MultiItemExecution(
+            run_inputs,
+            plan,
+            inspection.work_snapshot,
             shadow,
-            inputs,
             self.work_source,
             self.change_provider,
+            self.agent_provider,
+            self.review_agent_provider,
             self.git,
             self.processes,
             inspection.repository,
             run_id,
             run_path,
-            AgentExecution(
-                inputs,
-                self.work_source,
-                self.agent_provider,
-                self.review_agent_provider if inputs.semantic_review_enabled else None,
-                self.git,
-                inspection.repository,
-                run_id,
-                run_path,
-            ),
             self.identity,
             self.validation_timeout_seconds,
-            rehydrating,
             self.fault or (lambda stage: None),
+            self.clock,
+            self.checkpoint_nonce_factory,
         )
-        checkpoints = WriteCheckpointController(
-            execution,
-            clock=self.clock,
-            nonce_factory=self.checkpoint_nonce_factory,
-        )
+
+        def dynamic(node_id, factory):
+            return DynamicItemNode(controller, node_id, factory)
+
         nodes = {
             "START": StartNode(),
             "DISCOVER_PROJECT": DiscoverProjectNode(shadow, shadow=False),
             "PREFLIGHT": PreflightNode(shadow, shadow=False),
-            "SELECT_WORK": SelectWorkNode(shadow),
-            "EXPLORE": ExploreNode(inputs, execution.analysis),
-            "BUILD_TASK_PACKAGE": BuildTaskPackageNode(inputs, execution.analysis),
-            "ASSESS_RISK": AssessRiskNode(inputs, execution.analysis),
-            "HUMAN_CHECKPOINT": HumanCheckpointNode(checkpoints),
-            "IMPLEMENT": ImplementNode(execution),
-            "VALIDATE": ValidateNode(execution),
-            "REVIEW": ReviewNode(execution),
-            "CLASSIFY_FAILURE": ClassifyFailureNode(execution),
-            "PROGRAMMER_REPAIR": RepairNode(
-                execution, RepairClassification.PROGRAMMER, "PROGRAMMER_REPAIR"
+            "SELECT_WORK": MultiItemSelectWorkNode(controller),
+            "EXPLORE": dynamic("EXPLORE", lambda ex: ExploreNode(ex.inputs, ex.analysis)),
+            "BUILD_TASK_PACKAGE": dynamic(
+                "BUILD_TASK_PACKAGE", lambda ex: BuildTaskPackageNode(ex.inputs, ex.analysis)
             ),
-            "DEBUGGER": RepairNode(execution, RepairClassification.DEBUGGER, "DEBUGGER"),
-            "CLOSE_TASK": CloseTaskNode(execution),
+            "ASSESS_RISK": dynamic(
+                "ASSESS_RISK", lambda ex: AssessRiskNode(ex.inputs, ex.analysis)
+            ),
+            "HUMAN_CHECKPOINT": dynamic(
+                "HUMAN_CHECKPOINT",
+                lambda ex: HumanCheckpointNode(controller.checkpoints_for_execution(ex)),
+            ),
+            "IMPLEMENT": dynamic("IMPLEMENT", ImplementNode),
+            "VALIDATE": dynamic("VALIDATE", ValidateNode),
+            "REVIEW": dynamic("REVIEW", ReviewNode),
+            "CLASSIFY_FAILURE": dynamic("CLASSIFY_FAILURE", ClassifyFailureNode),
+            "PROGRAMMER_REPAIR": dynamic(
+                "PROGRAMMER_REPAIR",
+                lambda ex: RepairNode(ex, RepairClassification.PROGRAMMER, "PROGRAMMER_REPAIR"),
+            ),
+            "DEBUGGER": dynamic(
+                "DEBUGGER", lambda ex: RepairNode(ex, RepairClassification.DEBUGGER, "DEBUGGER")
+            ),
+            "CLOSE_TASK": dynamic("CLOSE_TASK", CloseTaskNode),
             "MORE_WORK": MoreWorkNode(),
             "FINALIZE": FinalizeNode(),
         }
         policy = PolicySnapshot(
-            max_repair_cycles=inputs.max_repair_cycles,
-            max_work_items_per_run=1,
+            max_repair_cycles=run_inputs.max_repair_cycles,
+            max_work_items_per_run=run_inputs.max_work_items_per_run,
             commit_mode=CommitMode.PER_WORK_ITEM,
         )
-        engine = GraphEngine(canonical_v1_graph(), policy, nodes)
         coordinator = DurableGraphCoordinator(
             self.paths,
             self.registry.get(inspection.project_id),
-            engine,
+            GraphEngine(canonical_v1_graph(), policy, nodes),
             run_id_factory=lambda: run_id,
             fault=self.fault,
         )
-        return execution, coordinator, checkpoints
+        return controller, coordinator
+
+    def _continue(self, session, state, controller, executed_prefix) -> WriteSliceReport:
+        executed = list(executed_prefix)
+        bound = self.max_steps * controller.run_inputs.max_work_items_per_run
+        for _ in range(bound):
+            if state.graph.current_node in {"END", "DELIVERY_REVIEW"}:
+                break
+            executed.append(state.graph.current_node)
+            state = session.step()
+            if state.graph.current_node == "HUMAN_CHECKPOINT":
+                try:
+                    checkpoints = controller.checkpoints(state)
+                    checkpoint = checkpoints.view(checkpoints.ensure_request(state))
+                except CheckpointError as exc:
+                    return self._checkpoint_recovery(state, controller, exc)
+                if self.fault is not None:
+                    self.fault("CHECKPOINT_REQUEST_PERSISTED")
+                return self._report(state, controller, tuple(executed), checkpoint=checkpoint)
+        else:
+            raise WritePreparationError("write graph exceeded its bounded step count")
+        if state.graph.current_node == "DELIVERY_REVIEW":
+            try:
+                controller.verify_run_boundary(state)
+            except WorkspaceError as exc:
+                return self._rehydration_required(state, controller, exc)
+        return self._report(state, controller, tuple(executed))
+
+    @staticmethod
+    def _rehydrate_current(controller: MultiItemExecution, state) -> None:
+        if state.work.item is not None and state.graph.current_node not in {
+            "START",
+            "DISCOVER_PROJECT",
+            "PREFLIGHT",
+            "SELECT_WORK",
+            "MORE_WORK",
+            "FINALIZE",
+            "DELIVERY_REVIEW",
+            "END",
+        }:
+            controller.activate(state, rehydrating=True)
 
     def _report(
         self,
         state,
-        execution: WriteExecution,
+        controller: MultiItemExecution,
         executed: tuple[str, ...],
         *,
         checkpoint: CheckpointView | None = None,
     ) -> WriteSliceReport:
+        commits = controller.all_commit_shas(state)
+        execution = controller.current
         outcome = (
             WriteSliceOutcome.CHECKPOINT_REQUIRED
             if checkpoint is not None
+            else WriteSliceOutcome.DELIVERY_REVIEW_REQUIRED
+            if state.run.status is RunStatus.RUNNING
+            and state.graph.current_node == "DELIVERY_REVIEW"
             else WriteSliceOutcome.LOCAL_COMMIT_CREATED
-            if execution.commit_sha is not None and state.run.status is RunStatus.PAUSED
+            if commits and state.run.status is RunStatus.PAUSED
             else WriteSliceOutcome.BLOCKED
             if state.run.status is RunStatus.BLOCKED
             else WriteSliceOutcome.FAILED
@@ -585,73 +618,68 @@ class WriteSliceRunner:
         if outcome not in {
             WriteSliceOutcome.LOCAL_COMMIT_CREATED,
             WriteSliceOutcome.CHECKPOINT_REQUIRED,
+            WriteSliceOutcome.DELIVERY_REVIEW_REQUIRED,
         }:
             issues = (
                 WriteSliceIssue(
-                    execution.issue_code
-                    or execution.analysis.issue_code
+                    (execution.issue_code if execution else None)
+                    or (execution.analysis.issue_code if execution else None)
                     or state.failure.code
                     or "write_run_not_completed",
                     f"write run finalized with {state.run.status.value}",
                 ),
             )
-        inputs = execution.inputs
+        completed = tuple(item.id for item in state.work.completed_items)
+        selected = state.work.item.id if state.work.item else completed[-1] if completed else None
+        manifest = None if execution is None else execution.manifest
+        changeset = None if execution is None else execution.changeset
+        run = controller.run_inputs
         return WriteSliceReport(
-            outcome,
-            inputs.project_id,
-            execution.run_id,
-            state,
-            inputs.package.item_id,
-            inputs.package.scope_id,
-            inputs.source_revision,
-            inputs.baseline_head,
-            inputs.scope_branch,
-            execution.commit_sha,
-            str(execution.run_path),
-            str(execution.workspace) if execution.workspace.exists() else None,
-            executed,
-            issues,
-            None if execution.changeset is None else execution.changeset.digest,
-            ()
-            if execution.manifest is None
-            else tuple(item.path for item in execution.manifest.files),
-            checkpoint,
+            outcome=outcome,
+            project_id=run.project_id,
+            run_id=controller.run_id,
+            graph_state=state,
+            selected_item_id=selected,
+            selected_scope_id=run.scope_id,
+            source_revision=run.source_revision,
+            baseline_head=run.target_baseline_head,
+            scope_branch=run.scope_branch,
+            commit_sha=(
+                commits[-1] if commits else None if execution is None else execution.commit_sha
+            ),
+            runtime_path=str(controller.run_path),
+            workspace_path=(
+                str(controller.run_path / "workspace")
+                if (controller.run_path / "workspace").exists()
+                else None
+            ),
+            executed_nodes=executed,
+            issues=issues,
+            changeset_digest=None if changeset is None else changeset.digest,
+            changed_paths=() if manifest is None else tuple(item.path for item in manifest.files),
+            checkpoint=checkpoint,
+            completed_item_ids=completed,
+            commit_shas=commits,
         )
 
-    def _checkpoint_recovery(
-        self, state, execution: WriteExecution, error: CheckpointError
-    ) -> WriteSliceReport:
-        report = self._report(state, execution, ())
-        return WriteSliceReport(
+    def _checkpoint_recovery(self, state, controller, error: CheckpointError):
+        return replace(
+            self._report(state, controller, ()),
             outcome=WriteSliceOutcome.RECOVERY_REQUIRED,
-            project_id=report.project_id,
-            run_id=report.run_id,
-            graph_state=report.graph_state,
-            selected_item_id=report.selected_item_id,
-            selected_scope_id=report.selected_scope_id,
-            source_revision=report.source_revision,
-            baseline_head=report.baseline_head,
-            scope_branch=report.scope_branch,
-            commit_sha=report.commit_sha,
-            runtime_path=report.runtime_path,
-            workspace_path=report.workspace_path,
             issues=(WriteSliceIssue(error.code, str(error)),),
-            changeset_digest=report.changeset_digest,
-            changed_paths=report.changed_paths,
+            checkpoint=None,
         )
 
     def _pending_checkpoint_report(self, run_id: str, code: str) -> WriteSliceReport | None:
-        """Report fail-closed drift even when live inputs cannot be reconstructed."""
-
         try:
-            configured = self.repository_root.expanduser().resolve()
-            repository = self.git.discover_repository(configured)
+            repository = self.git.discover_repository(self.repository_root.expanduser().resolve())
             project = self.registry.find_by_root(repository.root)
             if project is None:
                 return None
             run_path = self.paths.run(project.project_id, run_id)
-            document = read_evidence(run_path / "write-inputs.json")
-            inputs = decode_value(document.get("payload"), WriteInputs)
+            run_inputs = decode_value(
+                read_evidence(run_path / "run-inputs.json").get("payload"), WriteRunInputs
+            )
             state = StateStore(run_path / "state.json").load()
             if (
                 state.run.status is not RunStatus.RUNNING
@@ -660,68 +688,40 @@ class WriteSliceRunner:
                 return None
             return WriteSliceReport(
                 outcome=WriteSliceOutcome.RECOVERY_REQUIRED,
-                project_id=inputs.project_id,
+                project_id=run_inputs.project_id,
                 run_id=run_id,
                 graph_state=state,
-                selected_item_id=inputs.package.item_id,
-                selected_scope_id=inputs.package.scope_id,
-                source_revision=inputs.source_revision,
-                baseline_head=inputs.baseline_head,
-                scope_branch=inputs.scope_branch,
+                selected_item_id=None if state.work.item is None else state.work.item.id,
+                selected_scope_id=run_inputs.scope_id,
+                source_revision=run_inputs.source_revision,
+                baseline_head=run_inputs.target_baseline_head,
+                scope_branch=run_inputs.scope_branch,
                 commit_sha=None,
                 runtime_path=str(run_path),
                 workspace_path=None,
                 issues=(WriteSliceIssue(code, "checkpoint binding no longer matches"),),
+                completed_item_ids=tuple(item.id for item in state.work.completed_items),
             )
         except Exception:
             return None
 
-    def _recovery_required(
-        self, state, execution: WriteExecution, assessment: RecoveryAssessment
-    ) -> WriteSliceReport:
-        report = self._report(state, execution, ())
-        return WriteSliceReport(
-            WriteSliceOutcome.RECOVERY_REQUIRED,
-            report.project_id,
-            report.run_id,
-            report.graph_state,
-            report.selected_item_id,
-            report.selected_scope_id,
-            report.source_revision,
-            report.baseline_head,
-            report.scope_branch,
-            report.commit_sha,
-            report.runtime_path,
-            report.workspace_path,
+    def _recovery_required(self, state, controller, assessment):
+        return replace(
+            self._report(state, controller, ()),
+            outcome=WriteSliceOutcome.RECOVERY_REQUIRED,
             issues=(WriteSliceIssue(assessment.reason_code, assessment.human_readable_reason),),
-            changeset_digest=report.changeset_digest,
-            changed_paths=report.changed_paths,
         )
 
-    def _rehydration_required(
-        self, state, execution: WriteExecution, error: WorkspaceError
-    ) -> WriteSliceReport:
-        report = self._report(state, execution, ())
-        return WriteSliceReport(
-            WriteSliceOutcome.RECOVERY_REQUIRED,
-            report.project_id,
-            report.run_id,
-            report.graph_state,
-            report.selected_item_id,
-            report.selected_scope_id,
-            report.source_revision,
-            report.baseline_head,
-            report.scope_branch,
-            report.commit_sha,
-            report.runtime_path,
-            report.workspace_path,
+    def _rehydration_required(self, state, controller, error):
+        return replace(
+            self._report(state, controller, ()),
+            outcome=WriteSliceOutcome.RECOVERY_REQUIRED,
             issues=(
                 WriteSliceIssue(
-                    getattr(error, "code", None) or "write_rehydration_mismatch", str(error)
+                    getattr(error, "code", None) or "write_rehydration_mismatch",
+                    str(error),
                 ),
             ),
-            changeset_digest=report.changeset_digest,
-            changed_paths=report.changed_paths,
         )
 
     def _early(
@@ -734,20 +734,56 @@ class WriteSliceRunner:
         selection=None,
     ) -> WriteSliceReport:
         return WriteSliceReport(
-            outcome,
-            None if inspection is None else inspection.project_id,
-            None,
-            None,
-            None if selection is None else selection.item_id,
-            None if selection is None else selection.scope_id,
-            None if inspection is None else inspection.work_snapshot.revision.fingerprint,
-            None if inspection is None else inspection.git_snapshot.head_sha,
-            None,
-            None,
-            None,
-            None,
+            outcome=outcome,
+            project_id=None if inspection is None else inspection.project_id,
+            run_id=None,
+            graph_state=None,
+            selected_item_id=None if selection is None else selection.item_id,
+            selected_scope_id=None if selection is None else selection.scope_id,
+            source_revision=(
+                None if inspection is None else inspection.work_snapshot.revision.fingerprint
+            ),
+            baseline_head=None if inspection is None else inspection.git_snapshot.head_sha,
+            scope_branch=None,
+            commit_sha=None,
+            runtime_path=None,
+            workspace_path=None,
             issues=(WriteSliceIssue(code, message),),
         )
+
+
+def _plan_item(plan: WorkPlan, item_id: str) -> WorkPlanItem:
+    try:
+        return next(item for item in plan.items if item.item_id == item_id)
+    except StopIteration as exc:
+        raise WorkPlanMismatchError("selected item is absent from work plan") from exc
+
+
+def _item_inputs(
+    run: WriteRunInputs, plan: WorkPlan, item: WorkPlanItem, item_base_head: str
+) -> WriteInputs:
+    return WriteInputs(
+        project_id=run.project_id,
+        package=item.package,
+        expected_allowed_paths=item.allowed_paths,
+        source_revision=run.source_revision,
+        baseline_head=item_base_head,
+        base_branch=run.base_branch
+        if item_base_head == run.target_baseline_head
+        else run.scope_branch,
+        scope_branch=run.scope_branch,
+        item_validation_checks=item.package.item_validation_checks,
+        scope_required_checks=item.package.scope_required_checks,
+        capability_fingerprint=item.capability_fingerprint,
+        max_repair_cycles=run.max_repair_cycles,
+        semantic_review_enabled=run.semantic_review_enabled,
+        checkpoint_ttl_seconds=run.checkpoint_ttl_seconds,
+        target_baseline_head=run.target_baseline_head,
+        target_base_branch=run.base_branch,
+        item_index=item.plan_index,
+        work_plan_digest=plan.digest,
+        run_inputs_digest=sha256_digest(run),
+    )
 
 
 def _input_fingerprint(inspection, request: WriteSliceRequest) -> str:

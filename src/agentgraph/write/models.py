@@ -268,6 +268,11 @@ class WriteInputs:
     max_repair_cycles: int = 0
     semantic_review_enabled: bool = False
     checkpoint_ttl_seconds: int = 3600
+    target_baseline_head: str | None = None
+    target_base_branch: str | None = None
+    item_index: int = 1
+    work_plan_digest: str = ""
+    run_inputs_digest: str = ""
 
     def __post_init__(self) -> None:
         if (
@@ -275,6 +280,121 @@ class WriteInputs:
             or not 60 <= self.checkpoint_ttl_seconds <= 86400
         ):
             raise ValueError("checkpoint TTL must be between 60 and 86400 seconds")
+        if type(self.item_index) is not int or self.item_index < 1:
+            raise ValueError("item index must be positive")
+
+    @property
+    def pinned_target_head(self) -> str:
+        return self.target_baseline_head or self.baseline_head
+
+    @property
+    def pinned_target_branch(self) -> str:
+        return self.target_base_branch or self.base_branch
+
+
+@dataclass(frozen=True, slots=True)
+class WriteRunInputs:
+    schema_version: int
+    project_id: str
+    scope_id: str
+    parent_scope_id: str | None
+    source_revision: str
+    target_baseline_head: str
+    base_branch: str
+    scope_branch: str
+    work_plan_digest: str
+    max_work_items_per_run: int
+    max_repair_cycles: int
+    semantic_review_enabled: bool
+    checkpoint_ttl_seconds: int
+
+    def __post_init__(self) -> None:
+        if self.schema_version != 1:
+            raise ValueError("unsupported write-run inputs schema")
+        if not 1 <= self.max_work_items_per_run <= 20:
+            raise ValueError("work-item limit must be between 1 and 20")
+        if self.max_repair_cycles not in {0, 1, 2}:
+            raise ValueError("repair limit is invalid")
+        if not 60 <= self.checkpoint_ttl_seconds <= 86400:
+            raise ValueError("checkpoint TTL is invalid")
+        if not all(
+            (
+                self.project_id,
+                self.scope_id,
+                self.source_revision,
+                self.target_baseline_head,
+                self.base_branch,
+                self.scope_branch,
+                self.work_plan_digest,
+            )
+        ):
+            raise ValueError("write-run inputs contain an empty authority field")
+
+
+@dataclass(frozen=True, slots=True)
+class WorkPlanItem:
+    plan_index: int
+    item_id: str
+    package: WorkPackage
+    package_digest: str
+    allowed_paths: tuple[RepoPathSpec, ...]
+    capability_fingerprint: str
+
+    def __post_init__(self) -> None:
+        capability = [
+            {"path": item.path, "directory_hint": item.directory_hint}
+            for item in self.allowed_paths
+        ]
+        raw = json.dumps(capability, sort_keys=True, separators=(",", ":")).encode()
+        expected_capability = f"sha256:{hashlib.sha256(raw).hexdigest()}"
+        if (
+            self.plan_index < 1
+            or self.package.item_id != self.item_id
+            or self.package_digest != sha256_digest(self.package)
+            or self.capability_fingerprint != expected_capability
+        ):
+            raise ValueError("work plan item binding is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class WorkPlan:
+    schema_version: int
+    scope_id: str
+    source_revision: str
+    items: tuple[WorkPlanItem, ...]
+    digest: str
+
+    @classmethod
+    def create(
+        cls, scope_id: str, source_revision: str, items: tuple[WorkPlanItem, ...]
+    ) -> WorkPlan:
+        values = {
+            "schema_version": 1,
+            "scope_id": scope_id,
+            "source_revision": source_revision,
+            "items": items,
+        }
+        return cls(**values, digest=sha256_digest(values))
+
+    def __post_init__(self) -> None:
+        values = {
+            "schema_version": self.schema_version,
+            "scope_id": self.scope_id,
+            "source_revision": self.source_revision,
+            "items": self.items,
+        }
+        if self.schema_version != 1 or not self.items or self.digest != sha256_digest(values):
+            raise ValueError("work plan digest is invalid")
+        if tuple(item.plan_index for item in self.items) != tuple(range(1, len(self.items) + 1)):
+            raise ValueError("work plan indexes are invalid")
+        if len({item.item_id for item in self.items}) != len(self.items):
+            raise ValueError("work plan contains duplicate items")
+        if any(
+            item.package.scope_id != self.scope_id
+            or item.package.source_revision.fingerprint != self.source_revision
+            for item in self.items
+        ):
+            raise ValueError("work plan item authority is inconsistent")
 
 
 class WriteSliceOutcome(StrEnum):
@@ -284,6 +404,7 @@ class WriteSliceOutcome(StrEnum):
     INVALID_SOURCE = "invalid_source"
     RECOVERY_REQUIRED = "recovery_required"
     CHECKPOINT_REQUIRED = "checkpoint_required"
+    DELIVERY_REVIEW_REQUIRED = "delivery_review_required"
 
 
 @dataclass(frozen=True, slots=True)
@@ -335,6 +456,8 @@ class WriteSliceReport:
     changeset_digest: str | None = None
     changed_paths: tuple[str, ...] = ()
     checkpoint: CheckpointView | None = None
+    completed_item_ids: tuple[str, ...] = ()
+    commit_shas: tuple[str, ...] = ()
 
     @property
     def final_graph_state(self) -> GraphState | None:

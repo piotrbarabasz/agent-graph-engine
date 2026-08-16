@@ -102,5 +102,8 @@
   rechecks, capability checks, validation, or review.
 - `HUMAN_CHECKPOINT` is safely rerunnable only because the external decision is persisted before
   node invocation and the node itself only reads and verifies immutable evidence.
-- M011 does not implement `DELIVERY_REVIEW`, `CREATE_PR`, push, merge, remote approval, or M012
-  multi-item execution.
+- M012 executes frozen-plan work items sequentially in one external worktree and scope branch.
+  Each item has fresh analysis, capability, repair capacity, evidence, and one verified commit;
+  the next item starts at that commit while target main remains pinned to the run baseline.
+- M012 stops before invoking `DELIVERY_REVIEW` and does not implement `CREATE_PR`, push, merge,
+  remote approval, automatic continuation of limit-paused runs, or parallel item execution.

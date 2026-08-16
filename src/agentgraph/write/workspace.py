@@ -87,6 +87,7 @@ class WriteExecution:
     validation_timeout_seconds: float = 120.0
     rehydrating: bool = False
     fault: Callable[[str], None] = field(default=lambda stage: None, repr=False)
+    item_path: Path | None = None
     workspace: Path = field(init=False)
     operations: Path = field(init=False)
     workspace_repository: GitRepository | None = field(default=None, init=False)
@@ -105,7 +106,7 @@ class WriteExecution:
 
     def __post_init__(self) -> None:
         self.workspace = self.run_path / "workspace"
-        self.operations = self.run_path / "operations"
+        self.operations = (self.item_path or self.run_path) / "operations"
         run_root = self.run_path.resolve()
         candidate = self.workspace.resolve()
         try:
@@ -124,25 +125,34 @@ class WriteExecution:
 
     def implement(self, node_attempt_id: str) -> AppliedChangeSet:
         self.live_recheck("write_baseline_drift")
-        if self.git.local_branch_exists(self.target, self.inputs.scope_branch):
-            raise WriteBaselineDriftError("scope_branch_already_exists")
-        result = self.git.add_worktree(
-            self.target,
-            self.workspace,
-            self.inputs.scope_branch,
-            self.inputs.baseline_head,
-        )
-        self.workspace_repository = result.repository
-        workspace_snapshot = self.git.snapshot(result.repository)
+        if self.workspace.exists():
+            repository = self.git.discover_repository(self.workspace)
+            scope_ref = f"refs/heads/{self.inputs.scope_branch}"
+            workspace_snapshot = self.git.snapshot(repository)
+            if self.git.resolve_ref(self.target, scope_ref) != self.inputs.baseline_head:
+                raise WriteBaselineDriftError("multi_item_workspace_drift")
+        else:
+            if self.git.local_branch_exists(self.target, self.inputs.scope_branch):
+                raise WriteBaselineDriftError("scope_branch_already_exists")
+            result = self.git.add_worktree(
+                self.target,
+                self.workspace,
+                self.inputs.scope_branch,
+                self.inputs.baseline_head,
+            )
+            repository = result.repository
+            workspace_snapshot = self.git.snapshot(repository)
+        self.workspace_repository = repository
         if (
             workspace_snapshot.head_sha != self.inputs.baseline_head
             or workspace_snapshot.branch != self.inputs.scope_branch
             or workspace_snapshot.dirty
+            or workspace_snapshot.staged_paths
             or workspace_snapshot.conflicted_paths
         ):
-            raise WorkspaceError("new worktree does not match pinned baseline")
+            raise WorkspaceError("worktree does not match current item baseline")
         request = self.change_request()
-        provider_directory = self.run_path / "provider"
+        provider_directory = (self.item_path or self.run_path) / "provider"
         provider_directory.mkdir(exist_ok=True)
         context = ChangeProviderContext(
             repository_root=self.workspace,
@@ -160,7 +170,7 @@ class WriteExecution:
             proposed = self.provider.propose(request, context)
         except BaseException as exc:
             provider_error = exc
-        provider_snapshot = self.git.snapshot(result.repository)
+        provider_snapshot = self.git.snapshot(repository)
         self.live_recheck("write_baseline_drift_after_provider")
         if _repository_semantics(provider_snapshot) != _repository_semantics(workspace_snapshot):
             self.issue_code = "provider_mutated_repository"
@@ -182,7 +192,7 @@ class WriteExecution:
         )
         applied = apply_changeset(self.workspace, proposed, self.inputs.expected_allowed_paths)
         self.applied = applied
-        snapshot = self.git.snapshot(result.repository)
+        snapshot = self.git.snapshot(repository)
         write_evidence(
             self.operations / "implement-applied.json",
             context=self.evidence_context(),
@@ -1172,12 +1182,12 @@ class WriteExecution:
         current = self.git.snapshot(self.target)
         pinned = self.shadow.inspection.git_snapshot
         if (
-            current.head_sha != self.inputs.baseline_head
-            or current.branch != self.inputs.base_branch
+            current.head_sha != self.inputs.pinned_target_head
+            or current.branch != self.inputs.pinned_target_branch
             or current.detached_head
             or current.dirty
             or current.conflicted_paths
-            or pinned.head_sha != self.inputs.baseline_head
+            or pinned.head_sha != self.inputs.pinned_target_head
         ):
             raise WriteBaselineDriftError(code)
         snapshot = self.source.snapshot()
@@ -1271,6 +1281,10 @@ class WriteExecution:
             "item_id": self.inputs.package.item_id,
             "scope_id": self.inputs.package.scope_id,
             "pinned_head": self.inputs.baseline_head,
+            "item_base_head": self.inputs.baseline_head,
+            "target_baseline_head": self.inputs.pinned_target_head,
+            "item_index": self.inputs.item_index,
+            "work_plan_digest": self.inputs.work_plan_digest,
             "source_revision": self.inputs.source_revision,
             "changeset_digest": (
                 changeset_digest
