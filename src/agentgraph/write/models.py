@@ -438,6 +438,18 @@ class WriteSliceIssue:
 
 
 @dataclass(frozen=True, slots=True)
+class CompletedItemReport:
+    item_id: str
+    item_index: int
+    item_base_head: str
+    commit_sha: str
+    changeset_digest: str
+    workspace_manifest_digest: str
+    changed_paths: tuple[str, ...]
+    repair_count: int
+
+
+@dataclass(frozen=True, slots=True)
 class WriteSliceReport:
     outcome: WriteSliceOutcome
     project_id: str | None
@@ -458,6 +470,7 @@ class WriteSliceReport:
     checkpoint: CheckpointView | None = None
     completed_item_ids: tuple[str, ...] = ()
     commit_shas: tuple[str, ...] = ()
+    completed_items: tuple[CompletedItemReport, ...] = ()
 
     @property
     def final_graph_state(self) -> GraphState | None:

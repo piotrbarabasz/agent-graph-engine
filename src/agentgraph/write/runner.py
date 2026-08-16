@@ -59,7 +59,7 @@ from agentgraph.runtime import (
     RuntimePaths,
     StateStore,
 )
-from agentgraph.runtime.codec import decode_value, sha256_digest, utc_now
+from agentgraph.runtime.codec import decode_value, utc_now
 from agentgraph.runtime.ids import generate_run_id
 from agentgraph.work import InvalidWorkSourceError, WorkScopeStatus, WorkSource
 
@@ -90,6 +90,7 @@ from .multi_item import (
     MultiItemExecution,
     MultiItemSelectWorkNode,
     build_work_plan,
+    item_inputs,
 )
 from .provider import ChangeProvider
 
@@ -260,7 +261,7 @@ class WriteSliceRunner:
             self.review_agent_provider is not None,
             self.checkpoint_ttl_seconds,
         )
-        initial_inputs = _item_inputs(
+        initial_inputs = item_inputs(
             run_inputs, plan, selected_plan_item, run_inputs.target_baseline_head
         )
         shadow = ShadowInputs(
@@ -322,6 +323,20 @@ class WriteSliceRunner:
             }:
                 assessment = session.recover()
             state = session.store.load()
+            try:
+                controller.completed_reports(state)
+            except WorkspaceError as exc:
+                return self._rehydration_required(state, controller, exc)
+            if state.graph.current_node in {
+                "SELECT_WORK",
+                "EXPLORE",
+                "BUILD_TASK_PACKAGE",
+                "ASSESS_RISK",
+            }:
+                try:
+                    controller.verify_run_boundary(state)
+                except WorkspaceError as exc:
+                    return self._rehydration_required(state, controller, exc)
             if assessment.action is RecoveryAction.BLOCKED:
                 with suppress(WorkspaceError):
                     self._rehydrate_current(controller, state)
@@ -460,7 +475,7 @@ class WriteSliceRunner:
         if selection.item_id is None:
             raise WorkPlanMismatchError("initial plan selection is no longer ready")
         first = _plan_item(plan, selection.item_id)
-        initial_inputs = _item_inputs(run_inputs, plan, first, run_inputs.target_baseline_head)
+        initial_inputs = item_inputs(run_inputs, plan, first, run_inputs.target_baseline_head)
         root_document = read_evidence(run_path / "write-inputs.json")
         if decode_value(root_document.get("payload"), WriteInputs) != initial_inputs:
             raise WorkPlanMismatchError("root write inputs differ from frozen plan")
@@ -600,7 +615,13 @@ class WriteSliceRunner:
         *,
         checkpoint: CheckpointView | None = None,
     ) -> WriteSliceReport:
-        commits = controller.all_commit_shas(state)
+        completion_error = None
+        try:
+            completed_items = controller.completed_reports(state)
+        except WorkspaceError as exc:
+            completion_error = exc
+            completed_items = controller.verified_completed
+        commits = tuple(item.commit_sha for item in completed_items)
         execution = controller.current
         outcome = (
             WriteSliceOutcome.CHECKPOINT_REQUIRED
@@ -615,7 +636,15 @@ class WriteSliceRunner:
             else WriteSliceOutcome.FAILED
         )
         issues = ()
-        if outcome not in {
+        if completion_error is not None:
+            outcome = WriteSliceOutcome.RECOVERY_REQUIRED
+            issues = (
+                WriteSliceIssue(
+                    getattr(completion_error, "code", None) or "multi_item_evidence_mismatch",
+                    str(completion_error),
+                ),
+            )
+        elif outcome not in {
             WriteSliceOutcome.LOCAL_COMMIT_CREATED,
             WriteSliceOutcome.CHECKPOINT_REQUIRED,
             WriteSliceOutcome.DELIVERY_REVIEW_REQUIRED,
@@ -629,8 +658,15 @@ class WriteSliceRunner:
                     f"write run finalized with {state.run.status.value}",
                 ),
             )
-        completed = tuple(item.id for item in state.work.completed_items)
-        selected = state.work.item.id if state.work.item else completed[-1] if completed else None
+        completed = tuple(item.item_id for item in completed_items)
+        stored_completed = tuple(item.id for item in state.work.completed_items)
+        selected = (
+            state.work.item.id
+            if state.work.item
+            else stored_completed[-1]
+            if stored_completed
+            else None
+        )
         manifest = None if execution is None else execution.manifest
         changeset = None if execution is None else execution.changeset
         run = controller.run_inputs
@@ -660,6 +696,7 @@ class WriteSliceRunner:
             checkpoint=checkpoint,
             completed_item_ids=completed,
             commit_shas=commits,
+            completed_items=completed_items,
         )
 
     def _checkpoint_recovery(self, state, controller, error: CheckpointError):
@@ -757,33 +794,6 @@ def _plan_item(plan: WorkPlan, item_id: str) -> WorkPlanItem:
         return next(item for item in plan.items if item.item_id == item_id)
     except StopIteration as exc:
         raise WorkPlanMismatchError("selected item is absent from work plan") from exc
-
-
-def _item_inputs(
-    run: WriteRunInputs, plan: WorkPlan, item: WorkPlanItem, item_base_head: str
-) -> WriteInputs:
-    return WriteInputs(
-        project_id=run.project_id,
-        package=item.package,
-        expected_allowed_paths=item.allowed_paths,
-        source_revision=run.source_revision,
-        baseline_head=item_base_head,
-        base_branch=run.base_branch
-        if item_base_head == run.target_baseline_head
-        else run.scope_branch,
-        scope_branch=run.scope_branch,
-        item_validation_checks=item.package.item_validation_checks,
-        scope_required_checks=item.package.scope_required_checks,
-        capability_fingerprint=item.capability_fingerprint,
-        max_repair_cycles=run.max_repair_cycles,
-        semantic_review_enabled=run.semantic_review_enabled,
-        checkpoint_ttl_seconds=run.checkpoint_ttl_seconds,
-        target_baseline_head=run.target_baseline_head,
-        target_base_branch=run.base_branch,
-        item_index=item.plan_index,
-        work_plan_digest=plan.digest,
-        run_inputs_digest=sha256_digest(run),
-    )
 
 
 def _input_fingerprint(inspection, request: WriteSliceRequest) -> str:

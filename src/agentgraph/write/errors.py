@@ -56,6 +56,22 @@ class WorkspaceError(WriteSliceError):
     pass
 
 
+class MultiItemLineageError(WorkspaceError):
+    code = "multi_item_lineage_mismatch"
+
+
+class MultiItemEvidenceError(WorkspaceError):
+    code = "multi_item_evidence_mismatch"
+
+
+class ItemInputsMismatchError(WorkspaceError):
+    code = "item_inputs_mismatch"
+
+
+class ItemEvidenceError(WorkspaceError):
+    code = "item_evidence_invalid"
+
+
 class WriteBaselineDriftError(WriteSliceError):
     pass
 

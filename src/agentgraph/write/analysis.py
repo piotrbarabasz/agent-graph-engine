@@ -275,7 +275,11 @@ class AgentExecution:
         provider: AgentProvider | None = None,
     ) -> AnalysisResult:
         selected_provider = provider or self.provider
-        before = self._pinned_snapshot()
+        before = (
+            self._pinned_snapshot()
+            if workspace_digest is None
+            else self._pinned_dirty_workspace_snapshot()
+        )
         selected_root = self.target.root if repository_root is None else repository_root
         if (expected_workspace_digest is None) is not (workspace_digest is None):
             raise AgentContextError("workspace manifest guard is incomplete")
@@ -461,6 +465,27 @@ class AgentExecution:
             or snapshot.branch != self.inputs.base_branch
             or snapshot.detached_head
             or snapshot.dirty
+            or snapshot.conflicted_paths
+        ):
+            self.issue_code = AgentAnalysisDriftError.code
+            raise AgentAnalysisDriftError("agent_analysis_baseline_drift")
+        if self.guard_target is not None:
+            target = self.git.snapshot(self.guard_target)
+            if not self._target_is_pinned(target):
+                self.issue_code = AgentAnalysisDriftError.code
+                raise AgentAnalysisDriftError("agent_analysis_baseline_drift")
+        self._verify_source()
+        return snapshot
+
+    def _pinned_dirty_workspace_snapshot(self):
+        """Bind a guarded read-only invocation to an intentional uncommitted diff."""
+
+        snapshot = self.git.snapshot(self.target)
+        if (
+            snapshot.head_sha != self.inputs.baseline_head
+            or snapshot.branch != self.inputs.base_branch
+            or snapshot.detached_head
+            or snapshot.staged_paths
             or snapshot.conflicted_paths
         ):
             self.issue_code = AgentAnalysisDriftError.code
