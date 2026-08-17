@@ -191,3 +191,42 @@ SEMANTIC_REVIEW_SCHEMA["allOf"] = [
         },
     },
 ]
+
+DELIVERY_REVIEW_SCHEMA = _root(
+    {
+        "schema_version": {"const": 1},
+        "status": _STATUS,
+        "verdict": {"enum": ["pass", "fail", None]},
+        "summary": {"type": ["string", "null"], "maxLength": MAX_SUMMARY_LENGTH},
+        "findings": {
+            "type": "array",
+            "maxItems": MAX_SEMANTIC_FINDINGS,
+            "uniqueItems": True,
+            "items": _root(
+                {
+                    "kind": {
+                        "enum": [
+                            "scope_requirement_gap",
+                            "cross_item_integration_failure",
+                            "architecture_violation",
+                            "logic_defect",
+                            "regression_risk",
+                            "test_coverage_gap",
+                            "delivery_scope_violation",
+                            "security_concern",
+                            "incomplete_delivery",
+                            "maintainability_blocker",
+                        ]
+                    },
+                    "message": {"type": "string", "minLength": 1, "maxLength": MAX_TEXT_LENGTH},
+                    "path": {"type": ["string", "null"], "maxLength": MAX_TEXT_LENGTH},
+                    "item_ids": _strings(MAX_REQUIREMENT_REFS),
+                    "requirement_refs": _strings(MAX_REQUIREMENT_REFS),
+                }
+            ),
+        },
+        "reason_code": _REASON,
+        "message": _MESSAGE,
+    }
+)
+DELIVERY_REVIEW_SCHEMA["allOf"] = SEMANTIC_REVIEW_SCHEMA["allOf"]

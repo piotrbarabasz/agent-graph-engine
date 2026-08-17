@@ -15,6 +15,11 @@ from .errors import (
     CheckpointBindingError,
     CheckpointError,
     CommitVerificationError,
+    DeliveryReviewContextError,
+    DeliveryReviewEvidenceError,
+    DeliveryReviewProviderRequiredError,
+    DeliveryReviewStateMismatchError,
+    DeliveryReviewStorageError,
     ItemEvidenceError,
     ItemInputsMismatchError,
     MultiItemEvidenceError,
@@ -50,6 +55,11 @@ from .models import (
     CheckpointView,
     CommitWitness,
     CompletedItemReport,
+    DeliveryCompletedItem,
+    DeliveryManifest,
+    DeliveryManifestEntry,
+    DeliveryReviewContext,
+    DeliveryReviewReport,
     FileChange,
     RepairFailureContext,
     RepairValidationDiagnostic,
@@ -65,6 +75,7 @@ from .models import (
     WriteSliceOutcome,
     WriteSliceReport,
     WriteSliceRequest,
+    write_run_inputs_digest,
 )
 from .provider import ChangeProvider, ChangeProviderContext
 
@@ -85,6 +96,16 @@ __all__ = [
     "CommitVerificationError",
     "CommitWitness",
     "CompletedItemReport",
+    "DeliveryCompletedItem",
+    "DeliveryManifest",
+    "DeliveryManifestEntry",
+    "DeliveryReviewContext",
+    "DeliveryReviewContextError",
+    "DeliveryReviewEvidenceError",
+    "DeliveryReviewProviderRequiredError",
+    "DeliveryReviewReport",
+    "DeliveryReviewStateMismatchError",
+    "DeliveryReviewStorageError",
     "FileChange",
     "ItemEvidenceError",
     "ItemInputsMismatchError",
@@ -132,6 +153,7 @@ __all__ = [
     "path_is_allowed",
     "reconcile_write_capability",
     "stable_path_union",
+    "write_run_inputs_digest",
 ]
 
 

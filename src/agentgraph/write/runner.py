@@ -63,8 +63,10 @@ from agentgraph.runtime.codec import decode_value, utc_now
 from agentgraph.runtime.ids import generate_run_id
 from agentgraph.work import InvalidWorkSourceError, WorkScopeStatus, WorkSource
 
+from .delivery_review import DeliveryReviewNode
 from .errors import (
     CheckpointError,
+    DeliveryReviewProviderRequiredError,
     RepairPolicyError,
     ReviewProviderRequiredError,
     WorkCapabilityMismatchError,
@@ -106,6 +108,7 @@ class WriteSliceRunner:
         *,
         agent_provider: AgentProvider | None = None,
         review_agent_provider: AgentProvider | None = None,
+        delivery_review_agent_provider: AgentProvider | None = None,
         git_adapter: GitAdapter,
         project_registry: ProjectRegistry,
         process_runner: ProcessRunner | None = None,
@@ -134,6 +137,7 @@ class WriteSliceRunner:
         self.change_provider = change_provider
         self.agent_provider = agent_provider or DeclaredWorkAgentProvider()
         self.review_agent_provider = review_agent_provider
+        self.delivery_review_agent_provider = delivery_review_agent_provider
         self.git = git_adapter
         self.registry = project_registry
         self.paths = runtime_paths or project_registry.paths
@@ -260,6 +264,7 @@ class WriteSliceRunner:
             self.max_repair_cycles,
             self.review_agent_provider is not None,
             self.checkpoint_ttl_seconds,
+            self.delivery_review_agent_provider is not None,
         )
         initial_inputs = item_inputs(
             run_inputs, plan, selected_plan_item, run_inputs.target_baseline_head
@@ -298,6 +303,12 @@ class WriteSliceRunner:
 
         try:
             controller, coordinator = self._existing_runtime(run_id)
+        except DeliveryReviewProviderRequiredError as exc:
+            return self._early(
+                WriteSliceOutcome.RECOVERY_REQUIRED,
+                exc.code,
+                str(exc),
+            )
         except (
             WritePreparationError,
             WorkspaceError,
@@ -327,6 +338,11 @@ class WriteSliceRunner:
                 controller.completed_reports(state)
             except WorkspaceError as exc:
                 return self._rehydration_required(state, controller, exc)
+            if controller.run_inputs.delivery_review_enabled:
+                try:
+                    controller.delivery_reviews().rehydrate_if_complete(state)
+                except WorkspaceError as exc:
+                    return self._rehydration_required(state, controller, exc)
             if state.graph.current_node in {
                 "SELECT_WORK",
                 "EXPLORE",
@@ -352,13 +368,18 @@ class WriteSliceRunner:
                 self._rehydrate_current(controller, state)
             except WorkspaceError as exc:
                 return self._rehydration_required(state, controller, exc)
-            if state.graph.current_node == "DELIVERY_REVIEW":
+            if (
+                state.graph.current_node == "DELIVERY_REVIEW"
+                and not controller.run_inputs.delivery_review_enabled
+            ):
                 try:
                     controller.verify_run_boundary(state)
                 except WorkspaceError as exc:
                     return self._rehydration_required(state, controller, exc)
                 return self._report(state, controller, ())
             if state.graph.current_node == "HUMAN_CHECKPOINT":
+                if state.graph.pending_resume_node == "CREATE_PR":
+                    return self._report(state, controller, ())
                 try:
                     checkpoints = controller.checkpoints(state)
                     request, decision = checkpoints.decision(state)
@@ -385,6 +406,8 @@ class WriteSliceRunner:
         outcome: CheckpointOutcome,
         actor: str,
     ) -> CheckpointDecision:
+        if self._delivery_checkpoint_pending(run_id):
+            raise CheckpointError("delivery_checkpoint_not_implemented_in_m013")
         try:
             controller, coordinator = self._existing_runtime(run_id)
         except (
@@ -410,6 +433,11 @@ class WriteSliceRunner:
             }:
                 raise CheckpointError("checkpoint_not_pending")
             state = session.store.load()
+            if (
+                state.graph.current_node == "HUMAN_CHECKPOINT"
+                and state.graph.pending_resume_node == "CREATE_PR"
+            ):
+                raise CheckpointError("delivery_checkpoint_not_implemented_in_m013")
             self._rehydrate_current(controller, state)
             return controller.checkpoints(state).submit(
                 state,
@@ -444,6 +472,10 @@ class WriteSliceRunner:
         if run_inputs.semantic_review_enabled and self.review_agent_provider is None:
             raise ReviewProviderRequiredError(
                 "semantic review is enabled for this run but no review provider was supplied"
+            )
+        if run_inputs.delivery_review_enabled and self.delivery_review_agent_provider is None:
+            raise DeliveryReviewProviderRequiredError(
+                "delivery review is enabled but no delivery review provider was supplied"
             )
         inspection = inspect_project(
             repository.root,
@@ -507,6 +539,7 @@ class WriteSliceRunner:
             self.change_provider,
             self.agent_provider,
             self.review_agent_provider,
+            self.delivery_review_agent_provider,
             self.git,
             self.processes,
             inspection.repository,
@@ -551,8 +584,12 @@ class WriteSliceRunner:
             ),
             "CLOSE_TASK": dynamic("CLOSE_TASK", CloseTaskNode),
             "MORE_WORK": MoreWorkNode(),
+            "DELIVERY_REVIEW": DeliveryReviewNode(controller.delivery_reviews())
+            if run_inputs.delivery_review_enabled
+            else None,
             "FINALIZE": FinalizeNode(),
         }
+        nodes = {key: value for key, value in nodes.items() if value is not None}
         policy = PolicySnapshot(
             max_repair_cycles=run_inputs.max_repair_cycles,
             max_work_items_per_run=run_inputs.max_work_items_per_run,
@@ -571,11 +608,25 @@ class WriteSliceRunner:
         executed = list(executed_prefix)
         bound = self.max_steps * controller.run_inputs.max_work_items_per_run
         for _ in range(bound):
-            if state.graph.current_node in {"END", "DELIVERY_REVIEW"}:
+            if state.graph.current_node == "END" or (
+                state.graph.current_node == "DELIVERY_REVIEW"
+                and not controller.run_inputs.delivery_review_enabled
+            ):
                 break
+            if (
+                state.graph.current_node == "DELIVERY_REVIEW"
+                and controller.run_inputs.delivery_review_enabled
+            ):
+                try:
+                    controller.completed_reports(state)
+                    controller.delivery_reviews().rehydrate_if_complete(state)
+                except WorkspaceError as exc:
+                    return self._rehydration_required(state, controller, exc)
             executed.append(state.graph.current_node)
             state = session.step()
             if state.graph.current_node == "HUMAN_CHECKPOINT":
+                if state.graph.pending_resume_node == "CREATE_PR":
+                    return self._report(state, controller, tuple(executed))
                 try:
                     checkpoints = controller.checkpoints(state)
                     checkpoint = checkpoints.view(checkpoints.ensure_request(state))
@@ -586,7 +637,10 @@ class WriteSliceRunner:
                 return self._report(state, controller, tuple(executed), checkpoint=checkpoint)
         else:
             raise WritePreparationError("write graph exceeded its bounded step count")
-        if state.graph.current_node == "DELIVERY_REVIEW":
+        if (
+            state.graph.current_node == "DELIVERY_REVIEW"
+            and not controller.run_inputs.delivery_review_enabled
+        ):
             try:
                 controller.verify_run_boundary(state)
             except WorkspaceError as exc:
@@ -626,6 +680,10 @@ class WriteSliceRunner:
         outcome = (
             WriteSliceOutcome.CHECKPOINT_REQUIRED
             if checkpoint is not None
+            else WriteSliceOutcome.DELIVERY_CHECKPOINT_REQUIRED
+            if state.run.status is RunStatus.RUNNING
+            and state.graph.current_node == "HUMAN_CHECKPOINT"
+            and state.graph.pending_resume_node == "CREATE_PR"
             else WriteSliceOutcome.DELIVERY_REVIEW_REQUIRED
             if state.run.status is RunStatus.RUNNING
             and state.graph.current_node == "DELIVERY_REVIEW"
@@ -648,11 +706,17 @@ class WriteSliceRunner:
             WriteSliceOutcome.LOCAL_COMMIT_CREATED,
             WriteSliceOutcome.CHECKPOINT_REQUIRED,
             WriteSliceOutcome.DELIVERY_REVIEW_REQUIRED,
+            WriteSliceOutcome.DELIVERY_CHECKPOINT_REQUIRED,
         }:
             issues = (
                 WriteSliceIssue(
                     (execution.issue_code if execution else None)
                     or (execution.analysis.issue_code if execution else None)
+                    or (
+                        controller.delivery_review_execution.issue_code
+                        if controller.delivery_review_execution is not None
+                        else None
+                    )
                     or state.failure.code
                     or "write_run_not_completed",
                     f"write run finalized with {state.run.status.value}",
@@ -697,6 +761,11 @@ class WriteSliceRunner:
             completed_item_ids=completed,
             commit_shas=commits,
             completed_items=completed_items,
+            delivery_review=(
+                None
+                if controller.delivery_review_execution is None
+                else controller.delivery_review_execution.report
+            ),
         )
 
     def _checkpoint_recovery(self, state, controller, error: CheckpointError):
@@ -741,6 +810,21 @@ class WriteSliceRunner:
             )
         except Exception:
             return None
+
+    def _delivery_checkpoint_pending(self, run_id: str) -> bool:
+        try:
+            repository = self.git.discover_repository(self.repository_root.expanduser().resolve())
+            project = self.registry.find_by_root(repository.root)
+            if project is None:
+                return False
+            state = StateStore(self.paths.run(project.project_id, run_id) / "state.json").load()
+            return (
+                state.run.status is RunStatus.RUNNING
+                and state.graph.current_node == "HUMAN_CHECKPOINT"
+                and state.graph.pending_resume_node == "CREATE_PR"
+            )
+        except Exception:
+            return False
 
     def _recovery_required(self, state, controller, assessment):
         return replace(

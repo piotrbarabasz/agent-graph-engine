@@ -33,6 +33,7 @@ from agentgraph.work import (
 from .analysis import AgentExecution
 from .capability import capability_fingerprint, reconcile_write_capability
 from .checkpoints import WriteCheckpointController
+from .delivery_review import DeliveryReviewExecution
 from .errors import (
     ItemInputsMismatchError,
     MultiItemEvidenceError,
@@ -54,6 +55,7 @@ from .models import (
     WorkspaceManifest,
     WriteInputs,
     WriteRunInputs,
+    write_run_inputs_digest,
 )
 from .provider import ChangeProvider
 from .workspace import WriteExecution
@@ -143,7 +145,7 @@ def item_inputs(
         target_base_branch=run.base_branch,
         item_index=item.plan_index,
         work_plan_digest=plan.digest,
-        run_inputs_digest=sha256_digest(run),
+        run_inputs_digest=write_run_inputs_digest(run),
     )
 
 
@@ -159,6 +161,7 @@ class MultiItemExecution:
     change_provider: ChangeProvider
     agent_provider: object
     review_agent_provider: object | None
+    delivery_review_agent_provider: object | None
     git: GitAdapter
     processes: ProcessRunner
     target: GitRepository
@@ -172,6 +175,7 @@ class MultiItemExecution:
     current: WriteExecution | None = None
     current_item_id: str | None = None
     verified_completed: tuple[CompletedItemReport, ...] = field(default=(), init=False)
+    delivery_review_execution: DeliveryReviewExecution | None = field(default=None, init=False)
 
     def plan_item(self, item_id: str) -> WorkPlanItem:
         try:
@@ -248,6 +252,15 @@ class MultiItemExecution:
             execution, clock=self.clock, nonce_factory=self.nonce_factory
         )
 
+    def delivery_reviews(self) -> DeliveryReviewExecution:
+        if self.delivery_review_agent_provider is None:
+            raise WritePreparationError("delivery_review_provider_required")
+        if self.delivery_review_execution is None:
+            self.delivery_review_execution = DeliveryReviewExecution(
+                self, self.delivery_review_agent_provider
+            )
+        return self.delivery_review_execution
+
     def all_commit_shas(self, state: GraphState) -> tuple[str, ...]:
         return tuple(item.commit_sha for item in self.completed_reports(state))
 
@@ -277,6 +290,25 @@ class MultiItemExecution:
         head, commits = self._completed_lineage(completed)
         if commits:
             self._verified_workspace(head)
+
+    def verify_run_boundary_from_head(self, final_head: str) -> None:
+        target = self.git.snapshot(self.target)
+        if (
+            target.head_sha != self.run_inputs.target_baseline_head
+            or target.branch != self.run_inputs.base_branch
+            or target.detached_head
+            or target.dirty
+            or target.conflicted_paths
+        ):
+            raise WorkspaceError("target_baseline_drift")
+        snapshot = self.source.snapshot()
+        try:
+            verify_work_source_revision(self.target.root, snapshot.revision)
+        except Exception as exc:
+            raise WorkspaceError("work_source_drift") from exc
+        if snapshot.revision.fingerprint != self.run_inputs.source_revision:
+            raise WorkspaceError("work_source_drift")
+        self._verified_workspace(final_head)
 
     def _completed_lineage(self, completed_ids: tuple[str, ...]) -> tuple[str, tuple[str, ...]]:
         head = self.run_inputs.target_baseline_head

@@ -1,6 +1,7 @@
 """Neutral shell-free process and local Git infrastructure."""
 
 from .git import (
+    CommitDiffCheckResult,
     DiffCheckResult,
     GitAdapter,
     GitCommitIdentity,
@@ -19,6 +20,7 @@ __all__ = [
     "CommandReceipt",
     "CommandResult",
     "CommandSpec",
+    "CommitDiffCheckResult",
     "DiffCheckResult",
     "GitAdapter",
     "GitCommitIdentity",

@@ -107,3 +107,14 @@
   the next item starts at that commit while target main remains pinned to the run baseline.
 - M012 stops before invoking `DELIVERY_REVIEW` and does not implement `CREATE_PR`, push, merge,
   remote approval, automatic continuation of limit-paused runs, or parallel item execution.
+- `DELIVERY_REVIEW` reviews the exact cumulative delivery from the original target baseline to the
+  final verified scope HEAD, and runs only after every planned item is independently verified.
+- The delivery reviewer is a separate explicit `AgentProvider` role. It receives declared work and
+  final Git authority, never implementation plans or previous semantic-review prose.
+- Deterministic mechanical delivery checks precede semantic delivery review. Delivery review is
+  read-only and cannot alter target, source, scope workspace, commits, or capability.
+- A delivery PASS sets `review.safe_to_create_pr` but publishes nothing. M013 stops at
+  `HUMAN_CHECKPOINT` with `pending_resume_node=CREATE_PR`; M014 will bind publish approval to the
+  exact remote, push, and PR target.
+- Delivery FAIL is terminal for the current run; no scope-wide repair loop exists in M013.
+- M013 performs no push, PR creation, merge, deployment, or source closure.

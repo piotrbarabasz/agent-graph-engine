@@ -127,6 +127,26 @@ class ReviewProviderRequiredError(WritePreparationError):
     code = "review_provider_required"
 
 
+class DeliveryReviewProviderRequiredError(WritePreparationError):
+    code = "delivery_review_provider_required"
+
+
+class DeliveryReviewEvidenceError(WorkspaceError):
+    code = "delivery_review_evidence_mismatch"
+
+
+class DeliveryReviewContextError(WorkspaceError):
+    code = "delivery_review_context_mismatch"
+
+
+class DeliveryReviewStorageError(WorkspaceError):
+    code = "delivery_review_storage_invalid"
+
+
+class DeliveryReviewStateMismatchError(WorkspaceError):
+    code = "delivery_review_state_mismatch"
+
+
 class CheckpointError(WriteSliceError):
     """A durable human checkpoint operation failed closed."""
 
