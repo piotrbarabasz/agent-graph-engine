@@ -66,6 +66,44 @@ class SemanticReviewAnalysis:
     message: str | None
 
 
+class DeliveryReviewVerdict(StrEnum):
+    PASS = "pass"
+    FAIL = "fail"
+
+
+class DeliveryReviewFindingKind(StrEnum):
+    SCOPE_REQUIREMENT_GAP = "scope_requirement_gap"
+    CROSS_ITEM_INTEGRATION_FAILURE = "cross_item_integration_failure"
+    ARCHITECTURE_VIOLATION = "architecture_violation"
+    LOGIC_DEFECT = "logic_defect"
+    REGRESSION_RISK = "regression_risk"
+    TEST_COVERAGE_GAP = "test_coverage_gap"
+    DELIVERY_SCOPE_VIOLATION = "delivery_scope_violation"
+    SECURITY_CONCERN = "security_concern"
+    INCOMPLETE_DELIVERY = "incomplete_delivery"
+    MAINTAINABILITY_BLOCKER = "maintainability_blocker"
+
+
+@dataclass(frozen=True, slots=True)
+class DeliveryReviewFinding:
+    kind: DeliveryReviewFindingKind
+    message: str
+    path: str | None
+    item_ids: tuple[str, ...]
+    requirement_refs: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class DeliveryReviewAnalysis:
+    schema_version: int
+    status: AgentAnalysisStatus
+    verdict: DeliveryReviewVerdict | None
+    summary: str | None
+    findings: tuple[DeliveryReviewFinding, ...]
+    reason_code: str | None
+    message: str | None
+
+
 @dataclass(frozen=True, slots=True)
 class ExploreAnalysis:
     schema_version: int
@@ -326,6 +364,80 @@ def parse_semantic_review_payload(value: Any) -> SemanticReviewAnalysis:
     return result
 
 
+def parse_delivery_review_payload(value: Any) -> DeliveryReviewAnalysis:
+    document = _document(
+        value,
+        {
+            "schema_version",
+            "status",
+            "verdict",
+            "summary",
+            "findings",
+            "reason_code",
+            "message",
+        },
+    )
+    status = _status(document)
+    try:
+        verdict = (
+            None if document["verdict"] is None else DeliveryReviewVerdict(document["verdict"])
+        )
+    except (TypeError, ValueError) as exc:
+        raise AgentResponseContractError("delivery review verdict is invalid") from exc
+    summary = document["summary"]
+    if summary is not None:
+        _text(summary, "delivery review summary", MAX_SUMMARY_LENGTH)
+    raw_findings = document["findings"]
+    if not isinstance(raw_findings, (list, tuple)) or len(raw_findings) > MAX_SEMANTIC_FINDINGS:
+        raise AgentResponseContractError("delivery review findings must be a bounded array")
+    findings: list[DeliveryReviewFinding] = []
+    for raw in raw_findings:
+        finding = _delivery_finding(raw)
+        if finding in findings:
+            raise AgentResponseContractError("delivery review contains duplicate findings")
+        findings.append(finding)
+    result = DeliveryReviewAnalysis(
+        1,
+        status,
+        verdict,
+        summary,
+        tuple(findings),
+        document["reason_code"],
+        document["message"],
+    )
+    _status_fields(status, result.reason_code, result.message)
+    if status is AgentAnalysisStatus.SUCCESS:
+        if verdict is DeliveryReviewVerdict.PASS and result.findings:
+            raise AgentResponseContractError("passing delivery review cannot contain findings")
+        if verdict is DeliveryReviewVerdict.FAIL and (not result.findings or not summary):
+            raise AgentResponseContractError("failed delivery review requires summary and findings")
+        if verdict is None:
+            raise AgentResponseContractError("successful delivery review requires a verdict")
+    elif verdict is not None or summary is not None or result.findings:
+        raise AgentResponseContractError("blocked delivery review cannot contain a decision")
+    return result
+
+
+def _delivery_finding(value: Any) -> DeliveryReviewFinding:
+    expected = {"kind", "message", "path", "item_ids", "requirement_refs"}
+    if not isinstance(value, Mapping) or set(value) != expected:
+        raise AgentResponseContractError("delivery review finding has unknown or missing fields")
+    try:
+        kind = DeliveryReviewFindingKind(value["kind"])
+    except (TypeError, ValueError) as exc:
+        raise AgentResponseContractError("delivery review finding kind is invalid") from exc
+    path = value["path"]
+    if path is not None:
+        _safe_path(path, "delivery review finding path")
+    return DeliveryReviewFinding(
+        kind,
+        _text(value["message"], "delivery finding message"),
+        path,
+        _strings(value, "item_ids", MAX_REQUIREMENT_REFS),
+        _strings(value, "requirement_refs", MAX_REQUIREMENT_REFS),
+    )
+
+
 def _semantic_finding(value: Any) -> SemanticReviewFinding:
     expected = {"kind", "path", "message", "requirement_refs"}
     if not isinstance(value, Mapping) or set(value) != expected:
@@ -356,6 +468,27 @@ def _semantic_finding(value: Any) -> SemanticReviewFinding:
             raise AgentResponseContractError("semantic review finding path is invalid")
     refs = _strings(value, "requirement_refs", MAX_REQUIREMENT_REFS)
     return SemanticReviewFinding(kind, path, _text(value["message"], "finding message"), refs)
+
+
+def _safe_path(path: Any, label: str) -> None:
+    if (
+        not isinstance(path, str)
+        or not path
+        or len(path) > MAX_TEXT_LENGTH
+        or "\x00" in path
+        or "\\" in path
+    ):
+        raise AgentResponseContractError(f"{label} is invalid")
+    pure = PurePosixPath(path)
+    if (
+        pure.is_absolute()
+        or "." in pure.parts
+        or ".." in pure.parts
+        or any(":" in part for part in pure.parts)
+        or path.startswith("//")
+        or pure.as_posix() != path
+    ):
+        raise AgentResponseContractError(f"{label} is invalid")
 
 
 def _document(value: Any, expected: set[str]) -> dict[str, Any]:

@@ -60,6 +60,14 @@ class DiffCheckResult:
 
 
 @dataclass(frozen=True, slots=True)
+class CommitDiffCheckResult:
+    """Whitespace-check outcome for one exact cumulative commit range."""
+
+    ok: bool
+    receipt: CommandReceipt
+
+
+@dataclass(frozen=True, slots=True)
 class GitCommitIdentity:
     """Invocation-local Git author/committer identity."""
 
@@ -229,6 +237,30 @@ class GitAdapter:
             staged.receipt.exit_code == 0,
             (working.receipt, staged.receipt),
         )
+
+    def diff_check_between(
+        self, repository: GitRepository, old_sha: str, new_sha: str
+    ) -> CommitDiffCheckResult:
+        """Check whitespace errors in an exact local commit-to-commit diff."""
+
+        self._validate_start_point(repository, old_sha)
+        self._validate_start_point(repository, new_sha)
+        result = self._run(
+            repository,
+            (
+                "--no-pager",
+                "diff",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--check",
+                old_sha,
+                new_sha,
+                "--",
+            ),
+        )
+        if result.receipt.status in {ProcessStatus.TIMED_OUT, ProcessStatus.CANCELLED}:
+            self._require_success(result, "Git cumulative diff check did not complete")
+        return CommitDiffCheckResult(result.receipt.exit_code == 0, result.receipt)
 
     def create_branch(
         self,

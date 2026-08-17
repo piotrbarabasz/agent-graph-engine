@@ -64,6 +64,21 @@ def test_commit_tree_read_primitives_return_exact_local_objects(git_repo) -> Non
     assert entry.object_type == "blob"
     assert adapter.read_blob(repository, entry.object_id) == b"committed bytes\n"
     assert adapter.tree_entry(repository, commit.commit_sha, "absent.txt") is None
+    assert adapter.diff_check_between(repository, parent, commit.commit_sha).ok
+
+
+def test_commit_range_diff_check_reports_whitespace_errors(git_repo) -> None:
+    root, adapter, repository = git_repo
+    parent = adapter.snapshot(repository).head_sha
+    assert parent is not None
+    changed = root / "tracked.txt"
+    changed.write_text("trailing whitespace \n", encoding="utf-8")
+    adapter.stage_paths(repository, (changed,))
+    commit = adapter.commit(repository, "bad whitespace", expected_paths=(changed,))
+
+    result = adapter.diff_check_between(repository, parent, commit.commit_sha)
+    assert result.ok is False
+    assert result.receipt.exit_code != 0
 
 
 def test_stage_paths_handles_option_shaped_name_and_blocks_escape(git_repo, tmp_path) -> None:

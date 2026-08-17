@@ -7,7 +7,13 @@ import json
 from dataclasses import dataclass
 from enum import StrEnum
 
-from agentgraph.core import FailureCategory, GraphState, RepairClassification, RiskLevel
+from agentgraph.core import (
+    FailureCategory,
+    GraphState,
+    RepairClassification,
+    ReviewVerdict,
+    RiskLevel,
+)
 from agentgraph.runtime.codec import sha256_digest
 from agentgraph.work import RepoPathSpec, ValidationCheck, WorkPackage
 
@@ -307,10 +313,13 @@ class WriteRunInputs:
     max_repair_cycles: int
     semantic_review_enabled: bool
     checkpoint_ttl_seconds: int
+    delivery_review_enabled: bool = False
 
     def __post_init__(self) -> None:
         if self.schema_version != 1:
             raise ValueError("unsupported write-run inputs schema")
+        if type(self.delivery_review_enabled) is not bool:
+            raise ValueError("delivery review mode must be boolean")
         if not 1 <= self.max_work_items_per_run <= 20:
             raise ValueError("work-item limit must be between 1 and 20")
         if self.max_repair_cycles not in {0, 1, 2}:
@@ -405,6 +414,7 @@ class WriteSliceOutcome(StrEnum):
     RECOVERY_REQUIRED = "recovery_required"
     CHECKPOINT_REQUIRED = "checkpoint_required"
     DELIVERY_REVIEW_REQUIRED = "delivery_review_required"
+    DELIVERY_CHECKPOINT_REQUIRED = "delivery_checkpoint_required"
 
 
 @dataclass(frozen=True, slots=True)
@@ -450,6 +460,116 @@ class CompletedItemReport:
 
 
 @dataclass(frozen=True, slots=True)
+class DeliveryManifestEntry:
+    path: str
+    sha256: str
+    size_bytes: int
+    mode: int
+    object_id: str
+
+    def __post_init__(self) -> None:
+        if (
+            not self.path
+            or self.mode not in {0o644, 0o755}
+            or self.size_bytes < 0
+            or not _is_sha256(self.sha256)
+            or not self.object_id
+        ):
+            raise ChangeSetError("delivery manifest entry is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class DeliveryManifest:
+    schema_version: int
+    scope_id: str
+    target_baseline_head: str
+    final_head: str
+    final_tree_id: str
+    changed_files: tuple[DeliveryManifestEntry, ...]
+    completed_item_ids: tuple[str, ...]
+    completed_commit_shas: tuple[str, ...]
+    work_plan_digest: str
+    source_revision: str
+    digest: str
+
+    @classmethod
+    def create(cls, **values) -> DeliveryManifest:
+        values = {"schema_version": 1, **values}
+        return cls(**values, digest=sha256_digest(values))
+
+    def __post_init__(self) -> None:
+        values = {
+            field: getattr(self, field) for field in self.__dataclass_fields__ if field != "digest"
+        }
+        if (
+            self.schema_version != 1
+            or self.digest != sha256_digest(values)
+            or len({item.path for item in self.changed_files}) != len(self.changed_files)
+            or len(self.completed_item_ids) != len(self.completed_commit_shas)
+        ):
+            raise ChangeSetError("delivery manifest is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class DeliveryCompletedItem:
+    item_id: str
+    item_index: int
+    title: str
+    goal: str
+    acceptance_criteria: tuple[str, ...]
+    test_requirements: tuple[str, ...]
+    item_base_head: str
+    commit_sha: str
+    changed_paths: tuple[str, ...]
+    repair_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class DeliveryReviewContext:
+    schema_version: int
+    scope_id: str
+    source_revision: str
+    work_plan_digest: str
+    target_baseline_head: str
+    final_head: str
+    final_tree_id: str
+    delivery_manifest_digest: str
+    final_changed_paths: tuple[str, ...]
+    delivery_allowed_paths: tuple[RepoPathSpec, ...]
+    completed_items: tuple[DeliveryCompletedItem, ...]
+    declared_work: tuple[DeliveryCompletedItem, ...]
+    architecture_invariants: tuple[str, ...]
+    context_digest: str
+
+    @classmethod
+    def create(cls, **values) -> DeliveryReviewContext:
+        values = {"schema_version": 1, **values}
+        return cls(**values, context_digest=sha256_digest(values))
+
+    def __post_init__(self) -> None:
+        values = {
+            field: getattr(self, field)
+            for field in self.__dataclass_fields__
+            if field != "context_digest"
+        }
+        if self.schema_version != 1 or self.context_digest != sha256_digest(values):
+            raise ChangeSetError("delivery review context is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class DeliveryReviewReport:
+    scope_id: str
+    target_baseline_head: str
+    final_head: str
+    final_tree_id: str
+    manifest_digest: str
+    verdict: ReviewVerdict
+    safe_to_create_pr: bool
+    findings: tuple[str, ...]
+    evidence_reference: str
+
+
+@dataclass(frozen=True, slots=True)
 class WriteSliceReport:
     outcome: WriteSliceOutcome
     project_id: str | None
@@ -471,6 +591,7 @@ class WriteSliceReport:
     completed_item_ids: tuple[str, ...] = ()
     commit_shas: tuple[str, ...] = ()
     completed_items: tuple[CompletedItemReport, ...] = ()
+    delivery_review: DeliveryReviewReport | None = None
 
     @property
     def final_graph_state(self) -> GraphState | None:

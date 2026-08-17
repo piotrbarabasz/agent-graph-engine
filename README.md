@@ -157,3 +157,13 @@ validation, chooses graph transitions, closes source work, or gains Git/write au
 Malformed or contract-invalid agent output is classified as a design failure. Provider/runtime
 failures and detected repository mutation are infrastructure failures; pinned baseline or source
 drift and durable evidence mismatch block rather than guess.
+
+After all bounded scope items are committed, M013 can run the existing canonical
+`DELIVERY_REVIEW` node through a separately configured delivery-review provider. It first verifies
+every item and builds a content-digested `DeliveryManifest` from actual Git objects for the full
+original-baseline-to-final-HEAD diff. Deterministic target, source, workspace, branch, capability,
+tree, and cumulative `git diff --check` gates run before the independent semantic reviewer. The
+reviewer evaluates cross-item integration and scope-level correctness without receiving prior
+review prose or implementation proposals. A PASS advances the canonical graph to
+`HUMAN_CHECKPOINT` with `pending_resume_node=CREATE_PR`. M013 stops there without creating a
+checkpoint request or publishing anything; M014 adds exact publish approval and draft PR creation.
