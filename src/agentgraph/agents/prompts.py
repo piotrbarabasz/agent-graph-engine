@@ -142,7 +142,11 @@ def _architecture_invariants() -> tuple[str, ...]:
     return (
         "external_runtime_worktree_only_for_implementation",
         "target_main_worktree_read_only",
-        "one_item_bounded_repairs",
+        "sequential_multi_item_scope",
+        "per_item_bounded_repairs",
+        "per_work_item_verified_commit",
+        "one_scope_branch",
+        "no_parallel_writes",
         "no_source_closure",
         "no_push_or_pull_request",
     )

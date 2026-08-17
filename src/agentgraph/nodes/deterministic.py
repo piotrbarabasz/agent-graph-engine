@@ -121,7 +121,9 @@ class PreflightNode:
                 "target_main_worktree_read_only",
                 "work_source_snapshot_pinned",
                 "repository_baseline_pinned",
-                "one_item_bounded_repairs",
+                "sequential_items_bounded_by_policy",
+                "one_scope_branch_and_workspace",
+                "per_item_capability_and_commit",
                 "no_source_closure",
                 "no_push_or_pull_request",
             )

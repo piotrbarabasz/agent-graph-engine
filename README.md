@@ -37,6 +37,10 @@ requests. Execution pauses before any implementation write and returns a nonce-b
 an expiry. A separately submitted `APPROVED`, `REJECTED`, or `CANCELLED` decision is bound to the
 exact pinned run state; approved runs continue through the unchanged implementation, validation,
 and review pipeline.
+M012 adds sequential execution of multiple dependency-ready work items from one frozen scope plan.
+The run keeps one external workspace and one scope branch, creates one verified commit per item,
+and derives every next item from a source-neutral completion overlay. The default work-item limit
+remains one; callers may configure an immutable limit from 1 through 20.
 
 Agent Graph Engine—not Codex—computes stale-file hashes, applies changes, runs validation, reviews
 the actual diff, stages files, and verifies the local commit. The provider receives a neutral read
@@ -76,11 +80,15 @@ snapshot through deterministic `START`, `DISCOVER_PROJECT`, `PREFLIGHT`, and `SE
 It stops before `EXPLORE`, never executes validation commands, and does not create a durable run.
 
 `agentgraph.write.WriteSliceRunner` reuses pinned M005 preparation and the unchanged canonical
-graph, then executes exactly one eligible planned-scope item with a configurable bound of zero,
-one, or two graph-driven repairs. Generated text
+graph, then executes dependency-ready items from one eligible planned scope with a configurable
+work-item bound (default one, maximum 20) and zero, one, or two graph-driven repairs per item.
+Generated text
 changes are preflighted against independently reconstructed path capabilities, atomically applied
 under `<run>/workspace`, validated there, reviewed against exact paths and hashes, and committed
-with an invocation-local identity. Operation evidence remains under `<run>/operations`.
+with an invocation-local identity. Multi-item runs persist immutable `run-inputs.json` and a
+content-digested `work-plan.json` before promotion. Each item has isolated evidence under
+`<run>/items/<plan-index>-<item-id-hash>/`; the single-item default retains the historical root
+operation layout for compatibility.
 Existing file modes are preserved by atomic content replacement, and deterministic review rejects
 unexpected mode changes. Durable runs persist content-digested `write-inputs.json`; a fresh
 `WriteSliceRunner.resume(run_id)` can reconstruct committed safe transitions from immutable
@@ -115,7 +123,18 @@ decision with the request's local capability nonce, then explicitly calls `resum
 never starts implementation. Undecided requests expire and fail closed without renewal. Decisions
 created before expiry remain valid on a later resume. Approval does not bypass live drift checks,
 validation, mechanical review, or optional semantic review. Remote approval, delivery review,
-push, pull-request creation, and multi-item execution remain outside M011.
+push, and pull-request creation remain outside M012. When all planned items are complete below the
+configured limit, execution stops before invoking the canonical `DELIVERY_REVIEW` node and returns
+`DELIVERY_REVIEW_REQUIRED`; the durable run remains RUNNING and repeated resume is idempotent. If
+the item limit is reached first, canonical policy finalizes the run as PAUSED. M012 does not
+continue such a finalized run automatically.
+
+For later items, the previous verified item commit becomes `item_base_head`; read-only analysis,
+manifests, validation, review, and provider stale-file hashes use that commit rather than the
+original target baseline. The target main worktree remains pinned to its original baseline. The
+scope branch and workspace must remain clean and exactly at the last verified commit between
+items. Capabilities stay item-specific even though `DeliveryScope` exposes the deterministic union
+of planned paths for delivery diagnostics.
 
 `agentgraph.providers.codex.CodexChangeProvider` probes the installed CLI before use, requires
 non-interactive execution with an explicit Codex working root and a runtime-only permission profile.

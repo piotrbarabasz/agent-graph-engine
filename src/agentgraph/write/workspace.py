@@ -87,6 +87,7 @@ class WriteExecution:
     validation_timeout_seconds: float = 120.0
     rehydrating: bool = False
     fault: Callable[[str], None] = field(default=lambda stage: None, repr=False)
+    item_path: Path | None = None
     workspace: Path = field(init=False)
     operations: Path = field(init=False)
     workspace_repository: GitRepository | None = field(default=None, init=False)
@@ -105,7 +106,7 @@ class WriteExecution:
 
     def __post_init__(self) -> None:
         self.workspace = self.run_path / "workspace"
-        self.operations = self.run_path / "operations"
+        self.operations = (self.item_path or self.run_path) / "operations"
         run_root = self.run_path.resolve()
         candidate = self.workspace.resolve()
         try:
@@ -124,25 +125,34 @@ class WriteExecution:
 
     def implement(self, node_attempt_id: str) -> AppliedChangeSet:
         self.live_recheck("write_baseline_drift")
-        if self.git.local_branch_exists(self.target, self.inputs.scope_branch):
-            raise WriteBaselineDriftError("scope_branch_already_exists")
-        result = self.git.add_worktree(
-            self.target,
-            self.workspace,
-            self.inputs.scope_branch,
-            self.inputs.baseline_head,
-        )
-        self.workspace_repository = result.repository
-        workspace_snapshot = self.git.snapshot(result.repository)
+        if self.workspace.exists():
+            repository = self.git.discover_repository(self.workspace)
+            scope_ref = f"refs/heads/{self.inputs.scope_branch}"
+            workspace_snapshot = self.git.snapshot(repository)
+            if self.git.resolve_ref(self.target, scope_ref) != self.inputs.baseline_head:
+                raise WriteBaselineDriftError("multi_item_workspace_drift")
+        else:
+            if self.git.local_branch_exists(self.target, self.inputs.scope_branch):
+                raise WriteBaselineDriftError("scope_branch_already_exists")
+            result = self.git.add_worktree(
+                self.target,
+                self.workspace,
+                self.inputs.scope_branch,
+                self.inputs.baseline_head,
+            )
+            repository = result.repository
+            workspace_snapshot = self.git.snapshot(repository)
+        self.workspace_repository = repository
         if (
             workspace_snapshot.head_sha != self.inputs.baseline_head
             or workspace_snapshot.branch != self.inputs.scope_branch
             or workspace_snapshot.dirty
+            or workspace_snapshot.staged_paths
             or workspace_snapshot.conflicted_paths
         ):
-            raise WorkspaceError("new worktree does not match pinned baseline")
+            raise WorkspaceError("worktree does not match current item baseline")
         request = self.change_request()
-        provider_directory = self.run_path / "provider"
+        provider_directory = (self.item_path or self.run_path) / "provider"
         provider_directory.mkdir(exist_ok=True)
         context = ChangeProviderContext(
             repository_root=self.workspace,
@@ -160,7 +170,7 @@ class WriteExecution:
             proposed = self.provider.propose(request, context)
         except BaseException as exc:
             provider_error = exc
-        provider_snapshot = self.git.snapshot(result.repository)
+        provider_snapshot = self.git.snapshot(repository)
         self.live_recheck("write_baseline_drift_after_provider")
         if _repository_semantics(provider_snapshot) != _repository_semantics(workspace_snapshot):
             self.issue_code = "provider_mutated_repository"
@@ -182,7 +192,7 @@ class WriteExecution:
         )
         applied = apply_changeset(self.workspace, proposed, self.inputs.expected_allowed_paths)
         self.applied = applied
-        snapshot = self.git.snapshot(result.repository)
+        snapshot = self.git.snapshot(repository)
         write_evidence(
             self.operations / "implement-applied.json",
             context=self.evidence_context(),
@@ -621,7 +631,9 @@ class WriteExecution:
             ),
             failure_context=failure_context,
         )
-        provider_directory = self.run_path / "provider" / "repairs" / f"{cycle:03d}"
+        provider_directory = (
+            (self.item_path or self.run_path) / "provider" / "repairs" / f"{cycle:03d}"
+        )
         provider_directory.mkdir(parents=True, exist_ok=False)
         provider_invocation_id = f"{node_attempt_id}-repair-{cycle:03d}"
         provider_context = ChangeProviderContext(
@@ -1142,6 +1154,129 @@ class WriteExecution:
         self.review_findings = tuple(review["findings"])
         self.review_failure_code = review["failure_code"]
 
+    def verify_completed_review(self, cycle: int, manifest: WorkspaceManifest) -> None:
+        """Reconstruct the final passed review without relying on current GraphState."""
+
+        self.manifest = manifest
+        validation = self._payload_path(
+            self._cycle_evidence_path(cycle, "validation.json", create=False)
+        )
+        try:
+            receipts = decode_value(validation["commands"], tuple[CommandReceipt, ...])
+            diff_check = decode_value(validation["diff_check"], DiffCheckResult)
+        except Exception as exc:
+            raise SemanticReviewEvidenceError("semantic_review_evidence_mismatch") from exc
+        if (
+            validation.get("cycle") != cycle
+            or validation.get("workspace_manifest_digest") != manifest.digest
+            or validation.get("passed") is not True
+            or any(receipt.status is not ProcessStatus.SUCCEEDED for receipt in receipts)
+            or not diff_check.ok
+        ):
+            raise SemanticReviewEvidenceError("semantic_review_evidence_mismatch")
+
+        review = self._payload_path(self._cycle_evidence_path(cycle, "review.json", create=False))
+        mechanical_evidence = self._payload_path(
+            self._cycle_evidence_path(cycle, "mechanical-review.json", create=False)
+        )
+        mechanical = review.get("mechanical")
+        if (
+            review.get("cycle") != cycle
+            or review.get("workspace_manifest_digest") != manifest.digest
+            or review.get("semantic_review_enabled") is not self.inputs.semantic_review_enabled
+            or not isinstance(mechanical, dict)
+            or mechanical
+            != {
+                "passed": mechanical_evidence.get("passed"),
+                "findings": mechanical_evidence.get("findings"),
+            }
+            or mechanical_evidence.get("cycle") != cycle
+            or mechanical_evidence.get("workspace_manifest_digest") != manifest.digest
+            or mechanical.get("passed") is not True
+            or tuple(mechanical.get("findings", ()))
+        ):
+            raise SemanticReviewEvidenceError("semantic_review_evidence_mismatch")
+
+        semantic = review.get("semantic")
+        if self.inputs.semantic_review_enabled:
+            if not isinstance(semantic, dict):
+                raise SemanticReviewEvidenceError("semantic_review_evidence_mismatch")
+            try:
+                context_payload = self._payload_path(
+                    self._cycle_evidence_path(cycle, "review-context.json", create=False)
+                )
+                context = decode_value(context_payload["context"], SemanticReviewContext)
+            except Exception as exc:
+                raise SemanticReviewContextError("semantic_review_context_mismatch") from exc
+            diagnostics = (
+                *(
+                    self._validation_diagnostic(
+                        RepairValidationDiagnosticKind.DECLARED_VALIDATION, receipt
+                    )
+                    for receipt in receipts
+                ),
+                self._validation_diagnostic(
+                    RepairValidationDiagnosticKind.GIT_DIFF_CHECK_WORKTREE,
+                    diff_check.receipts[0],
+                ),
+                self._validation_diagnostic(
+                    RepairValidationDiagnosticKind.GIT_DIFF_CHECK_STAGED,
+                    diff_check.receipts[1],
+                ),
+            )
+            if (
+                context_payload.get("context_digest") != context.digest
+                or context.cycle != cycle
+                or context.item_id != self.inputs.package.item_id
+                or context.scope_id != self.inputs.package.scope_id
+                or context.goal != self.inputs.package.goal
+                or context.current_manifest_digest != manifest.digest
+                or context.current_changed_paths != tuple(item.path for item in manifest.files)
+                or context.allowed_paths != self.inputs.expected_allowed_paths
+                or context.baseline_head != self.inputs.baseline_head
+                or context.source_revision != self.inputs.source_revision
+                or context.validation_diagnostics != diagnostics
+            ):
+                raise SemanticReviewContextError("semantic_review_context_mismatch")
+            from agentgraph.write.analysis import semantic_review_request
+
+            request = semantic_review_request(context)
+            if (
+                semantic.get("context_digest") != context.digest
+                or semantic.get("input_digest") != request.input_digest
+            ):
+                raise SemanticReviewEvidenceError("semantic_review_evidence_mismatch")
+            try:
+                value = self.analysis.restore_semantic_review(
+                    semantic.get("evidence_reference"),
+                    semantic.get("output_digest"),
+                    request.input_digest,
+                )
+            except Exception as exc:
+                raise SemanticReviewEvidenceError("semantic_review_evidence_mismatch") from exc
+            if (
+                semantic.get("status") != value.status.value
+                or semantic.get("verdict")
+                != (None if value.verdict is None else value.verdict.value)
+                or semantic.get("summary") != value.summary
+                or semantic.get("findings") != encode_value(value.findings)
+                or semantic.get("reason_code") != value.reason_code
+                or semantic.get("message") != value.message
+                or value.status is not AgentAnalysisStatus.SUCCESS
+                or value.verdict is not SemanticReviewVerdict.PASS
+                or value.findings
+            ):
+                raise SemanticReviewEvidenceError("semantic_review_evidence_mismatch")
+        elif semantic is not None:
+            raise SemanticReviewEvidenceError("semantic_review_evidence_mismatch")
+
+        if (
+            review.get("passed") is not True
+            or tuple(review.get("findings", ()))
+            or review.get("failure_code") is not None
+        ):
+            raise SemanticReviewEvidenceError("semantic_review_evidence_mismatch")
+
     def _payload(self, name: str) -> dict[str, object]:
         return self._payload_path(self.operations / name)
 
@@ -1155,6 +1290,12 @@ class WriteExecution:
             or document.get("project_id") != self.inputs.project_id
             or document.get("item_id") != self.inputs.package.item_id
             or document.get("scope_id") != self.inputs.package.scope_id
+            or document.get("item_base_head") != self.inputs.baseline_head
+            or document.get("target_baseline_head") != self.inputs.pinned_target_head
+            or document.get("item_index") != self.inputs.item_index
+            or document.get("work_plan_digest") != self.inputs.work_plan_digest
+            or document.get("source_revision") != self.inputs.source_revision
+            or document.get("capability_fingerprint") != self.inputs.capability_fingerprint
         ):
             raise WorkspaceError("operation evidence identity differs from write inputs")
         return document
@@ -1172,12 +1313,12 @@ class WriteExecution:
         current = self.git.snapshot(self.target)
         pinned = self.shadow.inspection.git_snapshot
         if (
-            current.head_sha != self.inputs.baseline_head
-            or current.branch != self.inputs.base_branch
+            current.head_sha != self.inputs.pinned_target_head
+            or current.branch != self.inputs.pinned_target_branch
             or current.detached_head
             or current.dirty
             or current.conflicted_paths
-            or pinned.head_sha != self.inputs.baseline_head
+            or pinned.head_sha != self.inputs.pinned_target_head
         ):
             raise WriteBaselineDriftError(code)
         snapshot = self.source.snapshot()
@@ -1224,7 +1365,11 @@ class WriteExecution:
             (
                 "external_runtime_worktree_only",
                 "target_main_worktree_read_only",
-                "one_item_bounded_repairs",
+                "sequential_multi_item_scope",
+                "per_item_bounded_repairs",
+                "per_work_item_verified_commit",
+                "one_scope_branch",
+                "no_parallel_writes",
                 "no_source_closure",
                 "no_push_or_pull_request",
             ),
@@ -1271,7 +1416,12 @@ class WriteExecution:
             "item_id": self.inputs.package.item_id,
             "scope_id": self.inputs.package.scope_id,
             "pinned_head": self.inputs.baseline_head,
+            "item_base_head": self.inputs.baseline_head,
+            "target_baseline_head": self.inputs.pinned_target_head,
+            "item_index": self.inputs.item_index,
+            "work_plan_digest": self.inputs.work_plan_digest,
             "source_revision": self.inputs.source_revision,
+            "capability_fingerprint": self.inputs.capability_fingerprint,
             "changeset_digest": (
                 changeset_digest
                 if changeset_digest is not None
