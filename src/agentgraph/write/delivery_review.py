@@ -34,6 +34,7 @@ from agentgraph.core import (
     PatchOperation,
     ResultReason,
     ReviewVerdict,
+    RunStatus,
     StatePatch,
 )
 from agentgraph.runtime.codec import decode_value, encode_value, sha256_digest
@@ -43,6 +44,7 @@ from .delivery_storage import verify_delivery_storage
 from .errors import (
     DeliveryReviewContextError,
     DeliveryReviewEvidenceError,
+    DeliveryReviewStateMismatchError,
     WorkspaceError,
 )
 from .evidence import read_evidence, write_evidence
@@ -166,15 +168,17 @@ class DeliveryReviewExecution:
         verify_delivery_storage(self.controller.run_path)
         self.root.mkdir(parents=True, exist_ok=True)
         verify_delivery_storage(self.controller.run_path)
+        completed = self.controller.completed_reports(state)
+        if not completed:
+            raise WorkspaceError("delivery review has no verified completed items")
+        final_head = completed[-1].commit_sha
         findings: list[str] = []
         try:
-            completed = self.controller.completed_reports(state)
-            self.controller.verify_run_boundary(state)
+            self.controller.verify_run_boundary_from_head(final_head)
             if len(completed) != len(self.controller.plan.items) or {
                 item.item_id for item in completed
             } != {item.item_id for item in self.controller.plan.items}:
                 findings.append("incomplete_delivery: not all frozen work-plan items completed")
-            final_head = completed[-1].commit_sha
             workspace = self.controller.git.discover_repository(
                 self.controller.run_path / "workspace"
             )
@@ -213,10 +217,6 @@ class DeliveryReviewExecution:
         except Exception as exc:
             if not findings:
                 findings.append(f"delivery_mechanical_gate_failed: {type(exc).__name__}")
-            completed = self.controller.verified_completed
-            if not completed:
-                raise WorkspaceError("delivery review has no verified completed items") from exc
-            final_head = completed[-1].commit_sha
             manifest = self._manifest(completed, final_head)
             diff_check = None
 
@@ -450,6 +450,7 @@ class DeliveryReviewExecution:
                 self.report = self._report(
                     manifest, ReviewVerdict.FAIL, findings, "delivery-review/review.json"
                 )
+                self._reconcile_state(state, analysis, findings)
                 return analysis
             if not passed:
                 raise ValueError("mechanical")
@@ -470,7 +471,10 @@ class DeliveryReviewExecution:
                 self.report = self._report(
                     manifest, verdict, self._findings(analysis), "delivery-review/review.json"
                 )
+            self._reconcile_state(state, analysis, self._findings(analysis))
             return analysis
+        except DeliveryReviewStateMismatchError:
+            raise
         except DeliveryReviewEvidenceError:
             raise
         except Exception as exc:
@@ -564,6 +568,50 @@ class DeliveryReviewExecution:
             item_id not in known for finding in analysis.findings for item_id in finding.item_ids
         ):
             raise AgentResponseContractError("delivery review finding references an unknown item")
+
+    @staticmethod
+    def _reconcile_state(
+        state: GraphState, analysis: DeliveryReviewAnalysis, findings: tuple[str, ...]
+    ) -> None:
+        review = state.review
+        before_node_result = (
+            state.graph.current_node == "DELIVERY_REVIEW"
+            and review.verdict is ReviewVerdict.UNKNOWN
+            and review.safe_to_create_pr is False
+            and review.findings == ()
+        )
+        if before_node_result:
+            return
+
+        if analysis.status is AgentAnalysisStatus.BLOCKED:
+            matches = (
+                review.verdict is ReviewVerdict.UNKNOWN
+                and review.safe_to_create_pr is False
+                and review.findings == ()
+                and state.run.status is RunStatus.BLOCKED
+                and state.graph.current_node in {"FINALIZE", "END"}
+                and state.graph.pending_resume_node is None
+            )
+        elif analysis.verdict is DeliveryReviewVerdict.PASS:
+            matches = (
+                review.verdict is ReviewVerdict.PASS
+                and review.safe_to_create_pr is True
+                and review.findings == ()
+                and state.run.status is RunStatus.RUNNING
+                and state.graph.current_node == "HUMAN_CHECKPOINT"
+                and state.graph.pending_resume_node == "CREATE_PR"
+            )
+        else:
+            matches = (
+                review.verdict is ReviewVerdict.FAIL
+                and review.safe_to_create_pr is False
+                and review.findings == findings
+                and state.run.status is RunStatus.FAILED
+                and state.graph.current_node in {"FINALIZE", "END"}
+                and state.graph.pending_resume_node is None
+            )
+        if not matches:
+            raise DeliveryReviewStateMismatchError("delivery_review_state_mismatch")
 
     @staticmethod
     def _mechanical_analysis(findings: tuple[str, ...]) -> DeliveryReviewAnalysis:

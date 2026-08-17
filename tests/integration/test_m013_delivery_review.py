@@ -11,12 +11,15 @@ from agentgraph.agents import AgentResponse
 from agentgraph.core import CheckpointOutcome, ReviewVerdict, RunStatus
 from agentgraph.infra import GitAdapter, GitCommitIdentity
 from agentgraph.runtime import ProjectRegistry, RuntimePaths, StateStore
-from agentgraph.runtime.codec import decode_value, sha256_digest
+from agentgraph.runtime.codec import decode_value, encode_value, sha256_digest
 from agentgraph.write import (
     CheckpointError,
+    WriteInputs,
+    WriteRunInputs,
     WriteSliceOutcome,
     WriteSliceRequest,
     WriteSliceRunner,
+    write_run_inputs_digest,
 )
 from agentgraph.write.evidence import read_evidence
 from agentgraph.write.models import DeliveryReviewContext
@@ -27,6 +30,7 @@ from tests.integration.test_m012_multi_item import (
     StageFault,
     _item_roots,
     _multi_target,
+    _rewrite_durable_state,
     _rewrite_evidence,
     _symlink,
 )
@@ -129,6 +133,33 @@ class NamedFault:
             raise RuntimeError("injected M013 interruption")
 
 
+def test_write_run_inputs_digest_preserves_final_m012_disabled_authority() -> None:
+    disabled = WriteRunInputs(
+        1,
+        "prj_legacy",
+        "E001",
+        None,
+        "sha256:source",
+        "a" * 40,
+        "main",
+        "work/e001",
+        "sha256:plan",
+        3,
+        2,
+        True,
+        3600,
+    )
+    legacy_payload = encode_value(disabled)
+    legacy_payload.pop("delivery_review_enabled")
+    decoded = decode_value(legacy_payload, WriteRunInputs)
+
+    assert decoded.delivery_review_enabled is False
+    assert write_run_inputs_digest(decoded) == sha256_digest(legacy_payload)
+    assert write_run_inputs_digest(replace(decoded, delivery_review_enabled=True)) != (
+        write_run_inputs_digest(decoded)
+    )
+
+
 def _runner(
     target: Path,
     runtime: Path,
@@ -207,9 +238,8 @@ def test_reverse_dependency_delivery_context_uses_verified_execution_order(tmp_p
 def test_delivery_semantic_fail_is_terminal_without_checkpoint_or_repair(tmp_path) -> None:
     target = _multi_target(tmp_path)
     reviewer = DeliveryReviewer("fail")
-    report = _runner(target, tmp_path / "runtime", PerItemProvider(), delivery=reviewer).run(
-        WriteSliceRequest(scope_id="E001")
-    )
+    runner = _runner(target, tmp_path / "runtime", PerItemProvider(), delivery=reviewer)
+    report = runner.run(WriteSliceRequest(scope_id="E001"))
 
     assert report.outcome is WriteSliceOutcome.FAILED
     assert report.graph_state is not None
@@ -220,6 +250,9 @@ def test_delivery_semantic_fail_is_terminal_without_checkpoint_or_repair(tmp_pat
     assert "CLASSIFY_FAILURE" not in report.executed_nodes
     assert report.delivery_review is not None
     assert len(report.delivery_review.findings) == 1
+    assert len(reviewer.calls) == 1
+    resumed = runner.resume("run_m013")
+    assert resumed.outcome is WriteSliceOutcome.FAILED
     assert len(reviewer.calls) == 1
 
 
@@ -243,12 +276,15 @@ def test_delivery_provider_blocked_and_malformed_are_typed(
     tmp_path, reviewer, outcome, code
 ) -> None:
     target = _multi_target(tmp_path)
-    report = _runner(target, tmp_path / "runtime", PerItemProvider(), delivery=reviewer).run(
-        WriteSliceRequest(scope_id="E001")
-    )
+    runner = _runner(target, tmp_path / "runtime", PerItemProvider(), delivery=reviewer)
+    report = runner.run(WriteSliceRequest(scope_id="E001"))
     assert report.outcome is outcome
     assert report.issues[0].code == code
     assert report.checkpoint is None
+    if outcome is WriteSliceOutcome.BLOCKED:
+        resumed = runner.resume("run_m013")
+        assert resumed.outcome is WriteSliceOutcome.BLOCKED
+        assert len(reviewer.calls) == 1
 
 
 def test_delivery_finding_with_unknown_item_is_contract_failure(tmp_path) -> None:
@@ -394,6 +430,40 @@ def test_earlier_item_evidence_tamper_prevents_delivery_review(tmp_path) -> None
     resumed = runner.resume("run_m013")
     assert resumed.outcome is WriteSliceOutcome.RECOVERY_REQUIRED
     assert reviewer.calls == []
+    assert resumed.graph_state is not None
+    assert resumed.graph_state.review.verdict is ReviewVerdict.UNKNOWN
+    assert not (run / "delivery-review" / "review.json").exists()
+
+
+def test_live_delivery_boundary_item_corruption_returns_recovery_before_review(tmp_path) -> None:
+    target = _multi_target(tmp_path)
+    runtime = tmp_path / "runtime"
+    run = RuntimePaths.resolve(runtime).run("prj_m013", "run_m013")
+    reviewer = DeliveryReviewer()
+    transition_count = 0
+
+    def tamper_at_boundary(stage: str) -> None:
+        nonlocal transition_count
+        if stage != "after_transition_committed":
+            return
+        transition_count += 1
+        if transition_count == 21:
+            witness = _item_roots(run)[0] / "operations" / "commit-witness.json"
+            _rewrite_evidence(witness, lambda document: document.update(scope_id="E999"))
+
+    report = _runner(
+        target,
+        runtime,
+        PerItemProvider(),
+        delivery=reviewer,
+        fault=tamper_at_boundary,
+    ).run(WriteSliceRequest(scope_id="E001"))
+    assert report.outcome is WriteSliceOutcome.RECOVERY_REQUIRED
+    assert report.graph_state is not None
+    assert report.graph_state.graph.current_node == "DELIVERY_REVIEW"
+    assert report.graph_state.review.verdict is ReviewVerdict.UNKNOWN
+    assert reviewer.calls == []
+    assert not (run / "delivery-review" / "review.json").exists()
 
 
 def test_delivery_checkpoint_resume_is_idempotent_and_submit_is_deferred(tmp_path) -> None:
@@ -440,6 +510,42 @@ def test_legacy_run_stays_disabled_even_when_resume_adds_provider(tmp_path) -> N
     assert reviewer.calls == []
     persisted = read_evidence(Path(initial.runtime_path or "") / "run-inputs.json")["payload"]
     assert persisted["delivery_review_enabled"] is False
+
+
+def test_exact_final_m012_persisted_run_resumes_with_legacy_authority_digest(tmp_path) -> None:
+    target = _multi_target(tmp_path)
+    runtime = tmp_path / "runtime"
+    initial = _runner(target, runtime, PerItemProvider()).run(WriteSliceRequest(scope_id="E001"))
+    assert initial.outcome is WriteSliceOutcome.DELIVERY_REVIEW_REQUIRED
+    run = Path(initial.runtime_path or "")
+    run_inputs_path = run / "run-inputs.json"
+    persisted = read_evidence(run_inputs_path)["payload"]
+    legacy_payload = dict(persisted)
+    legacy_payload.pop("delivery_review_enabled")
+    historical_digest = sha256_digest(legacy_payload)
+    decoded = decode_value(legacy_payload, WriteRunInputs)
+    assert write_run_inputs_digest(decoded) == historical_digest
+
+    input_paths = (
+        run / "write-inputs.json",
+        *(root / "write-inputs.json" for root in _item_roots(run)),
+    )
+    for path in input_paths:
+        restored = decode_value(read_evidence(path)["payload"], WriteInputs)
+        assert restored.run_inputs_digest == historical_digest
+
+    _rewrite_evidence(
+        run_inputs_path,
+        lambda document: document["payload"].pop("delivery_review_enabled"),
+    )
+    disabled = _runner(target, runtime, PerItemProvider()).resume("run_m013")
+    reviewer = DeliveryReviewer()
+    with_provider = _runner(target, runtime, PerItemProvider(), delivery=reviewer).resume(
+        "run_m013"
+    )
+    assert disabled.outcome is WriteSliceOutcome.DELIVERY_REVIEW_REQUIRED
+    assert with_provider.outcome is WriteSliceOutcome.DELIVERY_REVIEW_REQUIRED
+    assert reviewer.calls == []
 
 
 def test_enabled_resume_without_delivery_provider_requires_recovery(tmp_path) -> None:
@@ -544,6 +650,86 @@ def test_completed_delivery_host_evidence_tamper_requires_recovery(tmp_path) -> 
     _rewrite_evidence(host, mutate)
     resumed = _runner(target, runtime, PerItemProvider(), delivery=reviewer).resume("run_m013")
     assert resumed.outcome is WriteSliceOutcome.RECOVERY_REQUIRED
+    assert len(reviewer.calls) == 1
+
+
+@pytest.mark.parametrize(
+    "forged_review",
+    (
+        {"verdict": ReviewVerdict.FAIL, "safe_to_create_pr": False},
+        {"verdict": ReviewVerdict.PASS, "safe_to_create_pr": False},
+    ),
+)
+def test_completed_pass_review_rejects_incompatible_graph_state(tmp_path, forged_review) -> None:
+    target = _multi_target(tmp_path)
+    runtime = tmp_path / "runtime"
+    reviewer = DeliveryReviewer()
+    initial = _runner(target, runtime, PerItemProvider(), delivery=reviewer).run(
+        WriteSliceRequest(scope_id="E001")
+    )
+    run = Path(initial.runtime_path or "")
+
+    def mutate(state):
+        return replace(
+            state,
+            review=replace(
+                state.review,
+                verdict=forged_review["verdict"],
+                safe_to_create_pr=forged_review["safe_to_create_pr"],
+            ),
+        )
+
+    _rewrite_durable_state(run, mutate)
+    resumed = _runner(target, runtime, PerItemProvider(), delivery=reviewer).resume("run_m013")
+    assert resumed.outcome is WriteSliceOutcome.RECOVERY_REQUIRED
+    assert resumed.issues[0].code == "delivery_review_state_mismatch"
+    assert len(reviewer.calls) == 1
+
+
+def test_fail_delivery_evidence_cannot_authorize_create_pr_checkpoint(tmp_path) -> None:
+    target = _multi_target(tmp_path)
+    runtime = tmp_path / "runtime"
+    reviewer = DeliveryReviewer()
+    initial = _runner(target, runtime, PerItemProvider(), delivery=reviewer).run(
+        WriteSliceRequest(scope_id="E001")
+    )
+    run = Path(initial.runtime_path or "")
+    review_path = run / "delivery-review" / "review.json"
+    review_payload = read_evidence(review_path)["payload"]
+    host_path = run.joinpath(*review_payload["evidence_reference"].split("/"))
+    failure = {
+        "schema_version": 1,
+        "status": "success",
+        "verdict": "fail",
+        "summary": "The cumulative delivery has a blocking integration defect.",
+        "findings": [
+            {
+                "kind": "cross_item_integration_failure",
+                "message": "The completed items are not compatible.",
+                "path": "src/t002.py",
+                "item_ids": ["T001", "T002"],
+                "requirement_refs": ["scope integration"],
+            }
+        ],
+        "reason_code": None,
+        "message": None,
+    }
+    failure_digest = sha256_digest(failure)
+
+    def mutate_host(document):
+        document["payload"]["response"] = failure
+        document["payload"]["output_digest"] = failure_digest
+
+    def mutate_review(document):
+        document["payload"]["analysis"] = failure
+        document["payload"]["output_digest"] = failure_digest
+
+    _rewrite_evidence(host_path, mutate_host)
+    _rewrite_evidence(review_path, mutate_review)
+    resumed = _runner(target, runtime, PerItemProvider(), delivery=reviewer).resume("run_m013")
+    assert resumed.outcome is WriteSliceOutcome.RECOVERY_REQUIRED
+    assert resumed.outcome is not WriteSliceOutcome.DELIVERY_CHECKPOINT_REQUIRED
+    assert resumed.issues[0].code == "delivery_review_state_mismatch"
     assert len(reviewer.calls) == 1
 
 

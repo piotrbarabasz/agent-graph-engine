@@ -55,6 +55,7 @@ from .models import (
     WorkspaceManifest,
     WriteInputs,
     WriteRunInputs,
+    write_run_inputs_digest,
 )
 from .provider import ChangeProvider
 from .workspace import WriteExecution
@@ -144,7 +145,7 @@ def item_inputs(
         target_base_branch=run.base_branch,
         item_index=item.plan_index,
         work_plan_digest=plan.digest,
-        run_inputs_digest=sha256_digest(run),
+        run_inputs_digest=write_run_inputs_digest(run),
     )
 
 

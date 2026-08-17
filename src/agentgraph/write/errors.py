@@ -143,6 +143,10 @@ class DeliveryReviewStorageError(WorkspaceError):
     code = "delivery_review_storage_invalid"
 
 
+class DeliveryReviewStateMismatchError(WorkspaceError):
+    code = "delivery_review_state_mismatch"
+
+
 class CheckpointError(WriteSliceError):
     """A durable human checkpoint operation failed closed."""
 

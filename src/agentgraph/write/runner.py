@@ -613,6 +613,15 @@ class WriteSliceRunner:
                 and not controller.run_inputs.delivery_review_enabled
             ):
                 break
+            if (
+                state.graph.current_node == "DELIVERY_REVIEW"
+                and controller.run_inputs.delivery_review_enabled
+            ):
+                try:
+                    controller.completed_reports(state)
+                    controller.delivery_reviews().rehydrate_if_complete(state)
+                except WorkspaceError as exc:
+                    return self._rehydration_required(state, controller, exc)
             executed.append(state.graph.current_node)
             state = session.step()
             if state.graph.current_node == "HUMAN_CHECKPOINT":

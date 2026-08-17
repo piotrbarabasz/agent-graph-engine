@@ -340,6 +340,29 @@ class WriteRunInputs:
             raise ValueError("write-run inputs contain an empty authority field")
 
 
+def write_run_inputs_digest(run: WriteRunInputs) -> str:
+    """Digest run authority without changing the final-M012 disabled-mode identity."""
+
+    authority = {
+        "schema_version": run.schema_version,
+        "project_id": run.project_id,
+        "scope_id": run.scope_id,
+        "parent_scope_id": run.parent_scope_id,
+        "source_revision": run.source_revision,
+        "target_baseline_head": run.target_baseline_head,
+        "base_branch": run.base_branch,
+        "scope_branch": run.scope_branch,
+        "work_plan_digest": run.work_plan_digest,
+        "max_work_items_per_run": run.max_work_items_per_run,
+        "max_repair_cycles": run.max_repair_cycles,
+        "semantic_review_enabled": run.semantic_review_enabled,
+        "checkpoint_ttl_seconds": run.checkpoint_ttl_seconds,
+    }
+    if run.delivery_review_enabled:
+        authority["delivery_review_enabled"] = True
+    return sha256_digest(authority)
+
+
 @dataclass(frozen=True, slots=True)
 class WorkPlanItem:
     plan_index: int

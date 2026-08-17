@@ -18,6 +18,7 @@ from .errors import (
     DeliveryReviewContextError,
     DeliveryReviewEvidenceError,
     DeliveryReviewProviderRequiredError,
+    DeliveryReviewStateMismatchError,
     DeliveryReviewStorageError,
     ItemEvidenceError,
     ItemInputsMismatchError,
@@ -74,6 +75,7 @@ from .models import (
     WriteSliceOutcome,
     WriteSliceReport,
     WriteSliceRequest,
+    write_run_inputs_digest,
 )
 from .provider import ChangeProvider, ChangeProviderContext
 
@@ -102,6 +104,7 @@ __all__ = [
     "DeliveryReviewEvidenceError",
     "DeliveryReviewProviderRequiredError",
     "DeliveryReviewReport",
+    "DeliveryReviewStateMismatchError",
     "DeliveryReviewStorageError",
     "FileChange",
     "ItemEvidenceError",
@@ -150,6 +153,7 @@ __all__ = [
     "path_is_allowed",
     "reconcile_write_capability",
     "stable_path_union",
+    "write_run_inputs_digest",
 ]
 
 
