@@ -184,14 +184,19 @@ class MultiItemExecution:
         if current is None:
             raise WritePreparationError("current_work_item_missing")
         item = self.plan_item(current.id)
+        completed_ids = tuple(value.id for value in state.work.completed_items)
+        if current.id in completed_ids or len(set(completed_ids)) != len(completed_ids):
+            raise MultiItemLineageError("multi_item_lineage_mismatch")
+        selection = self.source.next_ready_item(
+            projected_snapshot(self.snapshot, completed_ids), self.plan.scope_id
+        )
+        if selection.kind is not SelectionKind.READY or selection.item_id != current.id:
+            raise MultiItemLineageError("multi_item_lineage_mismatch")
         root = item_root(self.run_path, item)
         evidence_root = self.run_path if self.run_inputs.max_work_items_per_run == 1 else root
         verify_item_storage(self.run_path, root, evidence_root)
         if self.current is not None and self.current_item_id == current.id:
             return self.current
-        completed_ids = tuple(value.id for value in state.work.completed_items)
-        if current.id in completed_ids or len(set(completed_ids)) != len(completed_ids):
-            raise MultiItemLineageError("multi_item_lineage_mismatch")
         item_base, _commits = self._completed_lineage(completed_ids)
         inputs = item_inputs(self.run_inputs, self.plan, item, item_base)
         self._ensure_item_inputs(root, inputs)
@@ -223,7 +228,7 @@ class MultiItemExecution:
             analysis,
             self.identity,
             self.validation_timeout_seconds,
-            rehydrating or item.plan_index > 1,
+            rehydrating or bool(completed_ids),
             self.fault,
             item_path=evidence_root,
         )
@@ -276,19 +281,22 @@ class MultiItemExecution:
     def _completed_lineage(self, completed_ids: tuple[str, ...]) -> tuple[str, tuple[str, ...]]:
         head = self.run_inputs.target_baseline_head
         verified: list[CompletedItemReport] = []
-        seen = set()
+        replayed: list[str] = []
+        projected = self.snapshot
         self.verified_completed = ()
-        for position, item_id in enumerate(completed_ids):
-            if item_id in seen:
+        for item_id in completed_ids:
+            if item_id in replayed:
                 raise MultiItemLineageError("multi_item_lineage_mismatch")
-            seen.add(item_id)
+            selection = self.source.next_ready_item(projected, self.plan.scope_id)
+            if selection.kind is not SelectionKind.READY or selection.item_id != item_id:
+                raise MultiItemLineageError("multi_item_lineage_mismatch")
             item = self.plan_item(item_id)
-            if position >= len(self.plan.items) or self.plan.items[position] != item:
-                raise MultiItemLineageError("multi_item_lineage_mismatch")
             report = self.verify_completed_item(item, head)
             verified.append(report)
             self.verified_completed = tuple(verified)
             head = report.commit_sha
+            replayed.append(item_id)
+            projected = projected_snapshot(self.snapshot, tuple(replayed))
         return head, tuple(item.commit_sha for item in verified)
 
     def verify_completed_item(

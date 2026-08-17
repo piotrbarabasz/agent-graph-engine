@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import shutil
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -12,8 +13,13 @@ from agentgraph.adapters.speckit import SpecKitAdapter, SpecKitLayout
 from agentgraph.agents import DeclaredWorkAgentProvider
 from agentgraph.core import CheckpointOutcome, ReviewVerdict, RunStatus
 from agentgraph.infra import GitAdapter, GitCommitIdentity
-from agentgraph.runtime import ProjectRegistry, RuntimePaths
-from agentgraph.runtime.codec import canonical_json_bytes, decode_value
+from agentgraph.runtime import ProjectRegistry, RuntimePaths, StateStore
+from agentgraph.runtime.codec import (
+    canonical_json_bytes,
+    decode_value,
+    encode_value,
+    sha256_digest,
+)
 from agentgraph.write import (
     ChangeIntent,
     ChangeSet,
@@ -57,6 +63,7 @@ def _multi_target(
     tmp_path: Path,
     *,
     dependency: bool = False,
+    reverse_dependency: bool = False,
     count: int = 2,
     repair_validation: bool = False,
     critical_item: str | None = None,
@@ -85,7 +92,13 @@ def _multi_target(
         block = task_block(
             item_id,
             owner="E001",
-            dependencies=item_ids[index - 1] if dependency and index else "None",
+            dependencies=(
+                item_ids[1]
+                if reverse_dependency and index == 0
+                else item_ids[index - 1]
+                if dependency and index
+                else "None"
+            ),
         ).replace(
             "python -c \"from pathlib import Path; Path('executed.txt').write_text('bad')\"",
             command,
@@ -187,6 +200,36 @@ def _rewrite_evidence(path: Path, mutate) -> None:
     path.write_bytes(canonical_json_bytes(document))
 
 
+def _rewrite_durable_state(run: Path, mutate) -> None:
+    state_path = run / "state.json"
+    state = StateStore(state_path).load()
+    forged = mutate(state)
+    encoded = encode_value(forged)
+    digest = sha256_digest(encoded)
+    state_path.write_bytes(
+        canonical_json_bytes({"store_schema_version": 1, "state_digest": digest, "state": encoded})
+    )
+
+    journal_path = run / "journal.jsonl"
+    records = [json.loads(line) for line in journal_path.read_text(encoding="utf-8").splitlines()]
+    for record in records:
+        if record["record_type"] == "NODE_RESULT_RECORDED" and (
+            record["payload"].get("expected_next_state_version") == forged.state_version
+        ):
+            record["payload"]["expected_next_state_digest"] = digest
+        if record["record_type"] == "TRANSITION_COMMITTED" and (
+            record["payload"].get("committed_state_version") == forged.state_version
+        ):
+            record["payload"]["committed_state_digest"] = digest
+    previous = None
+    for record in records:
+        record["previous_checksum"] = previous
+        unsigned = {key: value for key, value in record.items() if key != "checksum"}
+        record["checksum"] = sha256_digest(unsigned)
+        previous = record["checksum"]
+    journal_path.write_bytes(b"".join(canonical_json_bytes(record) + b"\n" for record in records))
+
+
 def _item_roots(run: Path) -> tuple[Path, ...]:
     return tuple(sorted(path.parent for path in (run / "items").glob("*/write-inputs.json")))
 
@@ -252,6 +295,25 @@ def test_dependency_uses_projected_completion_and_limit_pauses(tmp_path) -> None
     assert report.completed_item_ids == ("T001", "T002")
     assert provider.item_ids == ["T001", "T002"]
     assert len(report.commit_shas) == 2
+
+
+def test_reverse_dependency_order_follows_source_selection_and_forms_linear_commits(
+    tmp_path,
+) -> None:
+    target = _multi_target(tmp_path, reverse_dependency=True)
+    baseline = git(target, "rev-parse", "HEAD").strip().decode()
+    provider = PerItemProvider()
+
+    report = _runner(target, tmp_path / "runtime", provider).run(WriteSliceRequest(scope_id="E001"))
+
+    assert report.outcome is WriteSliceOutcome.DELIVERY_REVIEW_REQUIRED
+    assert provider.item_ids == ["T002", "T001"]
+    assert report.completed_item_ids == ("T002", "T001")
+    assert git(target, "rev-parse", f"{report.commit_shas[0]}^").strip().decode() == baseline
+    assert (
+        git(target, "rev-parse", f"{report.commit_shas[1]}^").strip().decode()
+        == report.commit_shas[0]
+    )
 
 
 def test_delivery_boundary_resume_is_idempotent_and_policy_is_immutable(tmp_path) -> None:
@@ -547,8 +609,8 @@ def test_item_storage_links_are_rejected_without_touching_external_files(tmp_pat
     assert sentinel.read_text(encoding="utf-8") == "unchanged"
 
 
-def _crash_between_items(tmp_path: Path):
-    target = _multi_target(tmp_path)
+def _crash_between_items(tmp_path: Path, *, reverse_dependency: bool = False):
+    target = _multi_target(tmp_path, reverse_dependency=reverse_dependency)
     runtime = tmp_path / "runtime"
     provider = PerItemProvider()
     runner = _runner(
@@ -561,7 +623,8 @@ def _crash_between_items(tmp_path: Path):
         runner.run(WriteSliceRequest(scope_id="E001"))
     state = runner._coordinator  # preserve an explicit assertion below via resumed public state
     assert state is not None
-    assert provider.item_ids == ["T001"]
+    expected_first = "T002" if reverse_dependency else "T001"
+    assert provider.item_ids == [expected_first]
     return target, runtime, provider
 
 
@@ -575,6 +638,41 @@ def test_crash_after_first_more_work_resumes_without_duplicate_commit_or_provide
     assert provider.item_ids == ["T001", "T002"]
     assert resumed.commit_shas[0] == first_commit
     assert len(resumed.commit_shas) == 2
+
+
+def test_reverse_dependency_crash_after_more_work_resumes_without_duplicate_item(tmp_path) -> None:
+    target, runtime, provider = _crash_between_items(tmp_path, reverse_dependency=True)
+    first_commit = git(target, "rev-parse", "work/e001").strip().decode()
+
+    resumed = _runner(target, runtime, provider).resume("run_m012")
+
+    assert resumed.outcome is WriteSliceOutcome.DELIVERY_REVIEW_REQUIRED
+    assert provider.item_ids == ["T002", "T001"]
+    assert resumed.completed_item_ids == ("T002", "T001")
+    assert resumed.commit_shas[0] == first_commit
+    assert git(target, "rev-parse", f"{resumed.commit_shas[0]}^").strip().decode() == (
+        resumed.baseline_head
+    )
+    assert (
+        git(target, "rev-parse", f"{resumed.commit_shas[1]}^").strip().decode()
+        == (resumed.commit_shas[0])
+    )
+
+
+def test_reverse_dependency_forged_first_completion_fails_selection_replay(tmp_path) -> None:
+    target, runtime, provider = _crash_between_items(tmp_path, reverse_dependency=True)
+    run = RuntimePaths.resolve(runtime).run("prj_m012", "run_m012")
+
+    def forge(state):
+        claimed = replace(state.work.completed_items[0], id="T001")
+        return replace(state, work=replace(state.work, completed_items=(claimed,)))
+
+    _rewrite_durable_state(run, forge)
+    resumed = _runner(target, runtime, provider).resume("run_m012")
+
+    assert resumed.outcome is WriteSliceOutcome.RECOVERY_REQUIRED
+    assert resumed.issues[0].code == "multi_item_lineage_mismatch"
+    assert provider.item_ids == ["T002"]
 
 
 def test_crash_after_second_select_resumes_same_item_and_baseline(tmp_path) -> None:
@@ -595,6 +693,32 @@ def test_crash_after_second_select_resumes_same_item_and_baseline(tmp_path) -> N
     assert resumed.outcome is WriteSliceOutcome.DELIVERY_REVIEW_REQUIRED
     assert provider.item_ids == ["T001", "T002"]
     assert provider.baselines == [resumed.baseline_head, first_commit]
+
+
+def test_resume_rejects_current_item_that_does_not_match_next_ready_selection(tmp_path) -> None:
+    target = _multi_target(tmp_path)
+    runtime = tmp_path / "runtime"
+    provider = PerItemProvider()
+    runner = _runner(
+        target,
+        runtime,
+        provider,
+        fault=StageFault("after_transition_committed", 4),
+    )
+    with pytest.raises(RuntimeError, match="M012 interruption"):
+        runner.run(WriteSliceRequest(scope_id="E001"))
+    run = RuntimePaths.resolve(runtime).run("prj_m012", "run_m012")
+
+    def forge(state):
+        assert state.work.item is not None
+        return replace(state, work=replace(state.work, item=replace(state.work.item, id="T002")))
+
+    _rewrite_durable_state(run, forge)
+    resumed = _runner(target, runtime, provider).resume("run_m012")
+
+    assert resumed.outcome is WriteSliceOutcome.RECOVERY_REQUIRED
+    assert resumed.issues[0].code == "multi_item_lineage_mismatch"
+    assert provider.item_ids == []
 
 
 def test_interrupted_second_explore_reruns_with_fresh_item_evidence(tmp_path) -> None:
