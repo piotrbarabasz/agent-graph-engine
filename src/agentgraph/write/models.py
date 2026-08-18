@@ -18,6 +18,7 @@ from agentgraph.runtime.codec import sha256_digest
 from agentgraph.work import RepoPathSpec, ValidationCheck, WorkPackage
 
 from .errors import ChangeSetError
+from .publish_models import PublishCheckpointView, PublishReport
 
 MAX_CHANGE_FILES = 20
 MAX_FILE_BYTES = 1024 * 1024
@@ -438,6 +439,10 @@ class WriteSliceOutcome(StrEnum):
     CHECKPOINT_REQUIRED = "checkpoint_required"
     DELIVERY_REVIEW_REQUIRED = "delivery_review_required"
     DELIVERY_CHECKPOINT_REQUIRED = "delivery_checkpoint_required"
+    PUBLISH_PREPARATION_BLOCKED = "publish_preparation_blocked"
+    PUBLISH_CHECKPOINT_REQUIRED = "publish_checkpoint_required"
+    DRAFT_PR_CREATED = "draft_pr_created"
+    CANCELLED = "cancelled"
 
 
 @dataclass(frozen=True, slots=True)
@@ -610,11 +615,12 @@ class WriteSliceReport:
     issues: tuple[WriteSliceIssue, ...] = ()
     changeset_digest: str | None = None
     changed_paths: tuple[str, ...] = ()
-    checkpoint: CheckpointView | None = None
+    checkpoint: CheckpointView | PublishCheckpointView | None = None
     completed_item_ids: tuple[str, ...] = ()
     commit_shas: tuple[str, ...] = ()
     completed_items: tuple[CompletedItemReport, ...] = ()
     delivery_review: DeliveryReviewReport | None = None
+    publish: PublishReport | None = None
 
     @property
     def final_graph_state(self) -> GraphState | None:

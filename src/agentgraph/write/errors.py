@@ -159,3 +159,25 @@ class CheckpointError(WriteSliceError):
 
 class CheckpointBindingError(CheckpointError):
     pass
+
+
+class PublishError(WriteSliceError):
+    code = "publish_failed"
+
+
+class PublishPreparationError(PublishError):
+    code = "publish_preparation_blocked"
+
+
+class PublishConflictError(PublishPreparationError):
+    def __init__(self, code: str) -> None:
+        self.code = code
+        super().__init__(code)
+
+
+class PublishEvidenceError(WorkspaceError):
+    code = "publish_evidence_invalid"
+
+    def __init__(self, code: str = "publish_evidence_invalid") -> None:
+        self.code = code
+        super().__init__(code)

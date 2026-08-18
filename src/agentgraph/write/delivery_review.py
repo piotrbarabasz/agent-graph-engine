@@ -597,9 +597,25 @@ class DeliveryReviewExecution:
                 review.verdict is ReviewVerdict.PASS
                 and review.safe_to_create_pr is True
                 and review.findings == ()
-                and state.run.status is RunStatus.RUNNING
-                and state.graph.current_node == "HUMAN_CHECKPOINT"
-                and state.graph.pending_resume_node == "CREATE_PR"
+                and (
+                    (
+                        state.run.status is RunStatus.RUNNING
+                        and state.graph.current_node == "HUMAN_CHECKPOINT"
+                        and state.graph.pending_resume_node == "CREATE_PR"
+                    )
+                    or (
+                        state.graph.current_node in {"CREATE_PR", "FINALIZE", "END"}
+                        and state.graph.pending_resume_node is None
+                        and state.run.status
+                        in {
+                            RunStatus.RUNNING,
+                            RunStatus.COMPLETED,
+                            RunStatus.BLOCKED,
+                            RunStatus.CANCELLED,
+                            RunStatus.FAILED,
+                        }
+                    )
+                )
             )
         else:
             matches = (

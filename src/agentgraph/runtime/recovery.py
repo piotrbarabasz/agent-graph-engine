@@ -6,7 +6,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from types import MappingProxyType
-from typing import Any
+from typing import Any, Protocol
 
 from agentgraph.core import AgentGraphError, GraphEngine, NodeResult, NodeType, Transition
 
@@ -25,6 +25,24 @@ class RecoveryAction(StrEnum):
     COMPLETE_TRANSITION_MARKER = "complete_transition_marker"
     COMPLETED = "completed"
     BLOCKED = "blocked"
+
+
+@dataclass(frozen=True, slots=True)
+class InterruptedSideEffectAssessment:
+    """Read-only extension verdict for one otherwise unsafe interrupted node."""
+
+    safe_rerun: bool
+    reason_code: str
+    evidence: Mapping[str, Any] = field(default_factory=lambda: MappingProxyType({}))
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "evidence", MappingProxyType(dict(self.evidence)))
+
+
+class InterruptedSideEffectReconciler(Protocol):
+    def assess_interrupted_side_effect(
+        self, node_id: str, state: Any
+    ) -> InterruptedSideEffectAssessment: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,10 +65,17 @@ class RecoveryAssessment:
 class RecoveryManager:
     """Assess evidence and complete only provably idempotent protocol phases."""
 
-    def __init__(self, engine: GraphEngine, store: StateStore, journal: Journal) -> None:
+    def __init__(
+        self,
+        engine: GraphEngine,
+        store: StateStore,
+        journal: Journal,
+        reconciler: InterruptedSideEffectReconciler | None = None,
+    ) -> None:
         self.engine = engine
         self.store = store
         self.journal = journal
+        self.reconciler = reconciler
 
     def assess(self) -> RecoveryAssessment:
         persisted = self.store.load_persisted()
@@ -175,6 +200,28 @@ class RecoveryManager:
                 "Interrupted node capability is safe to invoke again.",
                 state,
                 records,
+            )
+        if self.reconciler is not None:
+            try:
+                verdict = self.reconciler.assess_interrupted_side_effect(node_id, state)
+            except Exception:
+                return self._blocked("side_effect_reconciliation_failed", state, records)
+            if verdict.safe_rerun:
+                return self._assessment(
+                    RecoveryAction.RERUN_INTERRUPTED_NODE,
+                    verdict.reason_code,
+                    "External state was reconciled and the node is safe to rerun.",
+                    state,
+                    records,
+                    verdict.evidence,
+                )
+            return self._assessment(
+                RecoveryAction.BLOCKED,
+                verdict.reason_code,
+                "External state could not be reconciled for an automatic rerun.",
+                state,
+                records,
+                verdict.evidence,
             )
         return self._assessment(
             RecoveryAction.BLOCKED,

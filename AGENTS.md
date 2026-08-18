@@ -118,3 +118,11 @@
   exact remote, push, and PR target.
 - Delivery FAIL is terminal for the current run; no scope-wide repair loop exists in M013.
 - M013 performs no push, PR creation, merge, deployment, or source closure.
+- Git push is permitted only inside `CREATE_PR` after exact durable publish approval.
+- Publish approval binds the repository, base/head branches, final commit/tree, draft PR content,
+  delivery manifest, and delivery-review evidence.
+- Publication pushes the exact final commit, never mutable `HEAD`, and never force-pushes.
+- GitHub draft PR creation is idempotently reconciled through a deterministic operation marker;
+  remote-service responsibilities remain separate from Git mutation.
+- Interrupted `CREATE_PR` is the only external-operation node with explicit remote reconciliation.
+- M014 performs no merge, deployment, or WorkSource closure.
