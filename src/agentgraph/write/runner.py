@@ -59,7 +59,7 @@ from agentgraph.runtime import (
     RuntimePaths,
     StateStore,
 )
-from agentgraph.runtime.codec import decode_value, utc_now
+from agentgraph.runtime.codec import decode_value, encode_value, utc_now
 from agentgraph.runtime.ids import generate_run_id
 from agentgraph.work import InvalidWorkSourceError, WorkScopeStatus, WorkSource
 
@@ -67,6 +67,7 @@ from .delivery_review import DeliveryReviewNode
 from .errors import (
     CheckpointError,
     DeliveryReviewProviderRequiredError,
+    ExecutionProfileMismatchError,
     RepairPolicyError,
     ReviewProviderRequiredError,
     WorkCapabilityMismatchError,
@@ -126,6 +127,8 @@ class WriteSliceRunner:
         checkpoint_ttl_seconds: int = 3600,
         clock: Callable[[], datetime] = utc_now,
         checkpoint_nonce_factory: Callable[[], str] | None = None,
+        execution_profile_digest: str | None = None,
+        execution_profile_payload: object | None = None,
     ) -> None:
         if validation_timeout_seconds <= 0 or max_steps < 1:
             raise ValueError("write runner bounds must be positive")
@@ -166,6 +169,16 @@ class WriteSliceRunner:
         self.checkpoint_ttl_seconds = checkpoint_ttl_seconds
         self.clock = clock
         self.checkpoint_nonce_factory = checkpoint_nonce_factory
+        if (execution_profile_digest is None) != (execution_profile_payload is None):
+            raise ValueError("execution profile digest and payload must be supplied together")
+        if execution_profile_digest is not None and (
+            not execution_profile_digest.startswith("sha256:")
+            or len(execution_profile_digest) != 71
+            or getattr(execution_profile_payload, "digest", None) != execution_profile_digest
+        ):
+            raise ValueError("execution profile binding is invalid")
+        self.execution_profile_digest = execution_profile_digest
+        self.execution_profile_payload = execution_profile_payload
         self._coordinator: DurableGraphCoordinator | None = None
         self._last_run_id: str | None = None
 
@@ -277,6 +290,7 @@ class WriteSliceRunner:
             self.review_agent_provider is not None,
             self.checkpoint_ttl_seconds,
             self.delivery_review_agent_provider is not None,
+            self.execution_profile_digest,
         )
         initial_inputs = item_inputs(
             run_inputs, plan, selected_plan_item, run_inputs.target_baseline_head
@@ -291,7 +305,10 @@ class WriteSliceRunner:
 
         def initialize(staging: Path) -> None:
             common = {"project_id": run_inputs.project_id, "run_id": run_id}
-            write_evidence(staging / "run-inputs.json", context=common, payload=run_inputs)
+            encoded_run_inputs = encode_value(run_inputs)
+            if run_inputs.execution_profile_digest is None:
+                encoded_run_inputs.pop("execution_profile_digest")
+            write_evidence(staging / "run-inputs.json", context=common, payload=encoded_run_inputs)
             write_evidence(staging / "work-plan.json", context=common, payload=plan)
             write_evidence(
                 staging / "write-inputs.json",
@@ -304,6 +321,15 @@ class WriteSliceRunner:
                 },
                 payload=initial_inputs,
             )
+            if self.execution_profile_payload is not None:
+                write_evidence(
+                    staging / "execution-profile.json",
+                    context={
+                        **common,
+                        "execution_profile_digest": self.execution_profile_digest,
+                    },
+                    payload=self.execution_profile_payload,
+                )
 
         coordinator.start_run(run_id, initialize_artifacts=initialize)
         with coordinator.open_session(run_id) as session:
@@ -315,6 +341,12 @@ class WriteSliceRunner:
 
         try:
             controller, coordinator = self._existing_runtime(run_id)
+        except ExecutionProfileMismatchError as exc:
+            return self._early(
+                WriteSliceOutcome.RECOVERY_REQUIRED,
+                exc.code,
+                str(exc),
+            )
         except DeliveryReviewProviderRequiredError as exc:
             return self._early(
                 WriteSliceOutcome.RECOVERY_REQUIRED,
@@ -444,6 +476,8 @@ class WriteSliceRunner:
             raise CheckpointError("remote_provider_required")
         try:
             controller, coordinator = self._existing_runtime(run_id)
+        except ExecutionProfileMismatchError as exc:
+            raise CheckpointError(exc.code, str(exc)) from exc
         except (
             WritePreparationError,
             WorkspaceError,
@@ -472,7 +506,7 @@ class WriteSliceRunner:
                 and state.graph.pending_resume_node == "CREATE_PR"
             ):
                 publish = controller.publication()
-                return publish.checkpoints().submit(
+                return publish.checkpoints().submit_materialized(
                     state,
                     checkpoint_id=checkpoint_id,
                     nonce=nonce,
@@ -480,7 +514,7 @@ class WriteSliceRunner:
                     actor=actor,
                 )
             self._rehydrate_current(controller, state)
-            return controller.checkpoints(state).submit(
+            return controller.checkpoints(state).submit_materialized(
                 state,
                 checkpoint_id=checkpoint_id,
                 nonce=nonce,
@@ -506,6 +540,7 @@ class WriteSliceRunner:
             raise WorkPlanMismatchError("run authority identity mismatch")
         run_inputs = decode_value(run_document.get("payload"), WriteRunInputs)
         plan = decode_value(plan_document.get("payload"), WorkPlan)
+        self._verify_execution_profile(run_path, run_inputs, project.project_id, run_id)
         if run_inputs.max_work_items_per_run != self.max_work_items_per_run:
             raise WorkItemPolicyError("resume work-item policy differs from persisted inputs")
         if run_inputs.max_repair_cycles != self.max_repair_cycles:
@@ -561,6 +596,38 @@ class WriteSliceRunner:
             _input_fingerprint(inspection, WriteSliceRequest(scope_id=run_inputs.scope_id)),
         )
         return self._build_runtime(inspection, shadow, run_inputs, plan, run_id)
+
+    def _verify_execution_profile(
+        self,
+        run_path: Path,
+        run_inputs: WriteRunInputs,
+        project_id: str,
+        run_id: str,
+    ) -> None:
+        persisted = run_inputs.execution_profile_digest
+        if persisted is None:
+            return
+        if self.execution_profile_digest != persisted or self.execution_profile_payload is None:
+            raise ExecutionProfileMismatchError(
+                "execution profile differs from persisted authority"
+            )
+        try:
+            document = read_evidence(run_path / "execution-profile.json")
+        except WorkspaceError as exc:
+            raise ExecutionProfileMismatchError(
+                "execution profile evidence is unavailable or invalid"
+            ) from exc
+        if (
+            document.get("project_id") != project_id
+            or document.get("run_id") != run_id
+            or document.get("execution_profile_digest") != persisted
+            or not isinstance(document.get("payload"), dict)
+            or document["payload"].get("digest") != persisted
+            or document["payload"] != encode_value(self.execution_profile_payload)
+        ):
+            raise ExecutionProfileMismatchError(
+                "execution profile evidence does not match run authority"
+            )
 
     def _build_runtime(
         self,

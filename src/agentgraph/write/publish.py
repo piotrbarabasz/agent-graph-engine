@@ -741,6 +741,29 @@ class PublishCheckpointController:
 
     def submit(self, state, *, checkpoint_id, nonce, outcome, actor):
         request = self.ensure_request(state)
+        return self._submit_request(
+            request,
+            checkpoint_id=checkpoint_id,
+            nonce=nonce,
+            outcome=outcome,
+            actor=actor,
+        )
+
+    def submit_materialized(self, state, *, checkpoint_id, nonce, outcome, actor):
+        """Persist a decision without remote inspection or request creation."""
+
+        _plan, request, _decision = self.decision_for_consumption(state)
+        if request is None:
+            raise CheckpointError("checkpoint_not_materialized")
+        return self._submit_request(
+            request,
+            checkpoint_id=checkpoint_id,
+            nonce=nonce,
+            outcome=outcome,
+            actor=actor,
+        )
+
+    def _submit_request(self, request, *, checkpoint_id, nonce, outcome, actor):
         if checkpoint_id != request.checkpoint_id:
             raise CheckpointError("checkpoint_not_pending")
         if self.store.load_decision(checkpoint_id) is not None:

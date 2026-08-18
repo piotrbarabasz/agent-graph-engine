@@ -315,12 +315,23 @@ class WriteRunInputs:
     semantic_review_enabled: bool
     checkpoint_ttl_seconds: int
     delivery_review_enabled: bool = False
+    execution_profile_digest: str | None = None
 
     def __post_init__(self) -> None:
         if self.schema_version != 1:
             raise ValueError("unsupported write-run inputs schema")
         if type(self.delivery_review_enabled) is not bool:
             raise ValueError("delivery review mode must be boolean")
+        if self.execution_profile_digest is not None and (
+            not isinstance(self.execution_profile_digest, str)
+            or not self.execution_profile_digest.startswith("sha256:")
+            or len(self.execution_profile_digest) != 71
+            or any(
+                character not in "0123456789abcdef"
+                for character in self.execution_profile_digest[7:]
+            )
+        ):
+            raise ValueError("execution profile digest is invalid")
         if not 1 <= self.max_work_items_per_run <= 20:
             raise ValueError("work-item limit must be between 1 and 20")
         if self.max_repair_cycles not in {0, 1, 2}:
@@ -361,6 +372,8 @@ def write_run_inputs_digest(run: WriteRunInputs) -> str:
     }
     if run.delivery_review_enabled:
         authority["delivery_review_enabled"] = True
+    if run.execution_profile_digest is not None:
+        authority["execution_profile_digest"] = run.execution_profile_digest
     return sha256_digest(authority)
 
 

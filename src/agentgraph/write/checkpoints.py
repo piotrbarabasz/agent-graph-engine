@@ -96,6 +96,52 @@ class WriteCheckpointController:
         if checkpoint_id != expected_id:
             raise CheckpointError("checkpoint_not_pending")
         request = self.ensure_request(state)
+        return self._submit_request(
+            request,
+            checkpoint_id=checkpoint_id,
+            nonce=nonce,
+            outcome=outcome,
+            actor=actor,
+        )
+
+    def submit_materialized(
+        self,
+        state: GraphState,
+        *,
+        checkpoint_id: str,
+        nonce: str,
+        outcome: CheckpointOutcome,
+        actor: str,
+    ) -> CheckpointDecision:
+        """Record a decision only when the exact request already exists."""
+
+        self._require_pending(state)
+        if checkpoint_id != self.checkpoint_id(state):
+            raise CheckpointError("checkpoint_not_pending")
+        try:
+            request = self.store.load_request(checkpoint_id)
+        except CheckpointEvidenceError as exc:
+            raise CheckpointBindingError("checkpoint_evidence_invalid") from exc
+        if request is None:
+            raise CheckpointError("checkpoint_not_materialized")
+        self._validate_request(request, self._binding(state))
+        return self._submit_request(
+            request,
+            checkpoint_id=checkpoint_id,
+            nonce=nonce,
+            outcome=outcome,
+            actor=actor,
+        )
+
+    def _submit_request(
+        self,
+        request: CheckpointRequestRecord,
+        *,
+        checkpoint_id: str,
+        nonce: str,
+        outcome: CheckpointOutcome,
+        actor: str,
+    ) -> CheckpointDecision:
         try:
             if self.store.load_decision(checkpoint_id) is not None:
                 raise CheckpointError("checkpoint_already_decided")

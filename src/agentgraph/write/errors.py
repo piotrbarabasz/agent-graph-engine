@@ -17,6 +17,10 @@ class WorkPlanMismatchError(WritePreparationError):
     code = "work_plan_mismatch"
 
 
+class ExecutionProfileMismatchError(WritePreparationError):
+    code = "execution_profile_mismatch"
+
+
 class WorkCapabilityMismatchError(WritePreparationError):
     pass
 

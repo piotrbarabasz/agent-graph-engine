@@ -1,5 +1,93 @@
 # Agent Graph Engine
 
+Agent Graph Engine v1 is installable as a local command-line tool:
+
+```powershell
+python -m pip install -e .
+agentgraph --help
+```
+
+The Codex CLI must already be installed and authenticated in the host environment. AgentGraph uses
+`GITHUB_TOKEN`, then `GH_TOKEN`, for GitHub publication. Never put a token in project configuration.
+
+## Project configuration and first run
+
+Create `.agentgraph.yml` at the exact Git root of the target project. The complete v1 configuration
+is:
+
+```yaml
+version: 1
+work:
+  source: speckit
+  speckit:
+    workstreams_dir: .specify/workstreams
+    active_scope_file: .specify/runtime/active-epic
+agents:
+  provider: codex
+  codex:
+    model: null
+    timeout_seconds: 900
+    max_result_bytes: 4194304
+review:
+  semantic: true
+  delivery: true
+policy:
+  max_repair_cycles: 2
+  max_work_items_per_run: 20
+  checkpoint_ttl_seconds: 3600
+  validation_timeout_seconds: 120
+  max_steps: 30
+  commit_mode: per_work_item
+publish:
+  enabled: true
+  provider: github
+  remote: origin
+  draft: true
+```
+
+An equivalent standalone example is available at `examples/agentgraph.yml`; it is documentation,
+not configuration for this engine repository.
+
+```powershell
+cd D:\Projects\my-project
+agentgraph config validate
+agentgraph run --scope E001
+```
+
+Commands may run from a repository subdirectory, or use `agentgraph --repo PATH ...`. Configuration
+is strict safe YAML: duplicate/unknown keys, aliases, merge keys, multiple documents, unsafe tags,
+and path escapes are rejected. Repository configuration cannot choose executables, command
+arguments, modules, environment variables, credentials, validation commands, branches, or PR text.
+The host may select Codex with `--codex-executable` or `AGENTGRAPH_CODEX_EXECUTABLE`.
+
+Runtime data defaults to `~/.agentgraph`. Select another external location with `AGENTGRAPH_HOME`
+or `--home`; runtime storage equal to or inside the target repository is rejected.
+
+## Checkpoints and publication
+
+Checkpoint decisions never continue execution automatically:
+
+```powershell
+agentgraph checkpoint show
+agentgraph checkpoint approve --actor "Piotr"
+agentgraph resume
+```
+
+The publication flow is: item work → delivery review → publish checkpoint → explicit human approval
+→ separate `resume` → exact commit push → one GitHub draft PR. Reject and cancel also only record a
+decision. `status` and `checkpoint show` are local, read-only operations and never invoke Codex,
+execute graph nodes, call GitHub, or repair evidence.
+
+## V1 support matrix and limitations
+
+- Work source: SpecKit only.
+- Agent provider: Codex CLI only.
+- Remote: GitHub.com only.
+- Pull requests: draft only.
+- Commit strategy: one commit per work item.
+- One writable scope at a time; items execute sequentially with no parallel writes.
+- No merge, deployment, source closure, PR-comment automation, daemon, or background watcher.
+
 Agent Graph Engine is an early-stage Python project for deterministic orchestration of
 agent workflows. M001 provides the in-memory deterministic Graph Core. M002 adds a
 local durable runtime foundation with atomic state, a checksummed journal, project

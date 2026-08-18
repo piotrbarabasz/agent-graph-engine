@@ -126,3 +126,13 @@
   remote-service responsibilities remain separate from Git mutation.
 - Interrupted `CREATE_PR` is the only external-operation node with explicit remote reconciliation.
 - M014 performs no merge, deployment, or WorkSource closure.
+- `.agentgraph.yml` is parsed as strict untrusted repository input.
+- Repository configuration cannot select arbitrary executables, commands, modules, environment
+  variables, or credentials.
+- New CLI-created runs are bound to a canonical execution-profile digest. Historical runs without
+  an execution profile remain backward compatible and are never retroactively rebound.
+- `status` and `checkpoint show` are strictly read-only.
+- Checkpoint decision commands persist a decision only and never automatically resume the graph.
+- Publish approval still requires an explicit later `resume` before remote side effects.
+- The CLI is a thin composition/UI layer over M001-M014, and runtime home remains external to the
+  target repository.
