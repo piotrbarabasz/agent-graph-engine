@@ -167,3 +167,14 @@ reviewer evaluates cross-item integration and scope-level correctness without re
 review prose or implementation proposals. A PASS advances the canonical graph to
 `HUMAN_CHECKPOINT` with `pending_resume_node=CREATE_PR`. M013 stops there without creating a
 checkpoint request or publishing anything; M014 adds exact publish approval and draft PR creation.
+
+M014 resumes that boundary only when an explicit neutral `RemoteProvider` is configured. It
+revalidates the complete M013 delivery, parses and verifies the configured GitHub.com remote, and
+persists an immutable `PublishPlan` binding the repository, base/head branches, final commit and
+tree, delivery evidence, and deterministic draft-PR title/body marker. A publish-specific durable
+human checkpoint must approve that exact plan before any remote mutation. `CREATE_PR` then pushes
+the exact final commit with a single non-force branch refspec, verifies the remote ref, and creates
+or adopts exactly one matching GitHub draft PR. Push, PR, and final result receipts make interrupted
+publication idempotently reconcilable without relaxing recovery for other side-effect nodes. No
+merge, deployment, or WorkSource closure occurs. M015 will add `.agentgraph.yml` and CLI wiring;
+M014 requires providers and the remote name to be supplied programmatically.

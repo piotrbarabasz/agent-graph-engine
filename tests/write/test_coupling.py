@@ -1,7 +1,7 @@
 from pathlib import Path
 
 
-def test_m006_production_has_no_forbidden_remote_or_shell_coupling() -> None:
+def test_write_production_has_no_forbidden_shell_or_direct_write_coupling() -> None:
     text = "\n".join(
         path.read_text(encoding="utf-8").casefold()
         for path in Path("src/agentgraph/write").glob("*.py")
@@ -9,7 +9,6 @@ def test_m006_production_has_no_forbidden_remote_or_shell_coupling() -> None:
     forbidden = (
         "codex",
         "openai",
-        "github",
         "shell=true",
         "os.system",
         "subprocess",
@@ -20,6 +19,17 @@ def test_m006_production_has_no_forbidden_remote_or_shell_coupling() -> None:
     )
 
     assert all(token not in text for token in forbidden)
+
+
+def test_github_coupling_is_confined_to_m014_publish_boundary() -> None:
+    allowed = {"__init__.py", "publish.py", "publish_models.py", "remote.py"}
+    offenders = {
+        path.name
+        for path in Path("src/agentgraph/write").glob("*.py")
+        if path.name not in allowed and "github" in path.read_text(encoding="utf-8").casefold()
+    }
+
+    assert offenders == set()
 
 
 def test_core_and_runtime_do_not_depend_on_write_slice() -> None:

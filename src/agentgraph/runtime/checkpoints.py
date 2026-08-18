@@ -173,6 +173,11 @@ class CheckpointStore:
     def load_request(self, checkpoint_id: str) -> CheckpointRequestRecord | None:
         return self._load(self.request_path(checkpoint_id), CheckpointRequestRecord)
 
+    def load_typed_request(self, checkpoint_id: str, kind: type[object]) -> object | None:
+        """Load an extension-owned request contract from the common safe store."""
+
+        return self._load(self.request_path(checkpoint_id), kind)
+
     def load_decision(self, checkpoint_id: str) -> CheckpointDecision | None:
         return self._load(self.decision_path(checkpoint_id), CheckpointDecision)
 
@@ -184,6 +189,23 @@ class CheckpointStore:
             path = self.request_path(record.checkpoint_id)
             self._verify_regular_file_if_present(lock_path)
             existing = self._load(path, CheckpointRequestRecord)
+            if existing is not None:
+                return existing
+            atomic_write_bytes(path, canonical_json_bytes(encode_value(record)))
+        return record
+
+    def write_typed_request_once(self, record: object, kind: type[object]) -> object:
+        """Create one immutable extension-owned request without changing its schema."""
+
+        checkpoint_id = getattr(record, "checkpoint_id", None)
+        if not isinstance(record, kind) or not isinstance(checkpoint_id, str):
+            raise CheckpointStoreError("invalid checkpoint request")
+        path = self.request_path(checkpoint_id)
+        lock_path = path.with_suffix(".lock")
+        self._verify_regular_file_if_present(lock_path)
+        with AdvisoryFileLock(lock_path, blocking=True):
+            path = self.request_path(checkpoint_id)
+            existing = self._load(path, kind)
             if existing is not None:
                 return existing
             atomic_write_bytes(path, canonical_json_bytes(encode_value(record)))
@@ -254,7 +276,7 @@ class CheckpointStore:
             raise CheckpointEvidenceError("checkpoint storage metadata is unreadable") from exc
 
     @staticmethod
-    def _load(path: Path, kind: type[CheckpointRequestRecord] | type[CheckpointDecision]):
+    def _load(path: Path, kind: type[object]):
         if not path.exists():
             return None
         try:

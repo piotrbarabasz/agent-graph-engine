@@ -124,8 +124,12 @@ class PreflightNode:
                 "sequential_items_bounded_by_policy",
                 "one_scope_branch_and_workspace",
                 "per_item_capability_and_commit",
-                "no_source_closure",
-                "no_push_or_pull_request",
+                "no_remote_mutation_before_publish_approval",
+                "publish_exact_verified_head_only",
+                "draft_pull_request_only",
+                "merge_forbidden",
+                "deployment_forbidden",
+                "source_closure_forbidden",
             )
         )
         operations = (

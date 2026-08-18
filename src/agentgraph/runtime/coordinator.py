@@ -35,7 +35,12 @@ from .locking import ProjectLock
 from .paths import RuntimePaths
 from .project_registry import ProjectRecord
 from .receipts import FinalReceipt
-from .recovery import RecoveryAssessment, RecoveryManager, _transition_commit_payload
+from .recovery import (
+    InterruptedSideEffectReconciler,
+    RecoveryAssessment,
+    RecoveryManager,
+    _transition_commit_payload,
+)
 from .state_store import StateStore
 
 
@@ -60,6 +65,7 @@ class DurableGraphCoordinator:
         run_id_factory: Callable[[], str] = generate_run_id,
         now: Callable[[], datetime] = utc_now,
         fault: Callable[[str], None] | None = None,
+        side_effect_reconciler: InterruptedSideEffectReconciler | None = None,
     ) -> None:
         self.paths = paths
         self.project = project
@@ -67,6 +73,7 @@ class DurableGraphCoordinator:
         self.run_id_factory = run_id_factory
         self.now = now
         self.fault = fault or (lambda stage: None)
+        self.side_effect_reconciler = side_effect_reconciler
 
     def start_run(
         self,
@@ -409,13 +416,23 @@ class RuntimeSession:
         """Assess current durable evidence without invoking a node."""
 
         self._require_lock()
-        return RecoveryManager(self.coordinator.engine, self.store, self.journal).assess()
+        return RecoveryManager(
+            self.coordinator.engine,
+            self.store,
+            self.journal,
+            self.coordinator.side_effect_reconciler,
+        ).assess()
 
     def recover(self) -> RecoveryAssessment:
         """Complete a provable interrupted commit phase without graph-semantic changes."""
 
         self._require_lock()
-        manager = RecoveryManager(self.coordinator.engine, self.store, self.journal)
+        manager = RecoveryManager(
+            self.coordinator.engine,
+            self.store,
+            self.journal,
+            self.coordinator.side_effect_reconciler,
+        )
         assessment = manager.assess()
         result = manager.execute(assessment)
         state = self.store.load_persisted()

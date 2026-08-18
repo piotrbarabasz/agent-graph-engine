@@ -162,6 +162,8 @@ class MultiItemExecution:
     agent_provider: object
     review_agent_provider: object | None
     delivery_review_agent_provider: object | None
+    remote_provider: object | None
+    publish_remote_name: str
     git: GitAdapter
     processes: ProcessRunner
     target: GitRepository
@@ -176,6 +178,7 @@ class MultiItemExecution:
     current_item_id: str | None = None
     verified_completed: tuple[CompletedItemReport, ...] = field(default=(), init=False)
     delivery_review_execution: DeliveryReviewExecution | None = field(default=None, init=False)
+    publish_execution: object | None = field(default=None, init=False)
 
     def plan_item(self, item_id: str) -> WorkPlanItem:
         try:
@@ -260,6 +263,19 @@ class MultiItemExecution:
                 self, self.delivery_review_agent_provider
             )
         return self.delivery_review_execution
+
+    def publication(self):
+        if self.publish_execution is None:
+            from .publish import PublishExecution
+
+            self.publish_execution = PublishExecution(
+                self,
+                self.remote_provider,
+                self.publish_remote_name,
+                self.clock,
+                self.nonce_factory,
+            )
+        return self.publish_execution
 
     def all_commit_shas(self, state: GraphState) -> tuple[str, ...]:
         return tuple(item.commit_sha for item in self.completed_reports(state))

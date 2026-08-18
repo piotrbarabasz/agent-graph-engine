@@ -17,6 +17,7 @@ from agentgraph.core import (
     GraphEngine,
     PolicySnapshot,
     RepairClassification,
+    ReviewVerdict,
     RunStatus,
     canonical_v1_graph,
 )
@@ -41,7 +42,6 @@ from agentgraph.nodes import (
     DiscoverProjectNode,
     ExploreNode,
     FinalizeNode,
-    HumanCheckpointNode,
     ImplementNode,
     MoreWorkNode,
     PreflightNode,
@@ -77,7 +77,6 @@ from .errors import (
 )
 from .evidence import read_evidence, write_evidence
 from .models import (
-    CheckpointView,
     WorkPlan,
     WorkPlanItem,
     WriteInputs,
@@ -95,6 +94,8 @@ from .multi_item import (
     item_inputs,
 )
 from .provider import ChangeProvider
+from .publish import CreatePullRequestNode, HumanCheckpointDispatchNode
+from .remote import RemoteProvider
 
 
 class WriteSliceRunner:
@@ -109,6 +110,8 @@ class WriteSliceRunner:
         agent_provider: AgentProvider | None = None,
         review_agent_provider: AgentProvider | None = None,
         delivery_review_agent_provider: AgentProvider | None = None,
+        remote_provider: RemoteProvider | None = None,
+        publish_remote_name: str = "origin",
         git_adapter: GitAdapter,
         project_registry: ProjectRegistry,
         process_runner: ProcessRunner | None = None,
@@ -138,6 +141,15 @@ class WriteSliceRunner:
         self.agent_provider = agent_provider or DeclaredWorkAgentProvider()
         self.review_agent_provider = review_agent_provider
         self.delivery_review_agent_provider = delivery_review_agent_provider
+        self.remote_provider = remote_provider
+        if (
+            not isinstance(publish_remote_name, str)
+            or not publish_remote_name
+            or publish_remote_name.startswith("-")
+            or "\x00" in publish_remote_name
+        ):
+            raise ValueError("publish remote name is invalid")
+        self.publish_remote_name = publish_remote_name
         self.git = git_adapter
         self.registry = project_registry
         self.paths = runtime_paths or project_registry.paths
@@ -332,6 +344,25 @@ class WriteSliceRunner:
                 RecoveryAction.REAPPLY_RECORDED_RESULT,
                 RecoveryAction.COMPLETE_TRANSITION_MARKER,
             }:
+                state_for_recovery = session.store.load()
+                if (
+                    self.remote_provider is not None
+                    and state_for_recovery.graph.current_node in {"CREATE_PR", "FINALIZE"}
+                    and (controller.run_path / "publish" / "result.json").exists()
+                ):
+                    try:
+                        controller.publication().verify_result_for_recovery(state_for_recovery)
+                    except Exception as exc:
+                        return replace(
+                            self._report(state_for_recovery, controller, ()),
+                            outcome=WriteSliceOutcome.RECOVERY_REQUIRED,
+                            issues=(
+                                WriteSliceIssue(
+                                    getattr(exc, "code", "publish_recovery_mismatch"),
+                                    str(exc),
+                                ),
+                            ),
+                        )
                 assessment = session.recover()
             state = session.store.load()
             try:
@@ -358,7 +389,10 @@ class WriteSliceRunner:
                     self._rehydrate_current(controller, state)
                 return self._recovery_required(state, controller, assessment)
             if assessment.action is RecoveryAction.COMPLETED:
-                return self._report(state, controller, ())
+                try:
+                    return self._report(state, controller, ())
+                except WorkspaceError as exc:
+                    return self._rehydration_required(state, controller, exc)
             if assessment.action not in {
                 RecoveryAction.CLEAN_RESUME,
                 RecoveryAction.RERUN_INTERRUPTED_NODE,
@@ -379,7 +413,7 @@ class WriteSliceRunner:
                 return self._report(state, controller, ())
             if state.graph.current_node == "HUMAN_CHECKPOINT":
                 if state.graph.pending_resume_node == "CREATE_PR":
-                    return self._report(state, controller, ())
+                    return self._publish_checkpoint_report(state, controller, (), session=session)
                 try:
                     checkpoints = controller.checkpoints(state)
                     request, decision = checkpoints.decision(state)
@@ -406,8 +440,8 @@ class WriteSliceRunner:
         outcome: CheckpointOutcome,
         actor: str,
     ) -> CheckpointDecision:
-        if self._delivery_checkpoint_pending(run_id):
-            raise CheckpointError("delivery_checkpoint_not_implemented_in_m013")
+        if self._delivery_checkpoint_pending(run_id) and self.remote_provider is None:
+            raise CheckpointError("remote_provider_required")
         try:
             controller, coordinator = self._existing_runtime(run_id)
         except (
@@ -437,7 +471,14 @@ class WriteSliceRunner:
                 state.graph.current_node == "HUMAN_CHECKPOINT"
                 and state.graph.pending_resume_node == "CREATE_PR"
             ):
-                raise CheckpointError("delivery_checkpoint_not_implemented_in_m013")
+                publish = controller.publication()
+                return publish.checkpoints().submit(
+                    state,
+                    checkpoint_id=checkpoint_id,
+                    nonce=nonce,
+                    outcome=outcome,
+                    actor=actor,
+                )
             self._rehydrate_current(controller, state)
             return controller.checkpoints(state).submit(
                 state,
@@ -540,6 +581,8 @@ class WriteSliceRunner:
             self.agent_provider,
             self.review_agent_provider,
             self.delivery_review_agent_provider,
+            self.remote_provider,
+            self.publish_remote_name,
             self.git,
             self.processes,
             inspection.repository,
@@ -567,10 +610,7 @@ class WriteSliceRunner:
             "ASSESS_RISK": dynamic(
                 "ASSESS_RISK", lambda ex: AssessRiskNode(ex.inputs, ex.analysis)
             ),
-            "HUMAN_CHECKPOINT": dynamic(
-                "HUMAN_CHECKPOINT",
-                lambda ex: HumanCheckpointNode(controller.checkpoints_for_execution(ex)),
-            ),
+            "HUMAN_CHECKPOINT": HumanCheckpointDispatchNode(controller),
             "IMPLEMENT": dynamic("IMPLEMENT", ImplementNode),
             "VALIDATE": dynamic("VALIDATE", ValidateNode),
             "REVIEW": dynamic("REVIEW", ReviewNode),
@@ -587,6 +627,9 @@ class WriteSliceRunner:
             "DELIVERY_REVIEW": DeliveryReviewNode(controller.delivery_reviews())
             if run_inputs.delivery_review_enabled
             else None,
+            "CREATE_PR": CreatePullRequestNode(controller.publication())
+            if self.remote_provider is not None
+            else None,
             "FINALIZE": FinalizeNode(),
         }
         nodes = {key: value for key, value in nodes.items() if value is not None}
@@ -601,6 +644,9 @@ class WriteSliceRunner:
             GraphEngine(canonical_v1_graph(), policy, nodes),
             run_id_factory=lambda: run_id,
             fault=self.fault,
+            side_effect_reconciler=(
+                controller.publication() if self.remote_provider is not None else None
+            ),
         )
         return controller, coordinator
 
@@ -626,7 +672,9 @@ class WriteSliceRunner:
             state = session.step()
             if state.graph.current_node == "HUMAN_CHECKPOINT":
                 if state.graph.pending_resume_node == "CREATE_PR":
-                    return self._report(state, controller, tuple(executed))
+                    return self._publish_checkpoint_report(
+                        state, controller, tuple(executed), session=session
+                    )
                 try:
                     checkpoints = controller.checkpoints(state)
                     checkpoint = checkpoints.view(checkpoints.ensure_request(state))
@@ -667,7 +715,7 @@ class WriteSliceRunner:
         controller: MultiItemExecution,
         executed: tuple[str, ...],
         *,
-        checkpoint: CheckpointView | None = None,
+        checkpoint: object | None = None,
     ) -> WriteSliceReport:
         completion_error = None
         try:
@@ -675,11 +723,32 @@ class WriteSliceRunner:
         except WorkspaceError as exc:
             completion_error = exc
             completed_items = controller.verified_completed
+        publish_error = None
+        publish_report = None
+        publication_expected = (
+            state.run.status is RunStatus.COMPLETED
+            and state.graph.current_node == "END"
+            and state.review.verdict is ReviewVerdict.PASS
+            and state.review.safe_to_create_pr
+        )
+        if controller.publish_execution is None and (
+            publication_expected or (controller.run_path / "publish" / "plan.json").exists()
+        ):
+            controller.publication()
+        if controller.publish_execution is not None:
+            try:
+                publish_report = controller.publish_execution.report(
+                    state, require_result=publication_expected
+                )
+            except WorkspaceError as exc:
+                publish_error = exc
         commits = tuple(item.commit_sha for item in completed_items)
         execution = controller.current
         outcome = (
             WriteSliceOutcome.CHECKPOINT_REQUIRED
-            if checkpoint is not None
+            if checkpoint is not None and state.graph.pending_resume_node == "IMPLEMENT"
+            else WriteSliceOutcome.PUBLISH_CHECKPOINT_REQUIRED
+            if checkpoint is not None and state.graph.pending_resume_node == "CREATE_PR"
             else WriteSliceOutcome.DELIVERY_CHECKPOINT_REQUIRED
             if state.run.status is RunStatus.RUNNING
             and state.graph.current_node == "HUMAN_CHECKPOINT"
@@ -689,6 +758,10 @@ class WriteSliceRunner:
             and state.graph.current_node == "DELIVERY_REVIEW"
             else WriteSliceOutcome.LOCAL_COMMIT_CREATED
             if commits and state.run.status is RunStatus.PAUSED
+            else WriteSliceOutcome.DRAFT_PR_CREATED
+            if state.run.status is RunStatus.COMPLETED and publish_report is not None
+            else WriteSliceOutcome.CANCELLED
+            if state.run.status is RunStatus.CANCELLED
             else WriteSliceOutcome.BLOCKED
             if state.run.status is RunStatus.BLOCKED
             else WriteSliceOutcome.FAILED
@@ -702,11 +775,21 @@ class WriteSliceRunner:
                     str(completion_error),
                 ),
             )
+        elif publish_error is not None:
+            outcome = WriteSliceOutcome.RECOVERY_REQUIRED
+            issues = (
+                WriteSliceIssue(
+                    getattr(publish_error, "code", None) or "publish_evidence_mismatch",
+                    str(publish_error),
+                ),
+            )
         elif outcome not in {
             WriteSliceOutcome.LOCAL_COMMIT_CREATED,
             WriteSliceOutcome.CHECKPOINT_REQUIRED,
             WriteSliceOutcome.DELIVERY_REVIEW_REQUIRED,
             WriteSliceOutcome.DELIVERY_CHECKPOINT_REQUIRED,
+            WriteSliceOutcome.PUBLISH_CHECKPOINT_REQUIRED,
+            WriteSliceOutcome.DRAFT_PR_CREATED,
         }:
             issues = (
                 WriteSliceIssue(
@@ -715,6 +798,11 @@ class WriteSliceRunner:
                     or (
                         controller.delivery_review_execution.issue_code
                         if controller.delivery_review_execution is not None
+                        else None
+                    )
+                    or (
+                        controller.publish_execution.issue_code
+                        if controller.publish_execution is not None
                         else None
                     )
                     or state.failure.code
@@ -766,7 +854,59 @@ class WriteSliceRunner:
                 if controller.delivery_review_execution is None
                 else controller.delivery_review_execution.report
             ),
+            publish=publish_report,
         )
+
+    def _publish_checkpoint_report(self, state, controller, executed, *, session=None):
+        if self.remote_provider is None:
+            return self._report(state, controller, executed)
+        continue_run = False
+        try:
+            publish = controller.publication()
+            _local_plan, _local_request, local_decision = (
+                publish.checkpoints().decision_for_consumption(state)
+            )
+            if local_decision is not None:
+                if session is not None:
+                    continue_run = True
+            else:
+                plan = publish.ensure_plan(state)
+                request, decision = publish.checkpoints().decision(state, plan)
+                if decision is None and not publish.checkpoints().expired(request):
+                    return self._report(
+                        state,
+                        controller,
+                        executed,
+                        checkpoint=publish.checkpoints().view(request, plan),
+                    )
+                if session is not None:
+                    continue_run = True
+        except Exception as exc:
+            recovery = isinstance(exc, (WorkspaceError, CheckpointError)) or getattr(
+                exc, "code", ""
+            ) in {
+                "publish_evidence_invalid",
+                "publish_evidence_mismatch",
+                "publish_plan_mismatch",
+                "publish_storage_invalid",
+            }
+            return replace(
+                self._report(state, controller, executed),
+                outcome=(
+                    WriteSliceOutcome.RECOVERY_REQUIRED
+                    if recovery
+                    else WriteSliceOutcome.PUBLISH_PREPARATION_BLOCKED
+                ),
+                issues=(
+                    WriteSliceIssue(
+                        getattr(exc, "code", None) or "publish_preparation_blocked",
+                        str(exc),
+                    ),
+                ),
+            )
+        if continue_run:
+            return self._continue(session, state, controller, executed)
+        return self._report(state, controller, executed)
 
     def _checkpoint_recovery(self, state, controller, error: CheckpointError):
         return replace(

@@ -31,6 +31,25 @@ class GitRepository:
 
 
 @dataclass(frozen=True, slots=True)
+class GitRemoteEndpoint:
+    """One exact, caller-validated Git transport endpoint."""
+
+    url: str
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.url, str)
+            or not self.url
+            or len(self.url) > 4096
+            or "\x00" in self.url
+            or self.url.startswith("-")
+            or "\r" in self.url
+            or "\n" in self.url
+        ):
+            raise InvalidGitOperationError("invalid Git remote endpoint")
+
+
+@dataclass(frozen=True, slots=True)
 class RepositorySnapshot:
     """Immutable machine-readable state of one local repository."""
 
@@ -92,6 +111,16 @@ class GitWorktreeResult:
     """A newly-created local worktree plus the structural command receipt."""
 
     repository: GitRepository
+    receipt: CommandReceipt
+
+
+@dataclass(frozen=True, slots=True)
+class GitPushResult:
+    """Receipt for one exact, non-force branch publication."""
+
+    commit_sha: str
+    remote_name: str
+    remote_branch: str
     receipt: CommandReceipt
 
 
@@ -295,6 +324,149 @@ class GitAdapter:
         self._require_success(result, "Git local branch inspection failed")
         raise AssertionError("unreachable")
 
+    def list_remotes(self, repository: GitRepository) -> tuple[str, ...]:
+        """Return exact configured remote names without interpreting URLs."""
+
+        result = self._run(repository, ("remote",))
+        self._require_success(result, "Git remote inspection failed")
+        try:
+            value = result.stdout.decode("utf-8", errors="strict")
+        except UnicodeDecodeError as exc:
+            raise GitOutputError("Git returned non-UTF-8 remote names") from exc
+        names = tuple(line for line in value.splitlines() if line)
+        if len(set(names)) != len(names) or any(
+            "\x00" in name or name.startswith("-") for name in names
+        ):
+            raise GitOutputError("Git returned invalid remote names")
+        return names
+
+    def remote_push_url(self, repository: GitRepository, remote_name: str) -> str:
+        """Read one validated remote's push URL; callers must not persist it blindly."""
+
+        urls = self.remote_push_urls(repository, remote_name)
+        if len(urls) != 1:
+            raise GitOutputError("Git remote has multiple push URLs")
+        return urls[0]
+
+    def remote_push_urls(self, repository: GitRepository, remote_name: str) -> tuple[str, ...]:
+        """Read every configured push URL for one exact remote in declaration order."""
+
+        self._validate_remote_name(repository, remote_name)
+        result = self._run(repository, ("remote", "get-url", "--push", "--all", remote_name))
+        self._require_success(result, "Git remote push URL inspection failed")
+        if len(result.stdout) > 65536:
+            raise GitOutputError("Git returned oversized remote push URL output")
+        try:
+            value = result.stdout.decode("utf-8", errors="strict")
+        except UnicodeDecodeError as exc:
+            raise GitOutputError("Git returned non-UTF-8 remote push URLs") from exc
+        urls = tuple(value.splitlines())
+        if (
+            not urls
+            or len(urls) > 32
+            or any(
+                not url or len(url) > 4096 or "\x00" in url or url.startswith("-") or "\r" in url
+                for url in urls
+            )
+        ):
+            raise GitOutputError("Git returned invalid remote push URLs")
+        return urls
+
+    def remote_branch_sha(
+        self, repository: GitRepository, remote_name: str, branch: str
+    ) -> str | None:
+        """Inspect one exact remote branch without updating tracking refs."""
+
+        self._validate_remote_name(repository, remote_name)
+        return self._remote_branch_sha(repository, remote_name, branch)
+
+    def _remote_branch_sha(
+        self, repository: GitRepository, endpoint: str, branch: str
+    ) -> str | None:
+        self._validate_branch(repository, branch)
+        ref = f"refs/heads/{branch}"
+        result = self._run(repository, ("ls-remote", "--exit-code", "--heads", endpoint, ref))
+        if result.receipt.status is ProcessStatus.FAILED and result.receipt.exit_code == 2:
+            if result.stdout:
+                raise GitOutputError("Git returned output for an absent remote branch")
+            return None
+        self._require_success(result, "Git remote branch inspection failed")
+        raw = result.stdout.rstrip(b"\r\n")
+        if b"\n" in raw or b"\r" in raw:
+            raise GitOutputError("Git returned multiple remote branch records")
+        sha, separator, returned_ref = raw.partition(b"\t")
+        try:
+            parsed_sha = sha.decode("ascii")
+            parsed_ref = returned_ref.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise GitOutputError("Git returned malformed remote branch data") from exc
+        if not separator or parsed_ref != ref or not _is_object_id(parsed_sha):
+            raise GitOutputError("Git returned malformed remote branch data")
+        return parsed_sha
+
+    def remote_branch_sha_at_endpoint(
+        self, repository: GitRepository, endpoint: GitRemoteEndpoint, branch: str
+    ) -> str | None:
+        """Inspect one exact endpoint branch without consulting a remote name again."""
+
+        self._validate_branch(repository, branch)
+        return self._remote_branch_sha(repository, endpoint.url, branch)
+
+    def push_exact_branch(
+        self,
+        repository: GitRepository,
+        *,
+        remote_name: str,
+        commit_sha: str,
+        remote_branch: str,
+    ) -> GitPushResult:
+        """Push exactly one verified commit to one branch, never forcefully."""
+
+        self._validate_remote_name(repository, remote_name)
+        self._validate_branch(repository, remote_branch)
+        self._validate_start_point(repository, commit_sha)
+        if self.resolve_ref(repository, commit_sha) != commit_sha:
+            raise InvalidGitReferenceError("published commit must be an exact object ID")
+        result = self._run(
+            repository,
+            (
+                "push",
+                "--no-verify",
+                remote_name,
+                f"{commit_sha}:refs/heads/{remote_branch}",
+            ),
+            timeout_seconds=self.commit_timeout_seconds,
+        )
+        self._require_success(result, "Git exact branch push failed")
+        return GitPushResult(commit_sha, remote_name, remote_branch, result.receipt)
+
+    def push_exact_branch_to_endpoint(
+        self,
+        repository: GitRepository,
+        *,
+        endpoint: GitRemoteEndpoint,
+        commit_sha: str,
+        remote_branch: str,
+    ) -> GitPushResult:
+        """Push one commit to the exact endpoint already inspected by the caller."""
+
+        self._validate_branch(repository, remote_branch)
+        self._validate_start_point(repository, commit_sha)
+        if self.resolve_ref(repository, commit_sha) != commit_sha:
+            raise InvalidGitReferenceError("published commit must be an exact object ID")
+        result = self._run(
+            repository,
+            (
+                "push",
+                "--no-verify",
+                endpoint.url,
+                f"{commit_sha}:refs/heads/{remote_branch}",
+            ),
+            timeout_seconds=self.commit_timeout_seconds,
+        )
+        self._require_success(result, "Git exact endpoint branch push failed")
+        return GitPushResult(commit_sha, endpoint.url, remote_branch, result.receipt)
+
     def resolve_ref(self, repository: GitRepository, reference: str) -> str | None:
         """Resolve an exact local commit-ish to a commit SHA, or return None."""
 
@@ -495,6 +667,12 @@ class GitAdapter:
         if result.receipt.status is ProcessStatus.FAILED:
             raise InvalidGitReferenceError("invalid Git branch name")
         self._require_success(result, "Git branch validation did not complete")
+
+    def _validate_remote_name(self, repository: GitRepository, name: str) -> None:
+        if not isinstance(name, str) or not name or name.startswith("-") or "\x00" in name:
+            raise InvalidGitOperationError("invalid Git remote name")
+        if name not in self.list_remotes(repository):
+            raise InvalidGitOperationError("Git remote does not exist")
 
     def _validate_start_point(self, repository: GitRepository, start_point: str) -> None:
         if (

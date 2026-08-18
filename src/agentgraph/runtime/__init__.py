@@ -7,7 +7,13 @@ from .journal import Journal, JournalRecordType
 from .locking import ProjectLock
 from .paths import RuntimePaths
 from .project_registry import ProjectRecord, ProjectRegistry
-from .recovery import RecoveryAction, RecoveryAssessment, RecoveryManager
+from .recovery import (
+    InterruptedSideEffectAssessment,
+    InterruptedSideEffectReconciler,
+    RecoveryAction,
+    RecoveryAssessment,
+    RecoveryManager,
+)
 from .state_store import StateStore
 
 __all__ = [
@@ -15,6 +21,8 @@ __all__ = [
     "CheckpointRequestRecord",
     "CheckpointStore",
     "DurableGraphCoordinator",
+    "InterruptedSideEffectAssessment",
+    "InterruptedSideEffectReconciler",
     "Journal",
     "JournalRecordType",
     "ProjectLock",

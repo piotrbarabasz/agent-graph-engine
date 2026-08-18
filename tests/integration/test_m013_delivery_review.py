@@ -486,7 +486,7 @@ def test_delivery_checkpoint_resume_is_idempotent_and_submit_is_deferred(tmp_pat
             outcome=CheckpointOutcome.APPROVED,
             actor="m013-test",
         )
-    assert error.value.code == "delivery_checkpoint_not_implemented_in_m013"
+    assert error.value.code == "remote_provider_required"
     without_provider = _runner(target, runtime, PerItemProvider())
     with pytest.raises(CheckpointError) as missing_provider_error:
         without_provider.submit_checkpoint(
@@ -496,7 +496,7 @@ def test_delivery_checkpoint_resume_is_idempotent_and_submit_is_deferred(tmp_pat
             outcome=CheckpointOutcome.APPROVED,
             actor="m013-test",
         )
-    assert missing_provider_error.value.code == "delivery_checkpoint_not_implemented_in_m013"
+    assert missing_provider_error.value.code == "remote_provider_required"
 
 
 def test_legacy_run_stays_disabled_even_when_resume_adds_provider(tmp_path) -> None:
