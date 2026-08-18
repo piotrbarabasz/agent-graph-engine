@@ -305,7 +305,13 @@ class PublishExecution:
         self.result = result
         return result
 
-    def report(self, *, require_result: bool = False) -> PublishReport | None:
+    def report(self, state: GraphState, *, require_result: bool = False) -> PublishReport | None:
+        plan = self.plan or load_typed(self.run_path, "plan.json", PublishPlan, self.context)
+        if plan is None:
+            if not require_result:
+                return None
+            raise PublishEvidenceError("publish_plan_missing")
+        self.verify_publish_plan_authority(state, plan)
         result = self.result or load_typed(
             self.run_path, "result.json", PublishResult, self.context
         )
@@ -313,9 +319,6 @@ class PublishExecution:
             if require_result:
                 raise PublishEvidenceError("publish_result_missing")
             return None
-        plan = self.plan or load_typed(self.run_path, "plan.json", PublishPlan, self.context)
-        if plan is None:
-            raise PublishEvidenceError("publish_plan_missing")
         try:
             request = self.checkpoints().store.load_typed_request(
                 result.checkpoint_id, PublishCheckpointRequestRecord
@@ -334,8 +337,10 @@ class PublishExecution:
         pull_request = load_typed(
             self.run_path, "pull-request.json", PullRequestReceipt, self.context
         )
-        if push is None or pull_request is None:
-            raise PublishEvidenceError("publish_result_mismatch")
+        if push is None:
+            raise PublishEvidenceError("push_receipt_missing")
+        if pull_request is None:
+            raise PublishEvidenceError("pull_request_receipt_missing")
         verify_publish_evidence_chain(plan, request, decision, push, pull_request, result)
         self.result = result
         return PublishReport(
@@ -425,8 +430,12 @@ class PublishExecution:
         delivery = self.controller.delivery_reviews()
         delivery.rehydrate_if_complete(state)
         report = delivery.report
+        run = self.controller.run_inputs
+        completed_ids = tuple(item.item_id for item in completed)
+        completed_shas = tuple(item.commit_sha for item in completed)
         if (
-            report is None
+            not completed
+            or report is None
             or report.verdict is not ReviewVerdict.PASS
             or not report.safe_to_create_pr
             or state.review.verdict is not ReviewVerdict.PASS
@@ -436,13 +445,47 @@ class PublishExecution:
         document = read_evidence(self.run_path / "delivery-review" / "manifest.json")
         manifest = decode_value(document.get("payload"), DeliveryManifest)
         if (
-            manifest.digest != report.manifest_digest
+            manifest.scope_id != run.scope_id
+            or manifest.target_baseline_head != run.target_baseline_head
+            or manifest.work_plan_digest != run.work_plan_digest
+            or manifest.source_revision != run.source_revision
+            or manifest.completed_item_ids != completed_ids
+            or manifest.completed_commit_shas != completed_shas
+            or manifest.final_head != completed[-1].commit_sha
+            or manifest.digest != report.manifest_digest
+            or manifest.target_baseline_head != report.target_baseline_head
             or manifest.final_head != report.final_head
             or manifest.final_tree_id != report.final_tree_id
-            or tuple(item.commit_sha for item in completed) != manifest.completed_commit_shas
         ):
             raise PublishEvidenceError("delivery_review_evidence_mismatch")
         return manifest, report, completed
+
+    def verify_publish_plan_authority(self, state: GraphState, plan: PublishPlan) -> None:
+        """Bind a publish plan to the exact durable delivery produced by this run."""
+
+        manifest, review, completed = self._delivery_authority(state)
+        run = self.controller.run_inputs
+        if (
+            plan.project_id != run.project_id
+            or plan.run_id != self.controller.run_id
+            or plan.scope_id != run.scope_id
+            or plan.source_revision != run.source_revision
+            or plan.work_plan_digest != run.work_plan_digest
+            or plan.target_baseline_head != run.target_baseline_head
+            or plan.base_branch != run.base_branch
+            or plan.local_scope_branch != run.scope_branch
+            or plan.remote_head_branch != run.scope_branch
+            or plan.final_head != completed[-1].commit_sha
+            or plan.delivery_manifest_digest != manifest.digest
+            or plan.final_head != manifest.final_head
+            or plan.final_tree_id != manifest.final_tree_id
+            or plan.delivery_review_evidence_reference != review.evidence_reference
+            or plan.delivery_manifest_digest != review.manifest_digest
+            or plan.final_head != review.final_head
+            or plan.final_tree_id != review.final_tree_id
+        ):
+            raise PublishEvidenceError("publish_plan_mismatch")
+        self.plan = plan
 
     def _verify_local(self, final_head: str):
         self.controller.verify_run_boundary_from_head(final_head)
@@ -494,22 +537,7 @@ class PublishExecution:
         plan = load_typed(self.run_path, "plan.json", PublishPlan, self.context)
         if plan is None:
             raise PublishEvidenceError("publish_plan_missing")
-        manifest, review, completed = self._delivery_authority(state)
-        if (
-            plan.final_head != manifest.final_head
-            or plan.final_tree_id != manifest.final_tree_id
-            or plan.delivery_manifest_digest != manifest.digest
-            or plan.delivery_review_evidence_reference != review.evidence_reference
-            or plan.source_revision != self.controller.run_inputs.source_revision
-            or plan.work_plan_digest != self.controller.run_inputs.work_plan_digest
-            or plan.target_baseline_head != self.controller.run_inputs.target_baseline_head
-            or plan.local_scope_branch != self.controller.run_inputs.scope_branch
-            or plan.remote_head_branch != self.controller.run_inputs.scope_branch
-            or plan.base_branch != self.controller.run_inputs.base_branch
-            or not completed
-        ):
-            raise PublishEvidenceError("publish_plan_mismatch")
-        self.plan = plan
+        self.verify_publish_plan_authority(state, plan)
         return plan
 
     def _find(self, plan):

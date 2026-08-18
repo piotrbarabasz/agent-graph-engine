@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from agentgraph.core import CheckpointOutcome, RunStatus
+from agentgraph.runtime import CheckpointDecision
 from agentgraph.runtime.codec import (
     canonical_json_bytes,
     decode_value,
@@ -23,7 +24,9 @@ from agentgraph.write import (
     PublishConflictError,
     PublishEvidenceError,
     PublishPlan,
+    PublishResult,
     PullRequestReceipt,
+    PushReceipt,
     RemoteAuthenticationError,
     RemoteContractError,
     RemotePullRequest,
@@ -33,6 +36,7 @@ from agentgraph.write import (
 )
 from agentgraph.write.evidence import read_evidence
 from agentgraph.write.publish import PublishCheckpointController
+from agentgraph.write.publish_models import verify_publish_evidence_chain
 from tests.integration.conftest import git
 from tests.integration.test_m014_publish import (
     FakeRemoteProvider,
@@ -193,6 +197,102 @@ def _rewrite_publish_payload(path: Path, **changes: object) -> None:
     path.write_bytes(canonical_json_bytes(document))
 
 
+def _redigest_wrapped(document: dict[str, object]) -> None:
+    payload = document["payload"]
+    payload["digest"] = sha256_digest(
+        {key: item for key, item in payload.items() if key != "digest"}
+    )
+    document["content_digest"] = sha256_digest(
+        {key: item for key, item in document.items() if key != "content_digest"}
+    )
+
+
+def _rewrite_complete_publish_chain(
+    run_path: Path, checkpoint_id: str, **plan_changes: object
+) -> None:
+    publish = run_path / "publish"
+    plan_path = publish / "plan.json"
+    request_path = run_path / "checkpoints" / checkpoint_id / "request.json"
+    decision_path = run_path / "checkpoints" / checkpoint_id / "decision.json"
+    push_path = publish / "push.json"
+    pull_request_path = publish / "pull-request.json"
+    result_path = publish / "result.json"
+
+    plan_document = json.loads(plan_path.read_text(encoding="utf-8"))
+    plan = plan_document["payload"]
+    plan.update(plan_changes)
+    _redigest_wrapped(plan_document)
+
+    request = json.loads(request_path.read_text(encoding="utf-8"))
+    for field in (
+        "delivery_manifest_digest",
+        "final_tree_id",
+        "delivery_review_evidence_reference",
+    ):
+        request[field] = plan[field]
+    request["publish_plan_digest"] = plan["digest"]
+    request["request_digest"] = sha256_digest(
+        {key: item for key, item in request.items() if key != "request_digest"}
+    )
+
+    decision = json.loads(decision_path.read_text(encoding="utf-8"))
+    decision["request_digest"] = request["request_digest"]
+    decision["decision_digest"] = sha256_digest(
+        {key: item for key, item in decision.items() if key != "decision_digest"}
+    )
+
+    push_document = json.loads(push_path.read_text(encoding="utf-8"))
+    push = push_document["payload"]
+    push["publish_plan_digest"] = plan["digest"]
+    _redigest_wrapped(push_document)
+
+    pull_request_document = json.loads(pull_request_path.read_text(encoding="utf-8"))
+    pull_request = pull_request_document["payload"]
+    pull_request["publish_plan_digest"] = plan["digest"]
+    _redigest_wrapped(pull_request_document)
+
+    result_document = json.loads(result_path.read_text(encoding="utf-8"))
+    result = result_document["payload"]
+    result.update(
+        publish_plan_digest=plan["digest"],
+        checkpoint_request_digest=request["request_digest"],
+        checkpoint_decision_digest=decision["decision_digest"],
+        push_receipt_digest=push["digest"],
+        pr_receipt_digest=pull_request["digest"],
+    )
+    _redigest_wrapped(result_document)
+
+    for path, document in (
+        (plan_path, plan_document),
+        (request_path, request),
+        (decision_path, decision),
+        (push_path, push_document),
+        (pull_request_path, pull_request_document),
+        (result_path, result_document),
+    ):
+        path.write_bytes(canonical_json_bytes(document))
+
+
+def _assert_complete_publish_chain_valid(run_path: Path, checkpoint_id: str) -> None:
+    publish = run_path / "publish"
+    checkpoint = run_path / "checkpoints" / checkpoint_id
+    plan = decode_value(read_evidence(publish / "plan.json")["payload"], PublishPlan)
+    request = decode_value(
+        json.loads((checkpoint / "request.json").read_text(encoding="utf-8")),
+        PublishCheckpointRequestRecord,
+    )
+    decision = decode_value(
+        json.loads((checkpoint / "decision.json").read_text(encoding="utf-8")),
+        CheckpointDecision,
+    )
+    push = decode_value(read_evidence(publish / "push.json")["payload"], PushReceipt)
+    pull_request = decode_value(
+        read_evidence(publish / "pull-request.json")["payload"], PullRequestReceipt
+    )
+    result = decode_value(read_evidence(publish / "result.json")["payload"], PublishResult)
+    verify_publish_evidence_chain(plan, request, decision, push, pull_request, result)
+
+
 def test_multiple_push_urls_are_rejected_before_checkpoint_or_remote_mutation(tmp_path) -> None:
     target, bare, _adapter = _single_target_with_remote(tmp_path)
     adapter = MultiplePushIdentityAdapter()
@@ -296,14 +396,46 @@ def test_finalized_local_chain_detects_recomputed_semantic_tamper_and_needs_no_p
     local = _runner(target, runtime, None, adapter).resume(pending.run_id or "")
     assert local.outcome is WriteSliceOutcome.DRAFT_PR_CREATED
     assert local.publish == completed.publish
+    checkpoint = _run_path(completed) / "checkpoints" / pending.checkpoint.checkpoint_id
+    terminal_artifacts = (
+        (publish / "plan.json", "publish_plan_missing"),
+        (checkpoint / "request.json", "publish_checkpoint_missing"),
+        (checkpoint / "decision.json", "publish_approval_missing"),
+        (publish / "push.json", "push_receipt_missing"),
+        (publish / "pull-request.json", "pull_request_receipt_missing"),
+        (publish / "result.json", "publish_result_missing"),
+    )
+    remote_calls = (remote.inspect_calls, remote.find_calls, remote.create_calls)
+    for path, expected_code in terminal_artifacts:
+        original = path.read_bytes()
+        path.unlink()
+        missing = _runner(target, runtime, None, adapter).resume(pending.run_id or "")
+        assert missing.outcome is WriteSliceOutcome.RECOVERY_REQUIRED
+        assert missing.issues[0].code == expected_code
+        assert (remote.inspect_calls, remote.find_calls, remote.create_calls) == remote_calls
+        path.write_bytes(original)
 
-    result_path = publish / "result.json"
-    result_bytes = result_path.read_bytes()
-    result_path.unlink()
-    missing = _runner(target, runtime, None, adapter).resume(pending.run_id or "")
-    assert missing.outcome is WriteSliceOutcome.RECOVERY_REQUIRED
-    assert missing.issues[0].code == "publish_result_missing"
-    result_path.write_bytes(result_bytes)
+    authority_paths = tuple(path for path, _code in terminal_artifacts)
+    originals = {path: path.read_bytes() for path in authority_paths}
+    authority_tampers = (
+        {"delivery_manifest_digest": "sha256:" + "0" * 64},
+        {"delivery_review_evidence_reference": "delivery-review/other-review.json"},
+    )
+    for changes in authority_tampers:
+        _rewrite_complete_publish_chain(
+            _run_path(completed), pending.checkpoint.checkpoint_id, **changes
+        )
+        _assert_complete_publish_chain_valid(_run_path(completed), pending.checkpoint.checkpoint_id)
+        tampered = _runner(target, runtime, None, adapter).resume(pending.run_id or "")
+        assert tampered.outcome is WriteSliceOutcome.RECOVERY_REQUIRED
+        assert tampered.issues[0].code == "publish_plan_mismatch"
+        assert (remote.inspect_calls, remote.find_calls, remote.create_calls) == remote_calls
+        for path, content in originals.items():
+            path.write_bytes(content)
+
+    final_local = _runner(target, runtime, None, adapter).resume(pending.run_id or "")
+    assert final_local.outcome is WriteSliceOutcome.DRAFT_PR_CREATED
+    assert final_local.publish == completed.publish
 
 
 def test_historical_m013_boundary_stays_inert_until_provider_is_supplied(tmp_path) -> None:

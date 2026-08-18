@@ -17,6 +17,7 @@ from agentgraph.core import (
     GraphEngine,
     PolicySnapshot,
     RepairClassification,
+    ReviewVerdict,
     RunStatus,
     canonical_v1_graph,
 )
@@ -724,15 +725,20 @@ class WriteSliceRunner:
             completed_items = controller.verified_completed
         publish_error = None
         publish_report = None
-        if (
-            controller.publish_execution is None
-            and (controller.run_path / "publish" / "plan.json").exists()
+        publication_expected = (
+            state.run.status is RunStatus.COMPLETED
+            and state.graph.current_node == "END"
+            and state.review.verdict is ReviewVerdict.PASS
+            and state.review.safe_to_create_pr
+        )
+        if controller.publish_execution is None and (
+            publication_expected or (controller.run_path / "publish" / "plan.json").exists()
         ):
             controller.publication()
         if controller.publish_execution is not None:
             try:
                 publish_report = controller.publish_execution.report(
-                    require_result=state.run.status is RunStatus.COMPLETED
+                    state, require_result=publication_expected
                 )
             except WorkspaceError as exc:
                 publish_error = exc
