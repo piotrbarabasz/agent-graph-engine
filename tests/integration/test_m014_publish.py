@@ -7,7 +7,7 @@ import pytest
 
 from agentgraph.adapters.speckit import SpecKitAdapter, SpecKitLayout
 from agentgraph.core import CheckpointOutcome, RunStatus
-from agentgraph.infra import GitAdapter, GitCommitIdentity
+from agentgraph.infra import GitAdapter, GitCommitIdentity, GitRemoteEndpoint
 from agentgraph.runtime import ProjectRegistry, RuntimePaths
 from agentgraph.runtime.codec import utc_now
 from agentgraph.write import (
@@ -24,13 +24,25 @@ from tests.integration.test_m013_delivery_review import DeliveryReviewer
 
 
 class IdentityGitAdapter(GitAdapter):
-    def remote_push_url(self, repository, remote_name):
-        super().remote_push_url(repository, remote_name)
-        return "https://github.com/owner/repository.git"
+    def remote_push_urls(self, repository, remote_name):
+        GitAdapter.remote_push_urls(self, repository, remote_name)
+        return ("https://github.com/owner/repository.git",)
 
-    def push_exact_branch(self, repository, **kwargs):
+    def _actual_endpoint(self, repository):
+        return GitRemoteEndpoint(GitAdapter.remote_push_urls(self, repository, "origin")[0])
+
+    def remote_branch_sha_at_endpoint(self, repository, endpoint, branch):
+        assert endpoint.url == "https://github.com/owner/repository.git"
+        return super().remote_branch_sha_at_endpoint(
+            repository, self._actual_endpoint(repository), branch
+        )
+
+    def push_exact_branch_to_endpoint(self, repository, **kwargs):
         self.push_calls = getattr(self, "push_calls", 0) + 1
-        return super().push_exact_branch(repository, **kwargs)
+        assert kwargs.pop("endpoint").url == "https://github.com/owner/repository.git"
+        return super().push_exact_branch_to_endpoint(
+            repository, endpoint=self._actual_endpoint(repository), **kwargs
+        )
 
 
 class FakeRemoteProvider:

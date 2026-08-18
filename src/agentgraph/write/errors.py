@@ -168,6 +168,10 @@ class PublishError(WriteSliceError):
 class PublishPreparationError(PublishError):
     code = "publish_preparation_blocked"
 
+    def __init__(self, code: str = "publish_preparation_blocked") -> None:
+        self.code = code
+        super().__init__(code)
+
 
 class PublishConflictError(PublishPreparationError):
     def __init__(self, code: str) -> None:

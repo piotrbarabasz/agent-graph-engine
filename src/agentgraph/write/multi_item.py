@@ -265,8 +265,6 @@ class MultiItemExecution:
         return self.delivery_review_execution
 
     def publication(self):
-        if self.remote_provider is None:
-            raise WritePreparationError("remote_provider_required")
         if self.publish_execution is None:
             from .publish import PublishExecution
 

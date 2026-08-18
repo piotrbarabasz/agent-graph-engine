@@ -94,7 +94,7 @@ from .multi_item import (
 )
 from .provider import ChangeProvider
 from .publish import CreatePullRequestNode, HumanCheckpointDispatchNode
-from .remote import RemoteProvider, RemoteServiceError
+from .remote import RemoteProvider
 
 
 class WriteSliceRunner:
@@ -724,9 +724,16 @@ class WriteSliceRunner:
             completed_items = controller.verified_completed
         publish_error = None
         publish_report = None
+        if (
+            controller.publish_execution is None
+            and (controller.run_path / "publish" / "plan.json").exists()
+        ):
+            controller.publication()
         if controller.publish_execution is not None:
             try:
-                publish_report = controller.publish_execution.report()
+                publish_report = controller.publish_execution.report(
+                    require_result=state.run.status is RunStatus.COMPLETED
+                )
             except WorkspaceError as exc:
                 publish_error = exc
         commits = tuple(item.commit_sha for item in completed_items)
@@ -850,17 +857,24 @@ class WriteSliceRunner:
         continue_run = False
         try:
             publish = controller.publication()
-            plan = publish.ensure_plan(state)
-            request, decision = publish.checkpoints().decision(state, plan)
-            if decision is None and not publish.checkpoints().expired(request):
-                return self._report(
-                    state,
-                    controller,
-                    executed,
-                    checkpoint=publish.checkpoints().view(request, plan),
-                )
-            if session is not None:
-                continue_run = True
+            _local_plan, _local_request, local_decision = (
+                publish.checkpoints().decision_for_consumption(state)
+            )
+            if local_decision is not None:
+                if session is not None:
+                    continue_run = True
+            else:
+                plan = publish.ensure_plan(state)
+                request, decision = publish.checkpoints().decision(state, plan)
+                if decision is None and not publish.checkpoints().expired(request):
+                    return self._report(
+                        state,
+                        controller,
+                        executed,
+                        checkpoint=publish.checkpoints().view(request, plan),
+                    )
+                if session is not None:
+                    continue_run = True
         except Exception as exc:
             recovery = isinstance(exc, (WorkspaceError, CheckpointError)) or getattr(
                 exc, "code", ""
@@ -870,8 +884,6 @@ class WriteSliceRunner:
                 "publish_plan_mismatch",
                 "publish_storage_invalid",
             }
-            if session is not None and isinstance(exc, RemoteServiceError):
-                return self._continue(session, state, controller, executed)
             return replace(
                 self._report(state, controller, executed),
                 outcome=(

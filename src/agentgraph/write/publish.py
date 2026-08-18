@@ -20,6 +20,7 @@ from agentgraph.core import (
     ReviewVerdict,
 )
 from agentgraph.infra.errors import GitError
+from agentgraph.infra.git import GitRemoteEndpoint
 from agentgraph.runtime import (
     CheckpointDecision,
     CheckpointStore,
@@ -54,6 +55,7 @@ from .publish_models import (
     PullRequestReceipt,
     PushReceipt,
     SafeGitCommandReceipt,
+    verify_publish_evidence_chain,
 )
 from .publish_storage import load_typed, persist_once
 from .remote import (
@@ -75,7 +77,7 @@ PUBLISH_CHECKPOINT_MESSAGE = "Exact draft pull-request publication requires appr
 @dataclass(slots=True)
 class PublishExecution:
     controller: object
-    provider: RemoteProvider
+    provider: RemoteProvider | None
     remote_name: str = "origin"
     clock: Callable[[], datetime] = utc_now
     nonce_factory: Callable[[], str] | None = None
@@ -100,15 +102,11 @@ class PublishExecution:
         self._require_publish_checkpoint(state)
         manifest, review, completed = self._delivery_authority(state)
         workspace = self._verify_local(manifest.final_head)
-        remote_url = self.controller.git.remote_push_url(workspace, self.remote_name)
-        reference = parse_github_remote_url(remote_url)
-        identity = self.provider.inspect_repository(reference)
-        if identity.full_name.lower() != reference.full_name.lower():
-            raise PublishPreparationError("remote_repository_identity_mismatch")
+        endpoint, identity = self._push_endpoint(workspace)
 
         existing = load_typed(self.run_path, "plan.json", PublishPlan, self.context)
-        observed = self.controller.git.remote_branch_sha(
-            workspace, self.remote_name, self.controller.run_inputs.scope_branch
+        observed = self.controller.git.remote_branch_sha_at_endpoint(
+            workspace, endpoint, self.controller.run_inputs.scope_branch
         )
         if observed not in {None, manifest.final_head}:
             raise PublishConflictError("remote_branch_conflict")
@@ -176,7 +174,7 @@ class PublishExecution:
         plan = self._load_plan_for_execution(state)
         request, decision = self.checkpoints().approved_for_create(state, plan)
         workspace = self._verify_local(plan.final_head)
-        self._verify_remote_identity(workspace, plan)
+        endpoint = self._verify_remote_identity(workspace, plan)
 
         restored = load_typed(self.run_path, "result.json", PublishResult, self.context)
         if restored is not None:
@@ -185,8 +183,8 @@ class PublishExecution:
             return restored
 
         push = load_typed(self.run_path, "push.json", PushReceipt, self.context)
-        before = self.controller.git.remote_branch_sha(
-            workspace, plan.remote_name, plan.remote_head_branch
+        before = self.controller.git.remote_branch_sha_at_endpoint(
+            workspace, endpoint, plan.remote_head_branch
         )
         if before not in {None, plan.final_head}:
             raise PublishConflictError("remote_branch_conflict")
@@ -194,9 +192,9 @@ class PublishExecution:
             command = None
             performed = False
             if before is None:
-                pushed = self.controller.git.push_exact_branch(
+                pushed = self.controller.git.push_exact_branch_to_endpoint(
                     workspace,
-                    remote_name=plan.remote_name,
+                    endpoint=endpoint,
                     commit_sha=plan.final_head,
                     remote_branch=plan.remote_head_branch,
                 )
@@ -207,8 +205,8 @@ class PublishExecution:
                     pushed.receipt.exit_code,
                 )
                 self.controller.fault("after_publish_push")
-            after = self.controller.git.remote_branch_sha(
-                workspace, plan.remote_name, plan.remote_head_branch
+            after = self.controller.git.remote_branch_sha_at_endpoint(
+                workspace, endpoint, plan.remote_head_branch
             )
             if after != plan.final_head:
                 raise PublishEvidenceError("remote_branch_verification_failed")
@@ -239,7 +237,7 @@ class PublishExecution:
             remote_pr = exact
             if remote_pr is None:
                 identity = self._identity(plan)
-                remote_pr = self.provider.create_draft_pull_request(
+                remote_pr = self._provider().create_draft_pull_request(
                     DraftPullRequestRequest(
                         identity,
                         plan.pr_title,
@@ -277,8 +275,8 @@ class PublishExecution:
             self._validate_pr_receipt(plan, pr_receipt)
 
         self._verify_local(plan.final_head)
-        final_remote_head = self.controller.git.remote_branch_sha(
-            workspace, plan.remote_name, plan.remote_head_branch
+        final_remote_head = self.controller.git.remote_branch_sha_at_endpoint(
+            workspace, endpoint, plan.remote_head_branch
         )
         if final_remote_head != plan.final_head:
             raise PublishEvidenceError("remote_branch_verification_failed")
@@ -288,6 +286,7 @@ class PublishExecution:
             run_id=plan.run_id,
             scope_id=plan.scope_id,
             publish_plan_digest=plan.digest,
+            checkpoint_id=request.checkpoint_id,
             checkpoint_request_digest=request.request_digest,
             checkpoint_decision_digest=decision.decision_digest,
             final_head=plan.final_head,
@@ -306,15 +305,38 @@ class PublishExecution:
         self.result = result
         return result
 
-    def report(self) -> PublishReport | None:
+    def report(self, *, require_result: bool = False) -> PublishReport | None:
         result = self.result or load_typed(
             self.run_path, "result.json", PublishResult, self.context
         )
         if result is None:
+            if require_result:
+                raise PublishEvidenceError("publish_result_missing")
             return None
         plan = self.plan or load_typed(self.run_path, "plan.json", PublishPlan, self.context)
-        if plan is None or result.publish_plan_digest != plan.digest:
+        if plan is None:
+            raise PublishEvidenceError("publish_plan_missing")
+        try:
+            request = self.checkpoints().store.load_typed_request(
+                result.checkpoint_id, PublishCheckpointRequestRecord
+            )
+        except CheckpointEvidenceError as exc:
+            raise PublishEvidenceError("publish_checkpoint_evidence_invalid") from exc
+        if request is None:
+            raise PublishEvidenceError("publish_checkpoint_missing")
+        try:
+            decision = self.checkpoints()._load_decision(request)
+        except CheckpointError as exc:
+            raise PublishEvidenceError("publish_checkpoint_evidence_invalid") from exc
+        if decision is None:
+            raise PublishEvidenceError("publish_approval_missing")
+        push = load_typed(self.run_path, "push.json", PushReceipt, self.context)
+        pull_request = load_typed(
+            self.run_path, "pull-request.json", PullRequestReceipt, self.context
+        )
+        if push is None or pull_request is None:
             raise PublishEvidenceError("publish_result_mismatch")
+        verify_publish_evidence_chain(plan, request, decision, push, pull_request, result)
         self.result = result
         return PublishReport(
             result.remote_repository_full_name,
@@ -334,22 +356,19 @@ class PublishExecution:
         result = load_typed(self.run_path, "result.json", PublishResult, self.context)
         if result is None:
             raise PublishEvidenceError("publish_result_missing")
-        offset = 1 if state.graph.current_node == "CREATE_PR" else 2
-        checkpoint_id = f"checkpoint-{state.state_version - offset}-create_pr"
         request = self.checkpoints().store.load_typed_request(
-            checkpoint_id, PublishCheckpointRequestRecord
+            result.checkpoint_id, PublishCheckpointRequestRecord
         )
         if request is None:
             raise PublishEvidenceError("publish_checkpoint_missing")
-        PublishCheckpointController._validate_static_plan_binding(request, plan)
         decision = self.checkpoints()._load_decision(request)
-        if (
-            decision is None
-            or decision.outcome is not CheckpointOutcome.APPROVED
-            or result.checkpoint_request_digest != request.request_digest
-            or result.checkpoint_decision_digest != decision.decision_digest
-        ):
-            raise PublishEvidenceError("publish_checkpoint_binding_mismatch")
+        push = load_typed(self.run_path, "push.json", PushReceipt, self.context)
+        pull_request = load_typed(
+            self.run_path, "pull-request.json", PullRequestReceipt, self.context
+        )
+        if decision is None or push is None or pull_request is None:
+            raise PublishEvidenceError("publish_result_mismatch")
+        verify_publish_evidence_chain(plan, request, decision, push, pull_request, result)
         self._verify_completed(plan, result)
 
     def checkpoints(self) -> PublishCheckpointController:
@@ -365,16 +384,28 @@ class PublishExecution:
             self.checkpoints().approved_for_create(state, plan)
             self._verify_local(plan.final_head)
             workspace = self.controller.git.discover_repository(self.run_path / "workspace")
-            self._verify_remote_identity(workspace, plan)
-            branch = self.controller.git.remote_branch_sha(
-                workspace,
-                plan.remote_name,
-                plan.remote_head_branch,
+            endpoint = self._verify_remote_identity(workspace, plan)
+            branch = self.controller.git.remote_branch_sha_at_endpoint(
+                workspace, endpoint, plan.remote_head_branch
             )
             if branch not in {None, plan.final_head}:
                 return InterruptedSideEffectAssessment(False, "remote_branch_conflict")
             matches = self._find(plan)
             self._verify_pr_set(plan, matches, allow_none=True)
+            push = load_typed(self.run_path, "push.json", PushReceipt, self.context)
+            pull_request = load_typed(
+                self.run_path, "pull-request.json", PullRequestReceipt, self.context
+            )
+            result = load_typed(self.run_path, "result.json", PublishResult, self.context)
+            if push is not None:
+                self._validate_push(plan, push, branch)
+            if pull_request is not None:
+                self._validate_pr_receipt(plan, pull_request)
+            if result is not None:
+                request, decision = self.checkpoints().approved_for_create(state, plan)
+                if push is None or pull_request is None:
+                    raise PublishEvidenceError("publish_result_mismatch")
+                verify_publish_evidence_chain(plan, request, decision, push, pull_request, result)
             return InterruptedSideEffectAssessment(
                 True,
                 "create_pr_reconciled_safe_rerun",
@@ -430,16 +461,34 @@ class PublishExecution:
             raise WorkspaceError("publish_local_head_drift")
         return workspace
 
-    def _verify_remote_identity(self, workspace, plan):
-        remote_url = self.controller.git.remote_push_url(workspace, plan.remote_name)
-        reference = parse_github_remote_url(remote_url)
-        identity = self.provider.inspect_repository(reference)
-        if (
+    def _push_endpoint(self, workspace, plan=None):
+        remote_name = self.remote_name if plan is None else plan.remote_name
+        urls = self.controller.git.remote_push_urls(workspace, remote_name)
+        if len(urls) != 1:
+            raise PublishPreparationError("multiple_push_targets_not_supported")
+        endpoint = GitRemoteEndpoint(urls[0])
+        reference = parse_github_remote_url(endpoint.url)
+        identity = self._provider().inspect_repository(reference)
+        if identity.full_name.lower() != reference.full_name.lower():
+            raise PublishPreparationError("remote_repository_identity_mismatch")
+        if plan is not None and (
             reference.host != plan.remote_host
             or reference.full_name.lower() != plan.remote_repository_full_name.lower()
             or identity != self._identity(plan)
         ):
             raise PublishEvidenceError("publish_remote_identity_mismatch")
+        return endpoint, identity
+
+    def _verify_remote_identity(self, workspace, plan):
+        endpoint, identity = self._push_endpoint(workspace, plan)
+        if identity != self._identity(plan):
+            raise PublishEvidenceError("publish_remote_identity_mismatch")
+        return endpoint
+
+    def _provider(self) -> RemoteProvider:
+        if self.provider is None:
+            raise PublishPreparationError("remote_provider_required")
+        return self.provider
 
     def _load_plan_for_execution(self, state):
         plan = load_typed(self.run_path, "plan.json", PublishPlan, self.context)
@@ -464,7 +513,7 @@ class PublishExecution:
         return plan
 
     def _find(self, plan):
-        return self.provider.find_open_pull_requests(
+        return self._provider().find_open_pull_requests(
             self._identity(plan),
             head_branch=plan.remote_head_branch,
             base_branch=plan.base_branch,
@@ -504,6 +553,7 @@ class PublishExecution:
             receipt.publish_plan_digest != plan.digest
             or receipt.operation_id != plan.operation_id
             or receipt.remote_repository_id != plan.remote_repository_id
+            or receipt.remote_repository_full_name != plan.remote_repository_full_name
             or receipt.remote_branch != plan.remote_head_branch
             or receipt.expected_final_head != plan.final_head
             or receipt.observed_after_sha != plan.final_head
@@ -516,6 +566,7 @@ class PublishExecution:
             receipt.publish_plan_digest != plan.digest
             or receipt.operation_id != plan.operation_id
             or receipt.remote_repository_id != plan.remote_repository_id
+            or receipt.remote_repository_full_name != plan.remote_repository_full_name
             or receipt.head_branch != plan.remote_head_branch
             or receipt.head_sha != plan.final_head
             or receipt.base_branch != plan.base_branch
@@ -524,14 +575,23 @@ class PublishExecution:
             raise PublishEvidenceError("pull_request_receipt_mismatch")
         matches = self._find(plan)
         exact = self._verify_pr_set(plan, matches, allow_none=False)
-        if exact.pr_id != receipt.pr_id or exact.number != receipt.pr_number:
+        if (
+            exact.pr_id != receipt.pr_id
+            or exact.number != receipt.pr_number
+            or exact.url != receipt.pr_url
+            or exact.repository.full_name != receipt.remote_repository_full_name
+            or exact.head_branch != receipt.head_branch
+            or exact.head_sha != receipt.head_sha
+            or exact.base_branch != receipt.base_branch
+            or exact.draft != receipt.draft
+        ):
             raise PublishEvidenceError("pull_request_receipt_mismatch")
 
     def _verify_completed(self, plan, result):
         workspace = self._verify_local(plan.final_head)
-        self._verify_remote_identity(workspace, plan)
-        live = self.controller.git.remote_branch_sha(
-            workspace, plan.remote_name, plan.remote_head_branch
+        endpoint = self._verify_remote_identity(workspace, plan)
+        live = self.controller.git.remote_branch_sha_at_endpoint(
+            workspace, endpoint, plan.remote_head_branch
         )
         push = load_typed(self.run_path, "push.json", PushReceipt, self.context)
         pr = load_typed(self.run_path, "pull-request.json", PullRequestReceipt, self.context)
@@ -539,12 +599,15 @@ class PublishExecution:
             raise PublishEvidenceError("publish_result_mismatch")
         self._validate_push(plan, push, live)
         self._validate_pr_receipt(plan, pr)
-        if (
-            result.publish_plan_digest != plan.digest
-            or result.push_receipt_digest != push.digest
-            or result.pr_receipt_digest != pr.digest
-        ):
+        request = self.checkpoints().store.load_typed_request(
+            result.checkpoint_id, PublishCheckpointRequestRecord
+        )
+        if request is None:
+            raise PublishEvidenceError("publish_checkpoint_missing")
+        decision = self.checkpoints()._load_decision(request)
+        if decision is None:
             raise PublishEvidenceError("publish_result_mismatch")
+        verify_publish_evidence_chain(plan, request, decision, push, pr, result)
 
     @staticmethod
     def _require_publish_checkpoint(state):
@@ -612,6 +675,41 @@ class PublishCheckpointController:
     def decision(self, state, plan=None):
         request = self.ensure_request(state, plan)
         return request, self._load_decision(request)
+
+    def decision_for_consumption(self, state):
+        """Load a persisted decision using durable local bindings only."""
+
+        PublishExecution._require_publish_checkpoint(state)
+        plan = load_typed(
+            self.execution.run_path,
+            "plan.json",
+            PublishPlan,
+            self.execution.context,
+        )
+        if plan is None:
+            return None, None, None
+        run = self.execution.controller.run_inputs
+        if (
+            plan.project_id != run.project_id
+            or plan.run_id != self.execution.controller.run_id
+            or plan.scope_id != run.scope_id
+            or plan.source_revision != run.source_revision
+            or plan.work_plan_digest != run.work_plan_digest
+            or plan.target_baseline_head != run.target_baseline_head
+            or plan.local_scope_branch != run.scope_branch
+            or plan.remote_head_branch != run.scope_branch
+            or plan.base_branch != run.base_branch
+        ):
+            raise PublishEvidenceError("publish_plan_mismatch")
+        checkpoint_id = self.checkpoint_id(state)
+        try:
+            request = self.store.load_typed_request(checkpoint_id, PublishCheckpointRequestRecord)
+        except CheckpointEvidenceError as exc:
+            raise CheckpointBindingError("checkpoint_evidence_invalid") from exc
+        if request is None:
+            return plan, None, None
+        self._validate(request, self._binding(state, plan, checkpoint_id))
+        return plan, request, self._load_decision(request)
 
     def submit(self, state, *, checkpoint_id, nonce, outcome, actor):
         request = self.ensure_request(state)
@@ -803,6 +901,22 @@ class HumanCheckpointDispatchNode:
             )
         publish = self.controller.publication()
         try:
+            _local_plan, local_request, local_decision = (
+                publish.checkpoints().decision_for_consumption(state)
+            )
+            if local_decision is not None:
+                return NodeResult(
+                    self.node_id,
+                    context.node_attempt_id,
+                    NodeStatus.SUCCEEDED,
+                    checkpoint_outcome=local_decision.outcome,
+                    evidence=(
+                        Evidence(
+                            "human_checkpoint",
+                            publish.checkpoints().decision_reference(local_request),
+                        ),
+                    ),
+                )
             plan = publish.ensure_plan(state)
             request, decision = publish.checkpoints().decision(state, plan)
         except Exception as exc:

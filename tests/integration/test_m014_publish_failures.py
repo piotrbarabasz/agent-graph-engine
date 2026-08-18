@@ -36,6 +36,7 @@ from agentgraph.write.publish import PublishCheckpointController
 from tests.integration.conftest import git
 from tests.integration.test_m014_publish import (
     FakeRemoteProvider,
+    IdentityGitAdapter,
     OneShotFault,
     _runner,
     _single_target_with_remote,
@@ -66,9 +67,11 @@ class InspectFailureProvider(FakeRemoteProvider):
         self.error = error
 
     def inspect_repository(self, repository):
-        del repository
         self.inspect_calls += 1
-        raise self.error
+        if self.error is not None:
+            raise self.error
+        assert repository.full_name == self.repository.full_name
+        return self.repository
 
 
 class CreateContractFailureProvider(FakeRemoteProvider):
@@ -86,6 +89,15 @@ class ToggleFindFailureProvider(FakeRemoteProvider):
             raise RemoteServiceError("service unavailable")
         return super().find_open_pull_requests(
             repository, head_branch=head_branch, base_branch=base_branch
+        )
+
+
+class MultiplePushIdentityAdapter(IdentityGitAdapter):
+    def remote_push_urls(self, repository, remote_name):
+        super().remote_push_urls(repository, remote_name)
+        return (
+            "https://github.com/owner/repository.git",
+            "https://github.com/owner/other.git",
         )
 
 
@@ -166,6 +178,132 @@ def _rewrite_self_digested(path: Path, field: str, value: object, digest_field: 
         {key: item for key, item in document.items() if key != digest_field}
     )
     path.write_bytes(canonical_json_bytes(document))
+
+
+def _rewrite_publish_payload(path: Path, **changes: object) -> None:
+    document = json.loads(path.read_text(encoding="utf-8"))
+    payload = document["payload"]
+    payload.update(changes)
+    payload["digest"] = sha256_digest(
+        {key: item for key, item in payload.items() if key != "digest"}
+    )
+    document["content_digest"] = sha256_digest(
+        {key: item for key, item in document.items() if key != "content_digest"}
+    )
+    path.write_bytes(canonical_json_bytes(document))
+
+
+def test_multiple_push_urls_are_rejected_before_checkpoint_or_remote_mutation(tmp_path) -> None:
+    target, bare, _adapter = _single_target_with_remote(tmp_path)
+    adapter = MultiplePushIdentityAdapter()
+    remote = FakeRemoteProvider()
+
+    final = _runner(target, tmp_path / "runtime", remote, adapter).run(
+        WriteSliceRequest(scope_id="E001")
+    )
+
+    assert final.outcome is WriteSliceOutcome.PUBLISH_PREPARATION_BLOCKED
+    assert final.issues[0].code == "multiple_push_targets_not_supported"
+    assert final.checkpoint is None
+    assert final.graph_state.run.status is RunStatus.RUNNING
+    assert remote.inspect_calls == 0
+    assert remote.create_calls == 0
+    assert git(bare, "for-each-ref", "--format=%(refname)") == b""
+
+
+def test_remote_failure_after_plan_before_approval_retries_same_checkpoint(tmp_path) -> None:
+    target, _bare, adapter = _single_target_with_remote(tmp_path)
+    remote = InspectFailureProvider(None)
+    runtime = tmp_path / "runtime"
+    runner = _runner(target, runtime, remote, adapter)
+    pending = runner.run(WriteSliceRequest(scope_id="E001"))
+    remote.error = RemoteServiceError("service unavailable")
+
+    blocked = runner.resume(pending.run_id or "")
+
+    assert blocked.outcome is WriteSliceOutcome.PUBLISH_PREPARATION_BLOCKED
+    assert blocked.graph_state.run.status is RunStatus.RUNNING
+    assert blocked.graph_state.graph.current_node == "HUMAN_CHECKPOINT"
+    assert blocked.graph_state.state_version == pending.graph_state.state_version
+    remote.error = None
+    retried = runner.resume(pending.run_id or "")
+    assert retried.outcome is WriteSliceOutcome.PUBLISH_CHECKPOINT_REQUIRED
+    assert retried.checkpoint.checkpoint_id == pending.checkpoint.checkpoint_id
+
+
+def test_approved_human_decision_is_consumed_without_network(tmp_path) -> None:
+    target, _bare, adapter = _single_target_with_remote(tmp_path)
+    remote = InspectFailureProvider(None)
+    runtime = tmp_path / "runtime"
+    runner = _runner(target, runtime, remote, adapter)
+    pending = runner.run(WriteSliceRequest(scope_id="E001"))
+    _approve(runner, pending)
+    calls = remote.inspect_calls
+    remote.error = RemoteServiceError("service unavailable")
+
+    final = _runner(target, runtime, remote, adapter).resume(pending.run_id or "")
+
+    assert remote.inspect_calls == calls + 1
+    assert final.graph_state.graph.current_node == "END"
+    assert final.issues[0].code == "remote_service_unavailable"
+    assert remote.create_calls == 0
+    assert getattr(adapter, "push_calls", 0) == 0
+
+
+def test_finalized_local_chain_detects_recomputed_semantic_tamper_and_needs_no_provider(
+    tmp_path,
+) -> None:
+    target, _bare, adapter = _single_target_with_remote(tmp_path)
+    remote = FakeRemoteProvider()
+    runtime = tmp_path / "runtime"
+    runner = _runner(target, runtime, remote, adapter)
+    pending = runner.run(WriteSliceRequest(scope_id="E001"))
+    _approve(runner, pending)
+    completed = runner.resume(pending.run_id or "")
+    assert completed.outcome is WriteSliceOutcome.DRAFT_PR_CREATED
+    publish = _run_path(completed) / "publish"
+    cases = (
+        (
+            publish / "result.json",
+            {
+                "remote_repository_full_name": "other/repository",
+                "pr_url": "https://github.com/other/repository/pull/7",
+            },
+        ),
+        (
+            publish / "result.json",
+            {"checkpoint_request_digest": "sha256:" + "0" * 64},
+        ),
+        (
+            publish / "pull-request.json",
+            {
+                "remote_repository_full_name": "other/repository",
+                "pr_url": "https://github.com/other/repository/pull/7",
+            },
+        ),
+        (
+            publish / "push.json",
+            {"performed_push": False, "command_receipt": None},
+        ),
+    )
+    for path, changes in cases:
+        original = path.read_bytes()
+        _rewrite_publish_payload(path, **changes)
+        tampered = _runner(target, runtime, None, adapter).resume(pending.run_id or "")
+        assert tampered.outcome is WriteSliceOutcome.RECOVERY_REQUIRED
+        path.write_bytes(original)
+
+    local = _runner(target, runtime, None, adapter).resume(pending.run_id or "")
+    assert local.outcome is WriteSliceOutcome.DRAFT_PR_CREATED
+    assert local.publish == completed.publish
+
+    result_path = publish / "result.json"
+    result_bytes = result_path.read_bytes()
+    result_path.unlink()
+    missing = _runner(target, runtime, None, adapter).resume(pending.run_id or "")
+    assert missing.outcome is WriteSliceOutcome.RECOVERY_REQUIRED
+    assert missing.issues[0].code == "publish_result_missing"
+    result_path.write_bytes(result_bytes)
 
 
 def test_historical_m013_boundary_stays_inert_until_provider_is_supplied(tmp_path) -> None:
@@ -350,19 +488,25 @@ def test_exact_existing_marker_pull_request_is_adopted_without_duplicate(tmp_pat
     "error",
     (RemoteAuthenticationError("authentication failed"), RemoteServiceError("service unavailable")),
 )
-def test_remote_operational_failure_blocks_without_false_publication(tmp_path, error) -> None:
+def test_remote_operational_failure_is_nonterminal_and_retryable(tmp_path, error) -> None:
     target, _bare, adapter = _single_target_with_remote(tmp_path)
     remote = InspectFailureProvider(error)
 
-    final = _runner(target, tmp_path / "runtime", remote, adapter).run(
-        WriteSliceRequest(scope_id="E001")
-    )
+    runtime = tmp_path / "runtime"
+    final = _runner(target, runtime, remote, adapter).run(WriteSliceRequest(scope_id="E001"))
 
-    assert final.outcome is WriteSliceOutcome.BLOCKED
-    assert final.graph_state.run.status is RunStatus.BLOCKED
+    assert final.outcome is WriteSliceOutcome.PUBLISH_PREPARATION_BLOCKED
+    assert final.graph_state.run.status is RunStatus.RUNNING
+    assert final.graph_state.graph.current_node == "HUMAN_CHECKPOINT"
+    assert final.graph_state.graph.pending_resume_node == "CREATE_PR"
     assert final.publish is None
     assert remote.create_calls == 0
     assert getattr(adapter, "push_calls", 0) == 0
+
+    remote.error = None
+    retried = _runner(target, runtime, remote, adapter).resume(final.run_id or "")
+
+    assert retried.outcome is WriteSliceOutcome.PUBLISH_CHECKPOINT_REQUIRED
 
 
 def test_malformed_create_response_is_terminal_contract_failure(tmp_path) -> None:
@@ -479,6 +623,56 @@ def test_interrupted_create_pr_never_claims_safe_rerun_when_service_is_unavailab
     assert recovered.outcome is WriteSliceOutcome.RECOVERY_REQUIRED
     assert recovered.issues[0].code == "publish_reconciliation_unavailable"
     assert remote.create_calls == 0
+
+
+@pytest.mark.parametrize(
+    ("stage", "evidence_name", "changes"),
+    (
+        (
+            "after_publish_push_receipt",
+            "push.json",
+            {"remote_repository_full_name": "other/repository"},
+        ),
+        (
+            "after_publish_pr_receipt",
+            "pull-request.json",
+            {
+                "remote_repository_full_name": "other/repository",
+                "pr_url": "https://github.com/other/repository/pull/7",
+            },
+        ),
+        (
+            "after_publish_result",
+            "result.json",
+            {"checkpoint_decision_digest": "sha256:" + "0" * 64},
+        ),
+    ),
+)
+def test_partial_self_digested_publication_corruption_requires_recovery(
+    tmp_path, stage, evidence_name, changes
+) -> None:
+    target, _bare, adapter = _single_target_with_remote(tmp_path)
+    remote = FakeRemoteProvider()
+    runtime = tmp_path / "runtime"
+    runner = _runner(
+        target,
+        runtime,
+        remote,
+        adapter,
+        fault=OneShotFault(stage),
+    )
+    pending = runner.run(WriteSliceRequest(scope_id="E001"))
+    _approve(runner, pending)
+    with pytest.raises(RuntimeError, match="injected M014 interruption"):
+        runner.resume(pending.run_id or "")
+    path = _run_path(pending) / "publish" / evidence_name
+    _rewrite_publish_payload(path, **changes)
+    calls = (remote.create_calls, getattr(adapter, "push_calls", 0))
+
+    recovered = _runner(target, runtime, remote, adapter).resume(pending.run_id or "")
+
+    assert recovered.outcome is WriteSliceOutcome.RECOVERY_REQUIRED
+    assert (remote.create_calls, getattr(adapter, "push_calls", 0)) == calls
 
 
 def test_finalized_publish_is_historical_after_remote_pr_lifecycle_change(tmp_path) -> None:
