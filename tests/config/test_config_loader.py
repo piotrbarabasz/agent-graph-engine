@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import hashlib
 import os
 from pathlib import Path
 
 import pytest
 
-from agentgraph.config import ConfigError, load_project_config
+from agentgraph.config import ConfigError, load_project_config, load_project_config_snapshot
 
 
 def test_loads_typed_canonical_config(config_root: Path) -> None:
@@ -16,6 +17,28 @@ def test_loads_typed_canonical_config(config_root: Path) -> None:
     assert config.agents.codex.timeout_seconds == 900
     assert config.policy.max_repair_cycles == 2
     assert config.publish.remote == "origin"
+
+
+def test_config_snapshot_digest_is_from_the_exact_bytes_parsed(
+    config_root: Path, monkeypatch
+) -> None:
+    path = config_root / ".agentgraph.yml"
+    raw = path.read_bytes()
+    read_bytes = Path.read_bytes
+
+    def read_then_change_config(candidate: Path) -> bytes:
+        content = read_bytes(candidate)
+        if candidate == path:
+            path.write_bytes(raw.replace(b"max_repair_cycles: 2", b"max_repair_cycles: 1"))
+        return content
+
+    monkeypatch.setattr(Path, "read_bytes", read_then_change_config)
+
+    loaded = load_project_config_snapshot(config_root)
+
+    assert loaded.config.policy.max_repair_cycles == 2
+    assert loaded.raw_content_digest == f"sha256:{hashlib.sha256(raw).hexdigest()}"
+    assert b"max_repair_cycles: 1" in read_bytes(path)
 
 
 def _replace_section(config_text: str, start: str, end: str, replacement: str) -> str:

@@ -2,13 +2,20 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
+import stat
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
 
 from agentgraph.adapters.speckit import SpecKitAdapter, SpecKitLayout
-from agentgraph.config import AgentGraphConfig, ExecutionProfile, load_project_config
+from agentgraph.config import (
+    CONFIG_NAME,
+    AgentGraphConfig,
+    ExecutionProfile,
+    load_project_config_snapshot,
+)
 from agentgraph.core import CheckpointOutcome
 from agentgraph.infra import GitAdapter, ProcessRunner
 from agentgraph.providers.codex import CodexAgentProvider, CodexChangeProvider, CodexProviderConfig
@@ -31,9 +38,15 @@ from .status import StatusReport, StatusService
 class _ProductionGitAdapter:
     """Delegate Git while allowing semantic-only config edits during explicit resume."""
 
-    def __init__(self, delegate: GitAdapter, repository_root: Path) -> None:
+    def __init__(
+        self,
+        delegate: GitAdapter,
+        repository_root: Path,
+        config_content_digest: str,
+    ) -> None:
         self._delegate = delegate
         self._repository_root = repository_root
+        self._config_content_digest = config_content_digest
         self.runner = delegate.runner
         self._allow_config_only_dirty = False
 
@@ -50,9 +63,54 @@ class _ProductionGitAdapter:
             and snapshot.unstaged_paths == (config_path,)
             and not snapshot.untracked_paths
             and not snapshot.conflicted_paths
+            and self._config_matches_pinned_bytes()
         ):
             return replace(snapshot, unstaged_paths=(), dirty=False)
         return snapshot
+
+    def require_pinned_config(self) -> None:
+        if not self._config_matches_pinned_bytes():
+            raise CliError(
+                "config_snapshot_mismatch",
+                "configuration changed after application composition",
+            )
+
+    def _config_matches_pinned_bytes(self) -> bool:
+        path = self._repository_root / CONFIG_NAME
+        try:
+            before = path.lstat()
+            attributes = getattr(before, "st_file_attributes", 0)
+            if (
+                stat.S_ISLNK(before.st_mode)
+                or bool(attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0))
+                or not stat.S_ISREG(before.st_mode)
+            ):
+                return False
+            raw = path.read_bytes()
+            after = path.lstat()
+        except OSError:
+            return False
+        after_attributes = getattr(after, "st_file_attributes", 0)
+        if (
+            stat.S_ISLNK(after.st_mode)
+            or bool(after_attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0))
+            or not stat.S_ISREG(after.st_mode)
+        ):
+            return False
+
+        def identity(value):
+            return (
+                value.st_dev,
+                value.st_ino,
+                value.st_mode,
+                value.st_size,
+                value.st_mtime_ns,
+            )
+
+        if identity(before) != identity(after):
+            return False
+        digest = f"sha256:{hashlib.sha256(raw).hexdigest()}"
+        return digest == self._config_content_digest
 
     @contextmanager
     def config_only_resume(self):
@@ -96,6 +154,7 @@ class AgentGraphApplication:
 
     def resume(self, run_id: str | None) -> WriteSliceReport:
         _project_id, selected = self.status_service.resolve_run_id(run_id)
+        self.git_adapter.require_pinned_config()
         with self.git_adapter.config_only_resume():
             return self.runner.resume(selected)
 
@@ -152,8 +211,9 @@ def build_application(
     )
     base_git = overrides.git_adapter or GitAdapter(processes)
     repository = base_git.discover_repository(repository_path)
-    git = _ProductionGitAdapter(base_git, repository.root)
-    config = load_project_config(repository.root)
+    loaded_config = load_project_config_snapshot(repository.root)
+    config = loaded_config.config
+    git = _ProductionGitAdapter(base_git, repository.root, loaded_config.raw_content_digest)
     executable = _codex_executable(codex_executable)
     profile = ExecutionProfile.create(config, executable)
     paths = RuntimePaths.resolve(runtime_home)

@@ -2,7 +2,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from agentgraph.cli import ProviderOverrides, build_application
+from agentgraph.cli.errors import CliError
 from agentgraph.core import CheckpointOutcome
 from agentgraph.infra import CommandReceipt, GitPushResult, ProcessStatus, ProcessTermination
 from agentgraph.write import WriteSliceOutcome
@@ -211,3 +214,58 @@ def test_comment_only_config_change_after_publish_approval_can_resume(
     assert resumed.outcome is WriteSliceOutcome.DRAFT_PR_CREATED
     assert remote.create_calls == 1
     assert adapter.push_calls == 1
+
+
+def test_config_change_after_application_composition_blocks_before_remote_effect(
+    tmp_path: Path, tmp_path_factory, config_text: str
+) -> None:
+    target, _bare, _adapter = _target_with_remote(tmp_path)
+    adapter = SimulatedPublishGitAdapter()
+    path = target / ".agentgraph.yml"
+    path.write_text(
+        config_text.replace(
+            "  semantic: true\n  delivery: true",
+            "  semantic: false\n  delivery: true",
+        ),
+        encoding="utf-8",
+    )
+    git(target, "add", "--all")
+    git(target, "commit", "--quiet", "-m", "agentgraph config")
+    runtime = tmp_path_factory.mktemp("composed")
+    remote = FakeRemoteProvider()
+    provider = PerItemProvider()
+    app = build_application(
+        target,
+        runtime_home=runtime,
+        provider_overrides=ProviderOverrides(
+            git_adapter=adapter,
+            change_provider=provider,
+            general_agent_provider=FilesystemDeclaredProvider(),
+            delivery_review_provider=DeliveryReviewer(),
+            remote_provider=remote,
+        ),
+    )
+    pending = app.run("E001", None)
+    assert pending.run_id is not None
+    app.submit_checkpoint(
+        pending.run_id,
+        outcome=CheckpointOutcome.APPROVED,
+        actor="Piotr",
+    )
+    before = (remote.inspect_calls, remote.find_calls, remote.create_calls, adapter.push_calls)
+    provider_calls = tuple(provider.item_ids)
+    path.write_text(
+        "# changed after composition\n" + path.read_text(encoding="utf-8"), encoding="utf-8"
+    )
+
+    with pytest.raises(CliError) as error:
+        app.resume(pending.run_id)
+
+    assert error.value.code == "config_snapshot_mismatch"
+    assert (
+        remote.inspect_calls,
+        remote.find_calls,
+        remote.create_calls,
+        adapter.push_calls,
+    ) == before
+    assert tuple(provider.item_ids) == provider_calls

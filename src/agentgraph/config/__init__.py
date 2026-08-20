@@ -1,7 +1,13 @@
 """Public production configuration API."""
 
 from .errors import ConfigError
-from .loader import CONFIG_NAME, MAX_CONFIG_BYTES, load_project_config
+from .loader import (
+    CONFIG_NAME,
+    MAX_CONFIG_BYTES,
+    LoadedProjectConfig,
+    load_project_config,
+    load_project_config_snapshot,
+)
 from .models import (
     AgentGraphConfig,
     AgentsConfig,
@@ -22,10 +28,12 @@ __all__ = [
     "CodexConfig",
     "ConfigError",
     "ExecutionProfile",
+    "LoadedProjectConfig",
     "PolicyConfig",
     "PublishConfig",
     "ReviewConfig",
     "SpecKitConfig",
     "WorkConfig",
     "load_project_config",
+    "load_project_config_snapshot",
 ]

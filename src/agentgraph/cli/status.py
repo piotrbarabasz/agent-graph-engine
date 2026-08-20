@@ -20,9 +20,14 @@ from agentgraph.write import (
     CommitWitness,
     PublishCheckpointRequestRecord,
     PublishPlan,
+    WorkPlan,
+    WriteInputs,
     WriteRunInputs,
+    write_run_inputs_digest,
 )
 from agentgraph.write.evidence import read_evidence
+from agentgraph.write.item_storage import verify_item_storage
+from agentgraph.write.multi_item import item_root as work_plan_item_root
 from agentgraph.write.publish_history import (
     read_local_publish_history,
     verify_publish_checkpoint_plan_binding,
@@ -215,7 +220,7 @@ class StatusService:
                     "checkpoint_not_materialized",
                     f"checkpoint is not materialized; run agentgraph resume {selected}",
                 )
-            self._validate_current_checkpoint(request, state, run_inputs)
+            self._validate_current_checkpoint(run_path, request, state, run_inputs)
             view = self._safe_checkpoint(run_path, request, run_inputs, state)
             return MaterializedCheckpoint(view, request.nonce)
         except CliError:
@@ -260,7 +265,7 @@ class StatusService:
             request = store.load_request(checkpoint_id)
         if request is None:
             return None
-        self._validate_current_checkpoint(request, state, inputs)
+        self._validate_current_checkpoint(run_path, request, state, inputs)
         return self._safe_checkpoint(run_path, request, inputs, state)
 
     def _safe_checkpoint(self, run_path, request, inputs, state) -> SafeCheckpoint:
@@ -339,7 +344,13 @@ class StatusService:
             report.publish_plan_digest,
         )
 
-    def _validate_current_checkpoint(self, request, state, inputs) -> None:
+    def _validate_current_checkpoint(self, run_path, request, state, inputs) -> None:
+        item_inputs = None
+        if not isinstance(request, PublishCheckpointRequestRecord):
+            item_inputs = self._current_item_inputs(run_path, state, inputs)
+        source_revision = (
+            inputs.source_revision if item_inputs is None else item_inputs.source_revision
+        )
         expected = {
             "checkpoint_id": self._checkpoint_id(
                 state.state_version, state.graph.pending_resume_node
@@ -350,19 +361,19 @@ class StatusService:
             "pending_resume_node": state.graph.pending_resume_node,
             "state_version": state.state_version,
             "state_digest": StateStore.digest_for_state(state),
-            "source_revision": inputs.source_revision,
+            "source_revision": source_revision,
         }
         if any(getattr(request, name, None) != value for name, value in expected.items()):
             raise CliError(
                 "checkpoint_binding_mismatch",
                 "checkpoint request does not bind the current paused state",
             )
-        lifetime = parse_timestamp(request.expires_at) - parse_timestamp(request.created_at)
-        if lifetime.total_seconds() != inputs.checkpoint_ttl_seconds:
-            raise CliError(
-                "checkpoint_binding_mismatch", "checkpoint lifetime authority is invalid"
-            )
         if isinstance(request, PublishCheckpointRequestRecord):
+            lifetime = parse_timestamp(request.expires_at) - parse_timestamp(request.created_at)
+            if lifetime.total_seconds() != inputs.checkpoint_ttl_seconds:
+                raise CliError(
+                    "checkpoint_binding_mismatch", "checkpoint lifetime authority is invalid"
+                )
             if (
                 request.target_baseline_head != inputs.target_baseline_head
                 or request.work_plan_digest != inputs.work_plan_digest
@@ -371,6 +382,9 @@ class StatusService:
                     "checkpoint_binding_mismatch", "publish checkpoint authority is invalid"
                 )
             return
+        if item_inputs is None:
+            raise CliError("checkpoint_binding_mismatch", "item checkpoint authority is missing")
+        lifetime = parse_timestamp(request.expires_at) - parse_timestamp(request.created_at)
         operations_digest = sha256_digest(
             {
                 "changes": state.changes,
@@ -383,11 +397,89 @@ class StatusService:
             }
         )
         if (
-            request.baseline_head != inputs.target_baseline_head
+            lifetime.total_seconds() != item_inputs.checkpoint_ttl_seconds
+            or request.project_id != item_inputs.project_id
+            or request.package_digest != sha256_digest(item_inputs.package)
+            or request.write_inputs_digest != sha256_digest(item_inputs)
+            or request.baseline_head != item_inputs.baseline_head
+            or request.capability_fingerprint != item_inputs.capability_fingerprint
             or request.risk_level != state.risk.level
             or request.operations_digest != operations_digest
         ):
             raise CliError("checkpoint_binding_mismatch", "item checkpoint authority is invalid")
+
+    @staticmethod
+    def _current_item_inputs(run_path: Path, state, run_inputs: WriteRunInputs) -> WriteInputs:
+        try:
+            plan_document = read_evidence(run_path / "work-plan.json")
+            plan = decode_value(plan_document.get("payload"), WorkPlan)
+            if (
+                plan_document.get("project_id") != run_inputs.project_id
+                or plan_document.get("run_id") != state.run.run_id
+                or plan.digest != run_inputs.work_plan_digest
+                or plan.scope_id != run_inputs.scope_id
+                or plan.source_revision != run_inputs.source_revision
+                or state.work.item is None
+            ):
+                raise ValueError("work plan does not bind the current item")
+            planned = next(
+                (item for item in plan.items if item.item_id == state.work.item.id),
+                None,
+            )
+            if planned is None:
+                raise ValueError("current item is absent from the work plan")
+            root = work_plan_item_root(run_path, planned)
+            evidence_root = run_path if run_inputs.max_work_items_per_run == 1 else root
+            inputs_path = root / "write-inputs.json"
+            verify_item_storage(run_path, root, evidence_root, inputs_path)
+            inputs_document = read_evidence(inputs_path)
+            item_inputs = decode_value(inputs_document.get("payload"), WriteInputs)
+            context = {
+                "project_id": item_inputs.project_id,
+                "run_id": state.run.run_id,
+                "item_id": item_inputs.package.item_id,
+                "item_index": item_inputs.item_index,
+                "item_base_head": item_inputs.baseline_head,
+                "target_baseline_head": item_inputs.pinned_target_head,
+                "work_plan_digest": item_inputs.work_plan_digest,
+                "source_revision": item_inputs.source_revision,
+                "capability_fingerprint": item_inputs.capability_fingerprint,
+            }
+            if any(inputs_document.get(name) != value for name, value in context.items()):
+                raise ValueError("item input evidence context is invalid")
+            expected_base_branch = (
+                run_inputs.base_branch
+                if item_inputs.baseline_head == run_inputs.target_baseline_head
+                else run_inputs.scope_branch
+            )
+            if (
+                item_inputs.project_id != run_inputs.project_id
+                or item_inputs.package != planned.package
+                or item_inputs.expected_allowed_paths != planned.allowed_paths
+                or item_inputs.source_revision != run_inputs.source_revision
+                or item_inputs.base_branch != expected_base_branch
+                or item_inputs.scope_branch != run_inputs.scope_branch
+                or item_inputs.item_validation_checks != planned.package.item_validation_checks
+                or item_inputs.scope_required_checks != planned.package.scope_required_checks
+                or item_inputs.capability_fingerprint != planned.capability_fingerprint
+                or item_inputs.max_repair_cycles != run_inputs.max_repair_cycles
+                or item_inputs.semantic_review_enabled != run_inputs.semantic_review_enabled
+                or item_inputs.checkpoint_ttl_seconds != run_inputs.checkpoint_ttl_seconds
+                or item_inputs.target_baseline_head != run_inputs.target_baseline_head
+                or item_inputs.target_base_branch != run_inputs.base_branch
+                or item_inputs.item_index != planned.plan_index
+                or item_inputs.work_plan_digest != run_inputs.work_plan_digest
+                or item_inputs.run_inputs_digest != write_run_inputs_digest(run_inputs)
+            ):
+                raise ValueError("item input authority is invalid")
+            return item_inputs
+        except CliError:
+            raise
+        except Exception as exc:
+            raise CliError(
+                "checkpoint_evidence_invalid",
+                "current item checkpoint evidence is invalid",
+            ) from exc
 
     @staticmethod
     def _checkpoint_id(state_version: int, pending_resume_node: str) -> str:

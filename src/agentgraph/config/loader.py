@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import stat
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +31,14 @@ from .models import (
 CONFIG_NAME = ".agentgraph.yml"
 MAX_CONFIG_BYTES = 64 * 1024
 MAX_MODEL_LENGTH = 256
+
+
+@dataclass(frozen=True, slots=True)
+class LoadedProjectConfig:
+    """One typed configuration and the exact raw bytes that produced it."""
+
+    config: AgentGraphConfig
+    raw_content_digest: str
 
 
 class _UniqueSafeLoader(SafeLoader):
@@ -59,6 +69,12 @@ _UniqueSafeLoader.add_constructor(
 
 
 def load_project_config(repository_root: Path | str) -> AgentGraphConfig:
+    return load_project_config_snapshot(repository_root).config
+
+
+def load_project_config_snapshot(repository_root: Path | str) -> LoadedProjectConfig:
+    """Read, fingerprint, and parse one config snapshot without a second file read."""
+
     root = Path(repository_root).expanduser().resolve()
     path = root / CONFIG_NAME
     _verify_config_file(root, path)
@@ -79,7 +95,9 @@ def load_project_config(repository_root: Path | str) -> AgentGraphConfig:
     if "\x00" in text:
         raise ConfigError("config_nul_forbidden", "configuration contains NUL", path=path)
     document = _parse_yaml(text, path)
-    return _parse_config(document, root, path)
+    config = _parse_config(document, root, path)
+    digest = f"sha256:{hashlib.sha256(raw).hexdigest()}"
+    return LoadedProjectConfig(config, digest)
 
 
 def _verify_config_file(root: Path, path: Path) -> None:
