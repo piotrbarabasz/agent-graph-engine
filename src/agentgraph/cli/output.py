@@ -67,10 +67,11 @@ def from_status(command: str, report: StatusReport) -> CliResultV1:
         if mismatch
         else ()
     )
+    recovery_required = mismatch or bool(report.issues)
     return CliResultV1(
         command=command,
-        ok=not mismatch,
-        outcome="RECOVERY_REQUIRED" if mismatch else "STATUS",
+        ok=not recovery_required,
+        outcome="RECOVERY_REQUIRED" if recovery_required else "STATUS",
         project_id=report.project_id,
         run_id=report.run_id,
         run_status=report.run_status,
@@ -201,6 +202,8 @@ def _checkpoint_lines(checkpoint: SafeCheckpoint) -> list[str]:
         f"Pending operation: {checkpoint.pending_resume_node}",
     ]
     for label, value in (
+        ("Scope", checkpoint.scope_id),
+        ("Item", checkpoint.item_id),
         ("Repository", checkpoint.repository),
         ("Base branch", checkpoint.base_branch),
         ("Head branch", checkpoint.head_branch),

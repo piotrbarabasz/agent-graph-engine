@@ -129,3 +129,85 @@ def test_full_v1_application_flow_publishes_once_after_separate_approval_and_res
     repeated = app.resume(pending.run_id)
     assert repeated.outcome is WriteSliceOutcome.DRAFT_PR_CREATED
     assert remote.create_calls == 1
+
+
+def _approved_publish_checkpoint(tmp_path: Path, tmp_path_factory, config_text: str):
+    target, _bare, _adapter = _target_with_remote(tmp_path)
+    adapter = SimulatedPublishGitAdapter()
+    path = target / ".agentgraph.yml"
+    path.write_text(
+        config_text.replace(
+            "  semantic: true\n  delivery: true",
+            "  semantic: false\n  delivery: true",
+        ),
+        encoding="utf-8",
+    )
+    git(target, "add", "--all")
+    git(target, "commit", "--quiet", "-m", "agentgraph config")
+    runtime = tmp_path_factory.mktemp("a")
+    remote = FakeRemoteProvider()
+    overrides = ProviderOverrides(
+        git_adapter=adapter,
+        change_provider=PerItemProvider(),
+        general_agent_provider=FilesystemDeclaredProvider(),
+        delivery_review_provider=DeliveryReviewer(),
+        remote_provider=remote,
+    )
+    app = build_application(target, runtime_home=runtime, provider_overrides=overrides)
+    pending = app.run("E001", None)
+    assert pending.outcome is WriteSliceOutcome.PUBLISH_CHECKPOINT_REQUIRED
+    assert pending.run_id is not None
+    app.submit_checkpoint(
+        pending.run_id,
+        outcome=CheckpointOutcome.APPROVED,
+        actor="Piotr",
+    )
+    return target, runtime, adapter, remote, overrides, pending.run_id
+
+
+def test_profile_drift_after_publish_approval_blocks_before_remote_effect(
+    tmp_path: Path, tmp_path_factory, config_text: str
+) -> None:
+    target, runtime, adapter, remote, overrides, run_id = _approved_publish_checkpoint(
+        tmp_path, tmp_path_factory, config_text
+    )
+    before = (remote.inspect_calls, remote.find_calls, remote.create_calls, adapter.push_calls)
+    path = target / ".agentgraph.yml"
+    path.write_text(
+        path.read_text(encoding="utf-8").replace("max_repair_cycles: 2", "max_repair_cycles: 1"),
+        encoding="utf-8",
+    )
+
+    resumed = build_application(target, runtime_home=runtime, provider_overrides=overrides).resume(
+        run_id
+    )
+
+    assert resumed.outcome is WriteSliceOutcome.RECOVERY_REQUIRED
+    assert resumed.issues[0].code == "execution_profile_mismatch"
+    assert (
+        remote.inspect_calls,
+        remote.find_calls,
+        remote.create_calls,
+        adapter.push_calls,
+    ) == before
+
+
+def test_comment_only_config_change_after_publish_approval_can_resume(
+    tmp_path: Path, tmp_path_factory, config_text: str
+) -> None:
+    target, runtime, adapter, remote, overrides, run_id = _approved_publish_checkpoint(
+        tmp_path, tmp_path_factory, config_text
+    )
+    path = target / ".agentgraph.yml"
+    path.write_text(
+        "# comment-only change after approval\n" + path.read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+
+    resumed = build_application(target, runtime_home=runtime, provider_overrides=overrides).resume(
+        run_id
+    )
+
+    assert resumed.outcome is WriteSliceOutcome.DRAFT_PR_CREATED
+    assert remote.create_calls == 1
+    assert adapter.push_calls == 1

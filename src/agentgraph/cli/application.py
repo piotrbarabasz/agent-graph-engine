@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from contextlib import contextmanager
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from agentgraph.adapters.speckit import SpecKitAdapter, SpecKitLayout
@@ -27,6 +28,42 @@ from .models import SafeCheckpoint
 from .status import StatusReport, StatusService
 
 
+class _ProductionGitAdapter:
+    """Delegate Git while allowing semantic-only config edits during explicit resume."""
+
+    def __init__(self, delegate: GitAdapter, repository_root: Path) -> None:
+        self._delegate = delegate
+        self._repository_root = repository_root
+        self.runner = delegate.runner
+        self._allow_config_only_dirty = False
+
+    def __getattr__(self, name: str):
+        return getattr(self._delegate, name)
+
+    def snapshot(self, repository):
+        snapshot = self._delegate.snapshot(repository)
+        config_path = Path(".agentgraph.yml")
+        if (
+            self._allow_config_only_dirty
+            and repository.root == self._repository_root
+            and not snapshot.staged_paths
+            and snapshot.unstaged_paths == (config_path,)
+            and not snapshot.untracked_paths
+            and not snapshot.conflicted_paths
+        ):
+            return replace(snapshot, unstaged_paths=(), dirty=False)
+        return snapshot
+
+    @contextmanager
+    def config_only_resume(self):
+        previous = self._allow_config_only_dirty
+        self._allow_config_only_dirty = True
+        try:
+            yield
+        finally:
+            self._allow_config_only_dirty = previous
+
+
 @dataclass(frozen=True, slots=True)
 class ProviderOverrides:
     process_runner: ProcessRunner | None = None
@@ -46,7 +83,7 @@ class AgentGraphApplication:
     runtime_paths: RuntimePaths
     registry: ProjectRegistry
     process_runner: ProcessRunner
-    git_adapter: GitAdapter
+    git_adapter: _ProductionGitAdapter
     work_source: SpecKitAdapter
     runner: WriteSliceRunner
     status_service: StatusService
@@ -59,7 +96,8 @@ class AgentGraphApplication:
 
     def resume(self, run_id: str | None) -> WriteSliceReport:
         _project_id, selected = self.status_service.resolve_run_id(run_id)
-        return self.runner.resume(selected)
+        with self.git_adapter.config_only_resume():
+            return self.runner.resume(selected)
 
     def status(self, run_id: str | None) -> StatusReport:
         return self.status_service.inspect(run_id)
@@ -112,8 +150,9 @@ def build_application(
         or (overrides.git_adapter.runner if overrides.git_adapter is not None else None)
         or ProcessRunner()
     )
-    git = overrides.git_adapter or GitAdapter(processes)
-    repository = git.discover_repository(repository_path)
+    base_git = overrides.git_adapter or GitAdapter(processes)
+    repository = base_git.discover_repository(repository_path)
+    git = _ProductionGitAdapter(base_git, repository.root)
     config = load_project_config(repository.root)
     executable = _codex_executable(codex_executable)
     profile = ExecutionProfile.create(config, executable)

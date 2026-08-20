@@ -48,6 +48,14 @@ publish:
 An equivalent standalone example is available at `examples/agentgraph.yml`; it is documentation,
 not configuration for this engine repository.
 
+The production v1 CLI requires `review.delivery: true`, `publish.enabled: true`, and
+`publish.draft: true`. The frozen v1 canonical graph reaches terminal completion through delivery
+review and draft-PR publication, so configurations that disable either stage are rejected instead
+of creating a permanently unfinished writer run. A local-only terminal mode is future work.
+`review.semantic` remains optional and may be either `true` or `false`. The `work.speckit` and
+`agents.codex` blocks may be omitted or partially specified; omitted subfields use the defaults
+shown above.
+
 ```powershell
 cd D:\Projects\my-project
 agentgraph config validate
@@ -132,8 +140,9 @@ remains one; callers may configure an immutable limit from 1 through 20.
 
 Agent Graph Engine—not Codex—computes stale-file hashes, applies changes, runs validation, reviews
 the actual diff, stages files, and verifies the local commit. The provider receives a neutral read
-context but no Git mutation or engine write capability. The project does not update source tasks,
-push, open pull requests, merge, or expose an AgentGraph CLI.
+context but no Git mutation or engine write capability. The production CLI can publish the exact
+verified final commit and open one GitHub draft PR only after explicit durable approval; it does not
+update source tasks, merge, deploy, or close source work.
 
 ## Development
 
@@ -264,5 +273,7 @@ human checkpoint must approve that exact plan before any remote mutation. `CREAT
 the exact final commit with a single non-force branch refspec, verifies the remote ref, and creates
 or adopts exactly one matching GitHub draft PR. Push, PR, and final result receipts make interrupted
 publication idempotently reconcilable without relaxing recovery for other side-effect nodes. No
-merge, deployment, or WorkSource closure occurs. M015 will add `.agentgraph.yml` and CLI wiring;
-M014 requires providers and the remote name to be supplied programmatically.
+merge, deployment, or WorkSource closure occurs. M015 adds the strict root `.agentgraph.yml`, the
+production composition root, and the `agentgraph` / `python -m agentgraph` command surface. Its
+`status` and `checkpoint show` commands inspect local durable authority without graph, provider,
+Git, or GitHub execution.

@@ -161,10 +161,16 @@ def _parse_config(value: object, root: Path, path: Path) -> AgentGraphConfig:
     review = _parse_review(_required(data, "review", path), path)
     policy = _parse_policy(_required(data, "policy", path), path)
     publish = _parse_publish(_required(data, "publish", path), path)
-    if publish.enabled and not review.delivery:
+    if not review.delivery:
         raise ConfigError(
-            "publish_requires_delivery_review",
-            "publishing requires delivery review",
+            "delivery_review_required_in_v1",
+            "configuration version 1 requires delivery review",
+            path=path,
+        )
+    if not publish.enabled:
+        raise ConfigError(
+            "publish_required_in_v1",
+            "configuration version 1 requires draft pull-request publication",
             path=path,
         )
     return AgentGraphConfig(version, work, agents, review, policy, publish)
@@ -180,7 +186,7 @@ def _parse_work(value: object, root: Path, path: Path) -> WorkConfig:
         )
     raw = data.get("speckit", {})
     speckit = _mapping(raw, "work.speckit", path)
-    _fields(speckit, {"workstreams_dir", "active_scope_file"}, path)
+    _fields(speckit, {"workstreams_dir", "active_scope_file"}, path, required=set())
     workstreams = _string(
         speckit.get("workstreams_dir", ".specify/workstreams"),
         "work.speckit.workstreams_dir",
@@ -206,7 +212,7 @@ def _parse_agents(value: object, path: Path) -> AgentsConfig:
             "unsupported_agent_provider", "only the codex agent provider is supported", path=path
         )
     raw = _mapping(data.get("codex", {}), "agents.codex", path)
-    _fields(raw, {"model", "timeout_seconds", "max_result_bytes"}, path)
+    _fields(raw, {"model", "timeout_seconds", "max_result_bytes"}, path, required=set())
     model_raw = raw.get("model")
     model = None if model_raw is None else _string(model_raw, "agents.codex.model", path)
     if model is not None and len(model) > MAX_MODEL_LENGTH:
@@ -310,9 +316,8 @@ def _fields(
     if unknown:
         name = sorted(unknown)[0]
         raise ConfigError("config_unknown_field", f"unknown configuration field: {name}", path=path)
-    missing = (required or allowed) - set(data)
-    if required is None:
-        missing = allowed - set(data)
+    required_fields = allowed if required is None else required
+    missing = required_fields - set(data)
     if missing:
         name = sorted(missing)[0]
         raise ConfigError(

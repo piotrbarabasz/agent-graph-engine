@@ -12,7 +12,7 @@ from agentgraph.runtime import (
     ProjectRegistry,
     RuntimePaths,
 )
-from agentgraph.runtime.codec import decode_value, parse_json_bytes
+from agentgraph.runtime.codec import decode_value, parse_json_bytes, parse_timestamp, sha256_digest
 from agentgraph.runtime.ids import validate_run_id
 from agentgraph.runtime.lifecycle import ActiveRunRecord
 from agentgraph.runtime.state_store import StateStore
@@ -20,10 +20,14 @@ from agentgraph.write import (
     CommitWitness,
     PublishCheckpointRequestRecord,
     PublishPlan,
-    PublishResult,
     WriteRunInputs,
 )
 from agentgraph.write.evidence import read_evidence
+from agentgraph.write.publish_history import (
+    read_local_publish_history,
+    verify_publish_checkpoint_plan_binding,
+)
+from agentgraph.write.publish_storage import load_typed
 
 from .errors import CliError
 from .models import CliIssue, SafeCheckpoint, SafePublish
@@ -108,10 +112,21 @@ class StatusService:
             ):
                 raise ValueError("run identity mismatch")
             profile_match = self._profile_match(run_path, run_inputs, project_id, selected)
-            checkpoint = self._checkpoint(run_path, state, run_inputs)
-            publish = self._publish(run_path, run_inputs)
             completed_ids = tuple(item.id for item in state.work.completed_items)
             commits = self._completed_commits(run_path, project_id, selected, completed_ids)
+            checkpoint = self._checkpoint(run_path, state, run_inputs)
+            issues: tuple[CliIssue, ...] = ()
+            try:
+                publish = self._publish(run_path, run_inputs, state, completed_ids, commits)
+            except Exception as exc:
+                publish = None
+                detail = getattr(exc, "code", None) or str(exc) or type(exc).__name__
+                issues = (
+                    CliIssue(
+                        "publish_evidence_mismatch",
+                        f"durable publication evidence is invalid: {detail}",
+                    ),
+                )
             return StatusReport(
                 project_id,
                 selected,
@@ -125,7 +140,7 @@ class StatusService:
                 completed_ids,
                 checkpoint,
                 publish,
-                (),
+                issues,
                 run_inputs.execution_profile_digest,
                 run_inputs.execution_profile_digest is not None,
                 profile_match,
@@ -176,6 +191,13 @@ class StatusService:
             run_inputs = decode_value(run_document.get("payload"), WriteRunInputs)
             state = StateStore(run_path / "state.json").load()
             if (
+                run_document.get("project_id") != project_id
+                or run_document.get("run_id") != selected
+                or run_inputs.project_id != project_id
+                or state.run.run_id != selected
+            ):
+                raise CliError("run_evidence_invalid", "durable run identity is invalid")
+            if (
                 state.graph.current_node != "HUMAN_CHECKPOINT"
                 or not state.graph.pending_resume_node
             ):
@@ -193,7 +215,8 @@ class StatusService:
                     "checkpoint_not_materialized",
                     f"checkpoint is not materialized; run agentgraph resume {selected}",
                 )
-            view = self._safe_checkpoint(run_path, request, run_inputs)
+            self._validate_current_checkpoint(request, state, run_inputs)
+            view = self._safe_checkpoint(run_path, request, run_inputs, state)
             return MaterializedCheckpoint(view, request.nonce)
         except CliError:
             raise
@@ -235,14 +258,28 @@ class StatusService:
             request = store.load_typed_request(checkpoint_id, PublishCheckpointRequestRecord)
         else:
             request = store.load_request(checkpoint_id)
-        return None if request is None else self._safe_checkpoint(run_path, request, inputs)
+        if request is None:
+            return None
+        self._validate_current_checkpoint(request, state, inputs)
+        return self._safe_checkpoint(run_path, request, inputs, state)
 
-    def _safe_checkpoint(self, run_path, request, inputs) -> SafeCheckpoint:
+    def _safe_checkpoint(self, run_path, request, inputs, state) -> SafeCheckpoint:
         if isinstance(request, PublishCheckpointRequestRecord):
-            plan_doc = read_evidence(run_path / "publish" / "plan.json")
-            plan = decode_value(plan_doc.get("payload"), PublishPlan)
-            if plan.digest != request.publish_plan_digest:
-                raise ValueError("publish plan mismatch")
+            context = {
+                "project_id": inputs.project_id,
+                "run_id": state.run.run_id,
+                "scope_id": inputs.scope_id,
+            }
+            plan = load_typed(run_path, "plan.json", PublishPlan, context)
+            if plan is None:
+                raise CliError("checkpoint_binding_mismatch", "publish plan is missing")
+            try:
+                verify_publish_checkpoint_plan_binding(request, plan)
+            except Exception as exc:
+                raise CliError(
+                    "checkpoint_binding_mismatch",
+                    "publish checkpoint no longer binds its publication plan",
+                ) from exc
             return SafeCheckpoint(
                 request.checkpoint_id,
                 "publish",
@@ -271,30 +308,86 @@ class StatusService:
             request.expires_at,
             request.pending_resume_node,
             scope_id=inputs.scope_id,
+            item_id=None if state.work.item is None else state.work.item.id,
         )
 
-    def _publish(self, run_path: Path, inputs: WriteRunInputs) -> SafePublish | None:
-        path = run_path / "publish" / "result.json"
-        if not path.exists():
-            return None
-        document = read_evidence(path)
-        result = decode_value(document.get("payload"), PublishResult)
-        if result.project_id != inputs.project_id or result.scope_id != inputs.scope_id:
-            raise ValueError("publish result identity mismatch")
-        plan_document = read_evidence(run_path / "publish" / "plan.json")
-        plan = decode_value(plan_document.get("payload"), PublishPlan)
-        if result.publish_plan_digest != plan.digest:
-            raise ValueError("publish result plan mismatch")
-        return SafePublish(
-            result.remote_repository_full_name,
-            plan.base_branch,
-            result.remote_branch,
-            result.final_head,
-            result.pr_number,
-            result.pr_url,
-            result.draft,
-            result.publish_plan_digest,
+    def _publish(
+        self,
+        run_path: Path,
+        inputs: WriteRunInputs,
+        state,
+        completed_item_ids: tuple[str, ...],
+        completed_commit_shas: tuple[str, ...],
+    ) -> SafePublish | None:
+        report = read_local_publish_history(
+            run_path,
+            inputs,
+            state,
+            completed_item_ids,
+            completed_commit_shas,
         )
+        if report is None:
+            return None
+        return SafePublish(
+            report.remote_repository_full_name,
+            report.base_branch,
+            report.head_branch,
+            report.head_sha,
+            report.pr_number,
+            report.pr_url,
+            report.draft,
+            report.publish_plan_digest,
+        )
+
+    def _validate_current_checkpoint(self, request, state, inputs) -> None:
+        expected = {
+            "checkpoint_id": self._checkpoint_id(
+                state.state_version, state.graph.pending_resume_node
+            ),
+            "project_id": inputs.project_id,
+            "run_id": state.run.run_id,
+            "node_id": "HUMAN_CHECKPOINT",
+            "pending_resume_node": state.graph.pending_resume_node,
+            "state_version": state.state_version,
+            "state_digest": StateStore.digest_for_state(state),
+            "source_revision": inputs.source_revision,
+        }
+        if any(getattr(request, name, None) != value for name, value in expected.items()):
+            raise CliError(
+                "checkpoint_binding_mismatch",
+                "checkpoint request does not bind the current paused state",
+            )
+        lifetime = parse_timestamp(request.expires_at) - parse_timestamp(request.created_at)
+        if lifetime.total_seconds() != inputs.checkpoint_ttl_seconds:
+            raise CliError(
+                "checkpoint_binding_mismatch", "checkpoint lifetime authority is invalid"
+            )
+        if isinstance(request, PublishCheckpointRequestRecord):
+            if (
+                request.target_baseline_head != inputs.target_baseline_head
+                or request.work_plan_digest != inputs.work_plan_digest
+            ):
+                raise CliError(
+                    "checkpoint_binding_mismatch", "publish checkpoint authority is invalid"
+                )
+            return
+        operations_digest = sha256_digest(
+            {
+                "changes": state.changes,
+                "validation": state.validation,
+                "review": state.review,
+                "repair": state.repair,
+                "commits": state.commits,
+                "push": state.push,
+                "pull_request": state.pull_request,
+            }
+        )
+        if (
+            request.baseline_head != inputs.target_baseline_head
+            or request.risk_level != state.risk.level
+            or request.operations_digest != operations_digest
+        ):
+            raise CliError("checkpoint_binding_mismatch", "item checkpoint authority is invalid")
 
     @staticmethod
     def _checkpoint_id(state_version: int, pending_resume_node: str) -> str:

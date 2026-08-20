@@ -18,6 +18,72 @@ def test_loads_typed_canonical_config(config_root: Path) -> None:
     assert config.publish.remote == "origin"
 
 
+def _replace_section(config_text: str, start: str, end: str, replacement: str) -> str:
+    before, remainder = config_text.split(start, 1)
+    _old, after = remainder.split(end, 1)
+    return before + replacement + end + after
+
+
+def test_minimal_speckit_config_uses_defaults(config_root: Path, config_text: str) -> None:
+    path = config_root / ".agentgraph.yml"
+    path.write_text(
+        _replace_section(config_text, "work:\n", "agents:\n", "work:\n  source: speckit\n"),
+        encoding="utf-8",
+    )
+
+    config = load_project_config(config_root)
+
+    assert config.work.speckit.workstreams_dir == ".specify/workstreams"
+    assert config.work.speckit.active_scope_file == ".specify/runtime/active-epic"
+
+
+def test_partial_speckit_config_preserves_remaining_default(
+    config_root: Path, config_text: str
+) -> None:
+    path = config_root / ".agentgraph.yml"
+    replacement = "work:\n  source: speckit\n  speckit:\n    active_scope_file: null\n"
+    path.write_text(
+        _replace_section(config_text, "work:\n", "agents:\n", replacement),
+        encoding="utf-8",
+    )
+
+    config = load_project_config(config_root)
+
+    assert config.work.speckit.workstreams_dir == ".specify/workstreams"
+    assert config.work.speckit.active_scope_file is None
+
+
+def test_minimal_codex_config_uses_defaults(config_root: Path, config_text: str) -> None:
+    path = config_root / ".agentgraph.yml"
+    path.write_text(
+        _replace_section(config_text, "agents:\n", "review:\n", "agents:\n  provider: codex\n"),
+        encoding="utf-8",
+    )
+
+    config = load_project_config(config_root)
+
+    assert config.agents.codex.model is None
+    assert config.agents.codex.timeout_seconds == 900
+    assert config.agents.codex.max_result_bytes == 4 * 1024 * 1024
+
+
+def test_partial_codex_config_preserves_remaining_defaults(
+    config_root: Path, config_text: str
+) -> None:
+    path = config_root / ".agentgraph.yml"
+    replacement = "agents:\n  provider: codex\n  codex:\n    model: gpt-example\n"
+    path.write_text(
+        _replace_section(config_text, "agents:\n", "review:\n", replacement),
+        encoding="utf-8",
+    )
+
+    config = load_project_config(config_root)
+
+    assert config.agents.codex.model == "gpt-example"
+    assert config.agents.codex.timeout_seconds == 900
+    assert config.agents.codex.max_result_bytes == 4 * 1024 * 1024
+
+
 @pytest.mark.parametrize(
     ("fragment", "code"),
     [
@@ -136,7 +202,8 @@ def test_strict_boolean_and_integer_types(config_root: Path, config_text: str) -
 @pytest.mark.parametrize(
     ("old", "new", "code"),
     [
-        ("delivery: true", "delivery: false", "publish_requires_delivery_review"),
+        ("delivery: true", "delivery: false", "delivery_review_required_in_v1"),
+        ("enabled: true", "enabled: false", "publish_required_in_v1"),
         ("draft: true", "draft: false", "unsupported_publish_mode"),
         ("provider: codex", "provider: other", "unsupported_agent_provider"),
         ("provider: github", "provider: other", "unsupported_publish_provider"),
@@ -151,6 +218,23 @@ def test_rejects_unsupported_modes_and_combinations(
         load_project_config(config_root)
 
     assert error.value.code == code
+
+
+def test_delivery_review_false_wins_when_publish_is_also_disabled(
+    config_root: Path, config_text: str
+) -> None:
+    path = config_root / ".agentgraph.yml"
+    path.write_text(
+        config_text.replace("delivery: true", "delivery: false").replace(
+            "enabled: true", "enabled: false"
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError) as error:
+        load_project_config(config_root)
+
+    assert error.value.code == "delivery_review_required_in_v1"
 
 
 def test_config_is_not_modified(config_root: Path) -> None:
