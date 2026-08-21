@@ -2,17 +2,20 @@
 
 from __future__ import annotations
 
+import os
+
+
 CODEX_PERMISSION_PROFILE_NAME = "agentgraph_provider"
 
 
-def restricted_permission_config_overrides() -> tuple[str, str]:
+def restricted_permission_config_overrides() -> tuple[str, ...]:
     """Return strict runtime-only Codex permission-profile configuration.
 
     The root deny is deliberately explicit. The only narrower grants are Codex's
     minimal runtime/helper paths and read access to each effective workspace root.
     """
 
-    return (
+    overrides = [
         f'default_permissions="{CODEX_PERMISSION_PROFILE_NAME}"',
         (
             f"permissions.{CODEX_PERMISSION_PROFILE_NAME}={{ "
@@ -20,4 +23,9 @@ def restricted_permission_config_overrides() -> tuple[str, str]:
             '":workspace_roots" = { "." = "read" } }, '
             "network = { enabled = false } }"
         ),
-    )
+    ]
+
+    if os.name == "nt":
+        overrides.append('windows.sandbox="elevated"')
+
+    return tuple(overrides)
