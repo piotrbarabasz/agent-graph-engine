@@ -21,7 +21,6 @@ from agentgraph.write import (
     GitHubRemoteProvider,
     HttpResponse,
     PublishCheckpointRequestRecord,
-    PublishConflictError,
     PublishEvidenceError,
     PublishPlan,
     PublishResult,
@@ -591,11 +590,13 @@ def test_non_exact_or_ambiguous_pull_requests_are_never_adopted(tmp_path, varian
                 url="https://github.com/owner/repository/pull/8",
             )
         )
-    with pytest.raises(PublishConflictError, match="pull_request_conflict"):
-        _approve(runner, pending)
+    _approve(runner, pending)
+    blocked = runner.resume(pending.run_id or "")
 
+    assert blocked.outcome is WriteSliceOutcome.BLOCKED
+    assert blocked.issues[0].code == "pull_request_conflict"
     assert remote.create_calls == 0
-    assert getattr(adapter, "push_calls", 0) == 0
+    assert getattr(adapter, "push_calls", 0) == 1
 
 
 def test_exact_existing_marker_pull_request_is_adopted_without_duplicate(tmp_path) -> None:

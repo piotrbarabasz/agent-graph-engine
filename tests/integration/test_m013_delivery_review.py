@@ -151,6 +151,7 @@ def test_write_run_inputs_digest_preserves_final_m012_disabled_authority() -> No
     )
     legacy_payload = encode_value(disabled)
     legacy_payload.pop("delivery_review_enabled")
+    legacy_payload.pop("execution_profile_digest")
     decoded = decode_value(legacy_payload, WriteRunInputs)
 
     assert decoded.delivery_review_enabled is False
@@ -522,6 +523,7 @@ def test_exact_final_m012_persisted_run_resumes_with_legacy_authority_digest(tmp
     persisted = read_evidence(run_inputs_path)["payload"]
     legacy_payload = dict(persisted)
     legacy_payload.pop("delivery_review_enabled")
+    legacy_payload.pop("execution_profile_digest", None)
     historical_digest = sha256_digest(legacy_payload)
     decoded = decode_value(legacy_payload, WriteRunInputs)
     assert write_run_inputs_digest(decoded) == historical_digest

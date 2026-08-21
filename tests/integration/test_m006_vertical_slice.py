@@ -54,6 +54,7 @@ def _runner(
     git_adapter=None,
     process_runner=None,
     fault=None,
+    execution_profile=None,
 ) -> WriteSliceRunner:
     executable = shutil.which("git") or "git"
     adapter = git_adapter or GitAdapter(executable=executable)
@@ -69,6 +70,8 @@ def _runner(
         commit_identity=GitCommitIdentity("M006 Test", "m006@example.test"),
         run_id_factory=lambda: "run_m006_fixture",
         fault=fault,
+        execution_profile_digest=(None if execution_profile is None else execution_profile.digest),
+        execution_profile_payload=execution_profile,
     )
 
 
