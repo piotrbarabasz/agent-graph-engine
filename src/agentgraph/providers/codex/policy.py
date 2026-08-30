@@ -4,11 +4,10 @@ from __future__ import annotations
 
 import os
 
-
 CODEX_PERMISSION_PROFILE_NAME = "agentgraph_provider"
 
 
-def restricted_permission_config_overrides() -> tuple[str, ...]:
+def restricted_permission_config_overrides(*, windows: bool | None = None) -> tuple[str, ...]:
     """Return strict runtime-only Codex permission-profile configuration.
 
     The root deny is deliberately explicit. The only narrower grants are Codex's
@@ -25,7 +24,9 @@ def restricted_permission_config_overrides() -> tuple[str, ...]:
         ),
     ]
 
-    if os.name == "nt":
+    if windows is None:
+        windows = os.name == "nt"
+    if windows:
         overrides.append('windows.sandbox="elevated"')
 
     return tuple(overrides)

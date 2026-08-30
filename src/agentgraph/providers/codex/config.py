@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from .executable import resolve_codex_executable
+
 
 @dataclass(frozen=True, slots=True)
 class CodexProviderConfig:
@@ -32,3 +34,4 @@ class CodexProviderConfig:
             raise ValueError("Codex model override must be non-empty and NUL-free")
         if isinstance(self.max_result_bytes, bool) or self.max_result_bytes <= 0:
             raise ValueError("Codex result limit must be positive")
+        object.__setattr__(self, "executable", resolve_codex_executable(self.executable))

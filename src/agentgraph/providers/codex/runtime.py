@@ -26,10 +26,12 @@ from .config import CodexProviderConfig
 from .errors import (
     CodexCliUnavailableError,
     CodexInvocationError,
+    CodexOutputSchemaRejectedError,
     CodexResponseError,
     CodexTimeoutError,
 )
 from .policy import restricted_permission_config_overrides
+from .schema_compat import project_to_codex_supported_schema
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,7 +83,8 @@ class CodexInvocationRuntime:
             path.exists() or path.is_symlink() for path in (schema_path, result_path, receipt_path)
         ):
             raise CodexResponseError("Codex structured invocation artifacts already exist")
-        atomic_write_bytes(schema_path, canonical_json_bytes(schema))
+        transport_schema = project_to_codex_supported_schema(schema)
+        atomic_write_bytes(schema_path, canonical_json_bytes(transport_schema))
         capabilities = self.probe.inspect(root)
         prompt_digest = _digest(prompt)
         argv = self.invocation(root, schema_path, result_path, capabilities)
@@ -121,6 +124,10 @@ class CodexInvocationRuntime:
         if result.receipt.status is ProcessStatus.TIMED_OUT:
             raise CodexTimeoutError("Codex structured invocation timed out")
         if result.receipt.status is not ProcessStatus.SUCCEEDED:
+            if _is_output_schema_rejection(result.stdout, result.stderr):
+                raise CodexOutputSchemaRejectedError(
+                    "Codex rejected the projected structured output schema"
+                )
             raise CodexInvocationError("Codex structured invocation failed")
         if result.receipt.stdout_truncated or result.receipt.stderr_truncated:
             raise CodexInvocationError("Codex diagnostic output exceeded its bound")
@@ -196,3 +203,15 @@ def read_regular_bounded(path: Path, limit: int) -> bytes:
 
 def _digest(value: bytes) -> str:
     return f"sha256:{hashlib.sha256(value).hexdigest()}"
+
+
+def _is_output_schema_rejection(stdout: bytes, stderr: bytes) -> bool:
+    diagnostic = (stdout + b"\n" + stderr).decode("utf-8", errors="replace").casefold()
+    return any(
+        marker in diagnostic
+        for marker in (
+            "invalid_json_schema",
+            "invalid schema for response_format",
+            "output schema is invalid",
+        )
+    )
