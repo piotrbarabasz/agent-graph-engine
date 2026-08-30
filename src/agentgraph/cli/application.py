@@ -215,7 +215,6 @@ def build_application(
     config = loaded_config.config
     git = _ProductionGitAdapter(base_git, repository.root, loaded_config.raw_content_digest)
     executable = _codex_executable(codex_executable)
-    profile = ExecutionProfile.create(config, executable)
     paths = RuntimePaths.resolve(runtime_home)
     paths.require_external_to(repository.root)
     registry = ProjectRegistry(paths)
@@ -232,6 +231,7 @@ def build_application(
         model=config.agents.codex.model,
         max_result_bytes=config.agents.codex.max_result_bytes,
     )
+    profile = ExecutionProfile.create(config, codex_config.executable)
     change_provider = overrides.change_provider or CodexChangeProvider(
         process_runner=processes, git_adapter=git, config=codex_config
     )

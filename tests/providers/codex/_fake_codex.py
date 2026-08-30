@@ -13,6 +13,9 @@ from pathlib import Path
 def main() -> int:
     args = sys.argv[1:]
     if args == ["--version"]:
+        if os.environ.get("FAKE_CODEX_PROBE_FAILED") == "1":
+            print("fake capability probe failed", file=sys.stderr)
+            return 7
         print("codex-cli 9.9.9-fake")
         return 0
     if args == ["exec", "--help"]:
@@ -63,6 +66,9 @@ def main() -> int:
         time.sleep(30)
     if mode == "nonzero":
         print("fake invocation failed", file=sys.stderr)
+        return 7
+    if mode == "schema_rejected":
+        print("invalid_json_schema: output schema is invalid", file=sys.stderr)
         return 7
     if mode == "tracked":
         Path("tracked.txt").write_text("mutated by fake Codex\n", encoding="utf-8")

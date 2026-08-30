@@ -10,8 +10,10 @@ import pytest
 
 from agentgraph.infra import CancellationToken
 from agentgraph.providers.codex import (
+    CODEX_PROPOSAL_JSON_SCHEMA,
     CodexChangeProvider,
     CodexInvocationError,
+    CodexOutputSchemaRejectedError,
     CodexProposalError,
     CodexProviderBlockedError,
     CodexProviderConfig,
@@ -115,6 +117,13 @@ def test_provider_uses_stdin_restricted_profile_and_engine_computes_existing_has
     assert receipt["payload"]["prompt_digest"].startswith("sha256:")
     assert evidence["payload"]["proposal_digest"].startswith("sha256:")
     assert set(evidence["payload"]) == {"proposal", "proposal_digest"}
+    transport_schema = json.loads((codex_dir / "schema.json").read_text(encoding="utf-8"))
+    assert transport_schema["additionalProperties"] is False
+    assert transport_schema["required"] == CODEX_PROPOSAL_JSON_SCHEMA["required"]
+    assert "maxItems" not in transport_schema["properties"]["changes"]
+    assert (
+        "minLength" not in transport_schema["properties"]["changes"]["items"]["properties"]["path"]
+    )
 
 
 def test_restricted_permission_policy_grants_only_workspace_read(
@@ -207,6 +216,7 @@ def test_provider_maps_blocked_result_without_a_changeset(codex_fixture, monkeyp
     ("mode", "error"),
     (
         ("nonzero", CodexInvocationError),
+        ("schema_rejected", CodexOutputSchemaRejectedError),
         ("malformed", CodexResponseError),
         ("freeform", CodexResponseError),
         ("oversized", CodexResponseError),

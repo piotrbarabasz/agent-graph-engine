@@ -11,7 +11,12 @@ from agentgraph.infra.errors import ProcessStartError
 from agentgraph.infra.redaction import is_sensitive_environment_key
 
 from .config import CodexProviderConfig
-from .errors import CodexCliUnavailableError, CodexCliUnsupportedError
+from .errors import (
+    CodexCliProbeError,
+    CodexCliUnavailableError,
+    CodexCliUnsupportedError,
+    CodexPermissionProfileUnsupportedError,
+)
 from .policy import CODEX_PERMISSION_PROFILE_NAME, restricted_permission_config_overrides
 
 
@@ -92,6 +97,31 @@ class CodexCliProbe:
         return (self.config.executable, *self.config.executable_arguments)
 
     def _validate_restricted_profile(self, cwd: Path) -> bool:
+        values = self._restricted_profile_argv(cwd)
+        try:
+            result = self.runner.run(
+                CommandSpec(
+                    argv=values,
+                    cwd=cwd,
+                    timeout_seconds=min(max(self.config.timeout_seconds, 5.0), 30.0),
+                    max_stdout_bytes=256 * 1024,
+                    max_stderr_bytes=256 * 1024,
+                    unset_env=sensitive_environment_keys(),
+                )
+            )
+        except ProcessStartError as exc:
+            raise CodexCliUnavailableError("configured Codex CLI is unavailable") from exc
+        if (
+            result.receipt.status is not ProcessStatus.SUCCEEDED
+            or result.receipt.stdout_truncated
+            or result.receipt.stderr_truncated
+        ):
+            raise CodexPermissionProfileUnsupportedError(
+                "local Codex CLI cannot enforce the restricted permission profile"
+            )
+        return True
+
+    def _restricted_profile_argv(self, cwd: Path) -> tuple[str, ...]:
         command = (
             ("cmd.exe", "/d", "/c", "exit", "0") if os.name == "nt" else ("/bin/sh", "-c", "exit 0")
         )
@@ -104,24 +134,7 @@ class CodexCliProbe:
         for override in restricted_permission_config_overrides():
             values.extend(("--config", override))
         values.extend(("--permission-profile", CODEX_PERMISSION_PROFILE_NAME, *command))
-        try:
-            result = self.runner.run(
-                CommandSpec(
-                    argv=tuple(values),
-                    cwd=cwd,
-                    timeout_seconds=min(max(self.config.timeout_seconds, 5.0), 30.0),
-                    max_stdout_bytes=256 * 1024,
-                    max_stderr_bytes=256 * 1024,
-                    unset_env=sensitive_environment_keys(),
-                )
-            )
-        except ProcessStartError as exc:
-            raise CodexCliUnavailableError("configured Codex CLI is unavailable") from exc
-        return (
-            result.receipt.status is ProcessStatus.SUCCEEDED
-            and not result.receipt.stdout_truncated
-            and not result.receipt.stderr_truncated
-        )
+        return tuple(values)
 
     def _run(self, argv: tuple[str, ...], cwd: Path) -> str:
         try:
@@ -142,7 +155,7 @@ class CodexCliProbe:
             or result.receipt.stdout_truncated
             or result.receipt.stderr_truncated
         ):
-            raise CodexCliUnavailableError("Codex CLI capability inspection failed")
+            raise CodexCliProbeError("Codex CLI capability inspection returned an unusable result")
         try:
             return result.stdout.decode("utf-8")
         except UnicodeDecodeError as exc:

@@ -6,6 +6,7 @@ import pytest
 
 from agentgraph.providers.codex import (
     CodexChangeProvider,
+    CodexCliProbeError,
     CodexCliUnavailableError,
     CodexCliUnsupportedError,
 )
@@ -35,6 +36,15 @@ def test_probe_fails_closed_when_restricted_profile_cannot_be_enforced(
 
     with pytest.raises(CodexCliUnsupportedError):
         codex_fixture["provider"].capabilities(codex_fixture["repository"])
+
+
+def test_probe_nonzero_is_distinct_from_missing_executable(codex_fixture, monkeypatch) -> None:
+    monkeypatch.setenv("FAKE_CODEX_PROBE_FAILED", "1")
+
+    with pytest.raises(CodexCliProbeError) as raised:
+        codex_fixture["provider"].capabilities(codex_fixture["repository"])
+
+    assert raised.value.code == "codex_cli_probe_failed"
 
 
 def test_probe_maps_missing_executable_without_install_attempt(codex_fixture) -> None:

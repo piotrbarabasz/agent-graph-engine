@@ -35,7 +35,11 @@ def _config() -> CodexProviderConfig:
     (
         ("hang", WriteSliceOutcome.FAILED, "codex_timeout"),
         ("malformed", WriteSliceOutcome.FAILED, "codex_response_invalid"),
-        ("unsupported", WriteSliceOutcome.BLOCKED, "codex_cli_unsupported"),
+        (
+            "unsupported",
+            WriteSliceOutcome.BLOCKED,
+            "codex_permission_profile_unsupported",
+        ),
     ),
 )
 def test_codex_agent_preserves_typed_diagnostic_codes(
