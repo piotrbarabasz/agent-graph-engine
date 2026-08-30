@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -87,6 +88,7 @@ def _project_schema(
         else:
             projected[key] = _project_simple(key, value, location=child_location)
 
+    _normalize_scalar_constraints(projected, location=location)
     _validate_projected_schema(
         projected, location=location, require_strict_object=require_strict_object
     )
@@ -139,12 +141,10 @@ def _project_simple(key: str, value: object, *, location: str) -> Any:
             )
         return False
     if key == "enum":
-        if not _is_sequence(value) or not value or not all(_is_json_scalar(item) for item in value):
+        if not _is_sequence(value) or not value:
             raise CodexSchemaProjectionError(f"Codex output enum is invalid at {location}")
         return list(value)
     if key == "const":
-        if not _is_json_scalar(value):
-            raise CodexSchemaProjectionError(f"Codex output const is invalid at {location}")
         return value
     if key in {"$ref", "description"}:
         if not isinstance(value, str) or not value:
@@ -169,6 +169,67 @@ def _project_type(value: object, *, location: str) -> str | list[str]:
             f"Codex output type union must be a single nullable type at {location}"
         )
     return list(value)
+
+
+def _normalize_scalar_constraints(schema: dict[str, Any], *, location: str) -> None:
+    if "const" in schema:
+        if "enum" in schema:
+            raise CodexSchemaProjectionError(
+                f"Codex output schema cannot combine const and enum at {location}"
+            )
+        schema["enum"] = [schema.pop("const")]
+    if "enum" not in schema:
+        return
+
+    values = schema["enum"]
+    inferred_type = _infer_enum_type(values, location=location)
+    declared_type = schema.get("type")
+    if declared_type is None:
+        schema["type"] = inferred_type
+        return
+
+    allowed_types = {declared_type} if isinstance(declared_type, str) else set(declared_type)
+    for value in values:
+        value_type = _json_scalar_type(value, location=location)
+        if value_type in allowed_types:
+            continue
+        if value_type == "integer" and "number" in allowed_types:
+            continue
+        raise CodexSchemaProjectionError(
+            f"Codex output enum is inconsistent with its explicit type at {location}"
+        )
+
+
+def _infer_enum_type(values: list[Any], *, location: str) -> str | list[str]:
+    value_types = {_json_scalar_type(value, location=location) for value in values}
+    nullable = "null" in value_types
+    non_null_types = value_types - {"null"}
+    if not non_null_types:
+        return "null"
+    if non_null_types == {"integer", "number"}:
+        scalar_type = "number"
+    elif len(non_null_types) == 1:
+        scalar_type = next(iter(non_null_types))
+    else:
+        raise CodexSchemaProjectionError(
+            f"Codex output enum has incompatible scalar types at {location}"
+        )
+    return [scalar_type, "null"] if nullable else scalar_type
+
+
+def _json_scalar_type(value: object, *, location: str) -> str:
+    value_type = type(value)
+    if value is None:
+        return "null"
+    if value_type is str:
+        return "string"
+    if value_type is bool:
+        return "boolean"
+    if value_type is int:
+        return "integer"
+    if value_type is float and math.isfinite(value):
+        return "number"
+    raise CodexSchemaProjectionError(f"Codex output enum has a non-JSON scalar at {location}")
 
 
 def _validate_projected_schema(
@@ -196,7 +257,3 @@ def _validate_projected_schema(
 
 def _is_sequence(value: object) -> bool:
     return isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray))
-
-
-def _is_json_scalar(value: object) -> bool:
-    return value is None or type(value) in {str, int, float, bool}
