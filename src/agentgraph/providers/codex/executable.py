@@ -55,13 +55,11 @@ def resolve_codex_executable(
         return selector
 
     roots = _candidate_roots(selector, search_path=search_path)
+    package, target = layout
     for root in roots:
         direct = root / "codex.exe"
         if _is_regular_file(direct):
             return str(direct.resolve(strict=True))
-
-    package, target = layout
-    for root in roots:
         if not _has_npm_shim(root, selector):
             continue
         candidate = (
