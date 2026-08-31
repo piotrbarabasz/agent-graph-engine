@@ -130,6 +130,28 @@ def test_codex_agent_uses_target_as_cwd_cd_and_restricted_read_profile(
     assert (context.runtime_directory / "receipt.json").is_file()
 
 
+def test_codex_agent_surfaces_bounded_local_contract_reason_without_model_text(
+    tmp_path, monkeypatch
+) -> None:
+    target = _target(tmp_path)
+    model_message = "Repository exploration completed for T001 with sensitive-looking text."
+    invalid = {**_explore_result(), "message": model_message}
+    monkeypatch.setenv("FAKE_CODEX_RESULT", json.dumps(invalid))
+
+    report = runner(target, tmp_path / "runtime", CodexAgentProvider(config=_config())).run(
+        WriteSliceRequest(scope_id="E001")
+    )
+
+    assert report.outcome is WriteSliceOutcome.FAILED
+    assert report.issues[0].code == "codex_response_invalid"
+    assert report.issues[0].message == (
+        "Agent response violates its local contract: "
+        "successful response has blocked fields"
+    )
+    assert model_message not in report.issues[0].message
+    assert "BUILD_TASK_PACKAGE" not in report.executed_nodes
+
+
 def test_full_fake_codex_m008_path_invokes_four_roles_and_preserves_target(
     tmp_path, monkeypatch
 ) -> None:

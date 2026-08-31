@@ -7,6 +7,7 @@ from agentgraph.agents import (
     AgentProvider,
     AgentRequest,
     AgentResponse,
+    AgentResponseContractError,
     parse_delivery_review_payload,
     parse_explore_payload,
     parse_failure_classification_payload,
@@ -82,6 +83,8 @@ class CodexAgentProvider(AgentProvider):
             raise ValueError("unsupported Codex agent schema ID")
         try:
             parsed = parser(document)
+        except AgentResponseContractError as exc:
+            raise CodexResponseError(_safe_contract_diagnostic(exc)) from exc
         except Exception as exc:
             raise CodexResponseError("Codex agent response violates its schema") from exc
         payload = encode_value(parsed)
@@ -108,3 +111,12 @@ class CodexAgentProvider(AgentProvider):
         )
 
     evidence_namespace = "codex"
+
+
+def _safe_contract_diagnostic(exc: AgentResponseContractError) -> str:
+    """Expose only one bounded trusted parser diagnostic, never model output."""
+
+    detail = str(exc)
+    if not detail or len(detail) > 256 or not detail.isascii() or not detail.isprintable():
+        detail = "agent response violates its local contract"
+    return f"Agent response violates its local contract: {detail}"

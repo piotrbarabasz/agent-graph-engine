@@ -53,6 +53,8 @@ from agentgraph.nodes import (
 from agentgraph.runtime import (
     CheckpointDecision,
     DurableGraphCoordinator,
+    Journal,
+    JournalRecordType,
     ProjectRegistry,
     RecoveryAction,
     RecoveryAssessment,
@@ -858,23 +860,33 @@ class WriteSliceRunner:
             WriteSliceOutcome.PUBLISH_CHECKPOINT_REQUIRED,
             WriteSliceOutcome.DRAFT_PR_CREATED,
         }:
+            issue_code = (
+                (execution.issue_code if execution else None)
+                or (execution.analysis.issue_code if execution else None)
+                or (
+                    controller.delivery_review_execution.issue_code
+                    if controller.delivery_review_execution is not None
+                    else None
+                )
+                or (
+                    controller.publish_execution.issue_code
+                    if controller.publish_execution is not None
+                    else None
+                )
+                or state.failure.code
+                or "write_run_not_completed"
+            )
+            issue_message = f"write run finalized with {state.run.status.value}"
+            issue_message = (
+                _recorded_safe_contract_issue_message(
+                    controller.run_path, controller.run_id, issue_code
+                )
+                or issue_message
+            )
             issues = (
                 WriteSliceIssue(
-                    (execution.issue_code if execution else None)
-                    or (execution.analysis.issue_code if execution else None)
-                    or (
-                        controller.delivery_review_execution.issue_code
-                        if controller.delivery_review_execution is not None
-                        else None
-                    )
-                    or (
-                        controller.publish_execution.issue_code
-                        if controller.publish_execution is not None
-                        else None
-                    )
-                    or state.failure.code
-                    or "write_run_not_completed",
-                    f"write run finalized with {state.run.status.value}",
+                    issue_code,
+                    issue_message,
                 ),
             )
         completed = tuple(item.item_id for item in completed_items)
@@ -1085,6 +1097,37 @@ def _plan_item(plan: WorkPlan, item_id: str) -> WorkPlanItem:
         return next(item for item in plan.items if item.item_id == item_id)
     except StopIteration as exc:
         raise WorkPlanMismatchError("selected item is absent from work plan") from exc
+
+
+def _recorded_safe_contract_issue_message(
+    run_path: Path, run_id: str, issue_code: str
+) -> str | None:
+    """Read one bounded host-generated contract reason from durable evidence."""
+
+    try:
+        records = Journal(run_path / "journal.jsonl", run_id).load()
+    except Exception:
+        return None
+    for record in reversed(records):
+        if record.record_type is not JournalRecordType.NODE_RESULT_RECORDED:
+            continue
+        node_result = record.payload.get("node_result")
+        if not isinstance(node_result, dict):
+            continue
+        reason = node_result.get("reason")
+        if not isinstance(reason, dict) or reason.get("code") != issue_code:
+            continue
+        message = reason.get("message")
+        if (
+            isinstance(message, str)
+            and 0 < len(message) <= 512
+            and message.isascii()
+            and message.isprintable()
+            and message.startswith("Agent response violates its local contract: ")
+        ):
+            return message
+        return None
+    return None
 
 
 def _input_fingerprint(inspection, request: WriteSliceRequest) -> str:

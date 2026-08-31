@@ -83,6 +83,13 @@ def test_explore_contract_rejects_oversized_total_structured_response() -> None:
         parse_explore_payload(payload)
 
 
+def test_explore_contract_rejects_success_message_from_real_failure() -> None:
+    value = explore_payload(message="Repository exploration completed for T001.")
+
+    with pytest.raises(AgentResponseContractError, match="successful response has blocked fields"):
+        parse_explore_payload(value)
+
+
 def test_agent_contract_module_has_no_codex_coupling() -> None:
     root = Path(__file__).parents[2] / "src" / "agentgraph" / "agents"
     assert "providers.codex" not in "\n".join(

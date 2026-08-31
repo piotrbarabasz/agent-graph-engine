@@ -38,6 +38,13 @@ def test_parser_accepts_exact_changes_and_blocked_contracts() -> None:
         _raw(extra="forbidden"),
         _raw(status="unknown"),
         _raw(changes=[]),
+        _raw(message="Implementation completed."),
+        _raw(
+            status="blocked",
+            changes=[{"path": "src/a.py", "content": "a"}],
+            reason_code="requires_delete",
+            message="Needs delete",
+        ),
         _raw(
             changes=[
                 {"path": "src/a.py", "content": "a"},
